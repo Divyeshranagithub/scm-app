@@ -1,0 +1,107 @@
+{
+  "title": "Item Code Cleansing \u2014 Duplication Removal Progress",
+  "sub": "MASTER DATA CLEANSING \u00b7 REMOVING DUPLICATION ACROSS 6 BATCHES",
+  "context": "Al Gihaz Holding \u00b7 Construction & Industrial Cluster \u00b7 ERS Phase 2",
+  "headline": [
+    {
+      "cap": "Total item codes",
+      "from": "41,000",
+      "value": "38,100",
+      "sub": "Total item codes now \u2014 down from 41K before cleansing"
+    },
+    {
+      "cap": "Batches completed",
+      "value": "3 of 6",
+      "sub": "Batches completed \u2014 50% of the plan",
+      "pct": 50
+    },
+    {
+      "cap": "Duplicates removed",
+      "value": "7,612",
+      "sub": "Duplicate records removed to date",
+      "accent": "ok"
+    }
+  ],
+  "completed": [
+    {
+      "n": "BATCH 1",
+      "value": "4,380",
+      "d": "Duplicate records removed",
+      "pct": 100
+    },
+    {
+      "n": "BATCH 2",
+      "value": "2,566",
+      "d": "Duplicate records removed",
+      "pct": 100
+    },
+    {
+      "n": "BATCH 3",
+      "value": "660",
+      "d": "Duplicate records removed",
+      "pct": 100
+    }
+  ],
+  "remaining": [
+    {
+      "n": "BATCH 4",
+      "value": "August 2026",
+      "d": "Target completion",
+      "pct": 30,
+      "state": "in progress"
+    },
+    {
+      "n": "BATCH 5",
+      "value": "October 2026",
+      "d": "Start date"
+    },
+    {
+      "n": "BATCH 6",
+      "value": "December 2026",
+      "d": "Start date"
+    }
+  ],
+  "perBatchNote": "Approx. <b>12,000 items</b> checked per batch",
+  "remainingNote": "3 batches remaining \u00b7 One batch every two months, completing duplication removal across all 41K item codes.",
+  "taxonomy": {
+    "title": "AI-Powered Item Taxonomy Mapping",
+    "sub": "MASTER DATA \u00b7 AUTOMATED UNSPSC CLASSIFICATION TO LEVEL 4",
+    "kpis": [
+      {
+        "cap": "Pilot scope",
+        "value": "50",
+        "sub": "Item codes in the pilot"
+      },
+      {
+        "cap": "Taxonomy depth",
+        "value": "L1 \u2192 L4",
+        "sub": "Full UNSPSC depth mapped"
+      },
+      {
+        "cap": "Automated",
+        "value": "100",
+        "unit": "%",
+        "sub": "No human picks the code"
+      }
+    ],
+    "steps": [
+      {
+        "b": "Item Input",
+        "p": "Item code, description and attributes are read from the master data."
+      },
+      {
+        "b": "AI Classification",
+        "p": "The model interprets each item and infers its category automatically."
+      },
+      {
+        "b": "UNSPSC Mapping",
+        "p": "Item is mapped to the UNSPSC hierarchy from Level 1 down to Level 4."
+      },
+      {
+        "b": "Code Assigned",
+        "p": "Final UNSPSC code is assigned automatically \u2014 no human selection."
+      }
+    ],
+    "goal": "Build an AI-powered tool that maps every item to its UNSPSC taxonomy down to Level 4 automatically \u2014 removing manual selection of the code for each item."
+  }
+}
