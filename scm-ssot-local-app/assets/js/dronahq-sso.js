@@ -2,45 +2,60 @@
  * DronaHQ SSO bridge (optional).
  *
  * When this app is deployed as a DronaHQ plugin app, the DronaHQ container
- * injects window.DronaHQ asynchronously and exposes the already-logged-in
- * user via window.DronaHQ.user.getProfile() — that's the "SSO": no separate
- * login screen, the app just inherits DronaHQ's session.
+ * loads dronahq.js and fires the real Cordova "deviceready" event (and sets
+ * window.DronaHQ.IsReady = true) once its native bridge is actually up —
+ * that's the correct readiness signal (confirmed by tracing DronaHQ's own
+ * Reinvention app's code, which waits on exactly this). Only after that is
+ * window.DronaHQ.user.getProfile() safe to call — that's the "SSO": no
+ * separate login screen, the app just inherits DronaHQ's session.
+ *
+ * Checking for window.DronaHQ.user.getProfile's mere presence (the previous
+ * approach here) is NOT a valid readiness signal: dronahq.js registers that
+ * method structurally as soon as the SDK script parses, regardless of
+ * whether a real native bridge is connected — so it stayed "present" even
+ * with no container backing it, and the SSO check never actually settled.
  *
  * When this app is opened any other way (plain web server, local file,
- * direct browser visit), window.DronaHQ never appears. Unlike the reference
- * polling snippet (which waits forever), this version times out so the rest
- * of the app is never blocked or affected when there's no DronaHQ container.
+ * direct browser visit), "deviceready" never fires. Unlike DronaHQ's own
+ * reference code (which waits forever), this version times out so the rest
+ * of the app is never blocked when there's no DronaHQ container at all.
  */
 (function () {
-  var POLL_MS = 100;
-  var TIMEOUT_MS = 5000;
+  var TIMEOUT_MS = 15000; // matches DronaHQ's own Reinvention app's wait
 
   function isReady() {
-    return !!(window.DronaHQ && window.DronaHQ.user && typeof window.DronaHQ.user.getProfile === 'function');
+    return !!(window.DronaHQ && window.DronaHQ.IsReady);
   }
 
   function waitForDronaHqSdk() {
     if (isReady()) return Promise.resolve(true);
     return new Promise(function (resolve) {
-      var waited = 0;
-      var timer = setInterval(function () {
-        waited += POLL_MS;
-        if (isReady()) {
-          clearInterval(timer);
-          resolve(true);
-        } else if (waited >= TIMEOUT_MS) {
-          clearInterval(timer);
-          resolve(false);
-        }
-      }, POLL_MS);
+      var settled = false;
+      var timer = setTimeout(function () {
+        if (settled) return;
+        settled = true;
+        document.removeEventListener('deviceready', onReady);
+        resolve(false);
+      }, TIMEOUT_MS);
+      function onReady() {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        resolve(true);
+      }
+      document.addEventListener('deviceready', onReady, { once: true });
     });
   }
 
   function fetchDronaHqProfile() {
     return new Promise(function (resolve, reject) {
+      if (!(window.DronaHQ && window.DronaHQ.user && typeof window.DronaHQ.user.getProfile === 'function')) {
+        reject(new Error('DronaHQ.user.getProfile is not available.'));
+        return;
+      }
       window.DronaHQ.user.getProfile(
         function (uData) { resolve(uData); },
-        function (err) { reject(new Error('Failed to load user info: ' + String(err))); }
+        function (err) { reject(err instanceof Error ? err : new Error('Failed to load user info: ' + String(err))); }
       );
     });
   }

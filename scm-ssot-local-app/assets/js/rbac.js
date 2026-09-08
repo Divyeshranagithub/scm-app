@@ -5,7 +5,7 @@
  * isn't registered -> full lockout screen, no nav, no page content.
  */
 (function(){
-  var LOCKOUT_TIMEOUT_MS = 7000; // longer than dronahq-sso.js's own 5s SSO wait
+  var LOCKOUT_TIMEOUT_MS = 17000; // longer than dronahq-sso.js's own 15s SSO wait
   var settled = false;
 
   function apiBase(){ return (window.SCM_API && window.SCM_API.base) || ''; }
@@ -27,10 +27,9 @@
   function diagLine(){
     var secs = ((Date.now()-bootStart)/1000).toFixed(1);
     var hasDrona = !!window.DronaHQ;
-    var hasUser = !!(window.DronaHQ && window.DronaHQ.user);
-    var hasFn = !!(window.DronaHQ && window.DronaHQ.user && typeof window.DronaHQ.user.getProfile==='function');
+    var isReady = !!(window.DronaHQ && window.DronaHQ.IsReady);
     return secs+'s elapsed &middot; window.DronaHQ: '+(hasDrona?'present':'absent')+
-      (hasDrona ? (' &middot; .user: '+(hasUser?'present':'absent')+' &middot; .getProfile: '+(hasFn?'present':'absent')) : '');
+      (hasDrona ? (' &middot; IsReady: '+(isReady?'true':'false')) : '');
   }
   var diagTimer = null;
   function showLoading(){
