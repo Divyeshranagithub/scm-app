@@ -1,4 +1,4 @@
-from typing import Optional
+from typing import List, Optional
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Query
 from pydantic import BaseModel
@@ -25,9 +25,42 @@ def require_admin(x_user_email: str = Header(...)) -> str:
     finally:
         db.put_conn(conn)
 
-    if row is None or row[0] != "ssot_administrator":
+    if row is None or row[0] != "administrator":
         raise HTTPException(status_code=403, detail="Admin access required")
     return x_user_email
+
+
+def _user_permissions(cur, user_id: int):
+    cur.execute(
+        """
+        SELECT p.permission_key, p.permission_name
+        FROM user_permissions up JOIN permissions p ON p.permission_key = up.permission_key
+        WHERE up.user_id = %s
+        ORDER BY p.permission_name
+        """,
+        (user_id,),
+    )
+    return cur.fetchall()
+
+
+def _permission_modules(cur, user_id: int) -> List[str]:
+    cur.execute(
+        """
+        SELECT DISTINCT pm.module_key
+        FROM user_permissions up JOIN permission_modules pm ON pm.permission_key = up.permission_key
+        WHERE up.user_id = %s
+        """,
+        (user_id,),
+    )
+    return [r[0] for r in cur.fetchall()]
+
+
+def _all_module_keys(cur, include_admin: bool) -> List[str]:
+    if include_admin:
+        cur.execute("SELECT module_key FROM modules")
+    else:
+        cur.execute("SELECT module_key FROM modules WHERE module_key != 'admin'")
+    return [r[0] for r in cur.fetchall()]
 
 
 @router.get("/api/auth/me")
@@ -37,31 +70,40 @@ def auth_me(email: str = Query(...)):
         with conn.cursor() as cur:
             cur.execute(
                 """
-                SELECT u.email, u.username, r.role_key, r.role_name, r.role_category,
-                       coalesce(array_agg(rm.module_key) FILTER (WHERE rm.module_key IS NOT NULL), '{}')
-                FROM users u
-                JOIN roles r ON r.role_key = u.role_key
-                LEFT JOIN role_modules rm ON rm.role_key = r.role_key
+                SELECT u.id, u.email, u.username, r.role_key, r.role_name
+                FROM users u JOIN roles r ON r.role_key = u.role_key
                 WHERE lower(u.email) = lower(%s)
-                GROUP BY u.email, u.username, r.role_key, r.role_name, r.role_category
                 """,
                 (email,),
             )
             row = cur.fetchone()
+            if row is None:
+                raise HTTPException(status_code=404, detail="User not registered for this app")
+
+            user_id, email_, username, role_key, role_name = row
+            perms = _user_permissions(cur, user_id)
+            editable_modules = _permission_modules(cur, user_id)
+
+            if role_key == "administrator":
+                modules = _all_module_keys(cur, include_admin=True)
+            elif role_key == "editor":
+                modules = _all_module_keys(cur, include_admin=False)
+            else:  # viewer
+                modules = editable_modules
+    except HTTPException:
+        raise
     finally:
         db.put_conn(conn)
 
-    if row is None:
-        raise HTTPException(status_code=404, detail="User not registered for this app")
-
-    email_, username, role_key, role_name, role_category, modules = row
     return {
         "email": email_,
         "username": username,
         "roleKey": role_key,
         "roleName": role_name,
-        "roleCategory": role_category,
+        "permissions": [k for k, _ in perms],
+        "permissionNames": [n for _, n in perms],
         "modules": modules,
+        "editableModules": editable_modules,
     }
 
 
@@ -70,11 +112,23 @@ def list_roles(admin_email: str = Depends(require_admin)):
     conn = db.get_conn()
     try:
         with conn.cursor() as cur:
-            cur.execute("SELECT role_key, role_name, role_category FROM roles ORDER BY role_category, role_name")
+            cur.execute("SELECT role_key, role_name FROM roles ORDER BY role_key")
             rows = cur.fetchall()
     finally:
         db.put_conn(conn)
-    return [{"roleKey": k, "roleName": n, "roleCategory": c} for k, n, c in rows]
+    return [{"roleKey": k, "roleName": n} for k, n in rows]
+
+
+@router.get("/api/admin/permissions")
+def list_permissions(admin_email: str = Depends(require_admin)):
+    conn = db.get_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT permission_key, permission_name FROM permissions ORDER BY permission_name")
+            rows = cur.fetchall()
+    finally:
+        db.put_conn(conn)
+    return [{"permissionKey": k, "permissionName": n} for k, n in rows]
 
 
 @router.get("/api/admin/users")
@@ -89,19 +143,27 @@ def list_users(admin_email: str = Depends(require_admin)):
                 ORDER BY u.created_at DESC
                 """
             )
-            rows = cur.fetchall()
+            users = cur.fetchall()
+            result = []
+            for i, e, un, rk, rn, ca in users:
+                perms = _user_permissions(cur, i)
+                result.append({
+                    "id": i, "email": e, "username": un,
+                    "roleKey": rk, "roleName": rn,
+                    "permissions": [k for k, _ in perms],
+                    "permissionNames": [n for _, n in perms],
+                    "createdAt": ca.isoformat(),
+                })
     finally:
         db.put_conn(conn)
-    return [
-        {"id": i, "email": e, "username": un, "roleKey": rk, "roleName": rn, "createdAt": ca.isoformat()}
-        for i, e, un, rk, rn, ca in rows
-    ]
+    return result
 
 
 class NewUser(BaseModel):
     email: str
     username: Optional[str] = None
     roleKey: str
+    permissionKeys: List[str] = []
 
 
 @router.post("/api/admin/users")
@@ -112,6 +174,12 @@ def add_user(body: NewUser, admin_email: str = Depends(require_admin)):
             cur.execute("SELECT 1 FROM roles WHERE role_key = %s", (body.roleKey,))
             if cur.fetchone() is None:
                 raise HTTPException(status_code=400, detail=f"Unknown roleKey: {body.roleKey}")
+
+            for pk in body.permissionKeys:
+                cur.execute("SELECT 1 FROM permissions WHERE permission_key = %s", (pk,))
+                if cur.fetchone() is None:
+                    raise HTTPException(status_code=400, detail=f"Unknown permissionKey: {pk}")
+
             cur.execute(
                 """
                 INSERT INTO users (email, username, role_key)
@@ -121,7 +189,14 @@ def add_user(body: NewUser, admin_email: str = Depends(require_admin)):
                 """,
                 (body.email, body.username, body.roleKey),
             )
-            row = cur.fetchone()
+            user_id, e, un, rk, ca = cur.fetchone()
+
+            cur.execute("DELETE FROM user_permissions WHERE user_id = %s", (user_id,))
+            for pk in body.permissionKeys:
+                cur.execute(
+                    "INSERT INTO user_permissions (user_id, permission_key) VALUES (%s, %s)",
+                    (user_id, pk),
+                )
         conn.commit()
     except HTTPException:
         conn.rollback()
@@ -132,8 +207,71 @@ def add_user(body: NewUser, admin_email: str = Depends(require_admin)):
     finally:
         db.put_conn(conn)
 
-    i, e, un, rk, ca = row
-    return {"id": i, "email": e, "username": un, "roleKey": rk, "createdAt": ca.isoformat()}
+    return {
+        "id": user_id, "email": e, "username": un, "roleKey": rk,
+        "permissionKeys": body.permissionKeys, "createdAt": ca.isoformat(),
+    }
+
+
+class BulkUserRow(BaseModel):
+    email: str
+    username: Optional[str] = None
+    roleKey: str
+    permissionKeys: List[str] = []
+
+
+class BulkUsersRequest(BaseModel):
+    users: List[BulkUserRow]
+
+
+@router.post("/api/admin/users/bulk")
+def bulk_add_users(body: BulkUsersRequest, admin_email: str = Depends(require_admin)):
+    conn = db.get_conn()
+    results = []
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT role_key FROM roles")
+            valid_roles = {r[0] for r in cur.fetchall()}
+            cur.execute("SELECT permission_key FROM permissions")
+            valid_perms = {r[0] for r in cur.fetchall()}
+
+        for row in body.users:
+            try:
+                email = (row.email or "").strip()
+                if not email or "@" not in email:
+                    raise ValueError(f"invalid email: '{row.email}'")
+                if row.roleKey not in valid_roles:
+                    raise ValueError(f"unknown role '{row.roleKey}' (must be one of {sorted(valid_roles)})")
+                bad_perms = [p for p in row.permissionKeys if p not in valid_perms]
+                if bad_perms:
+                    raise ValueError(f"unknown permission(s): {', '.join(bad_perms)}")
+
+                with conn.cursor() as cur:
+                    cur.execute(
+                        """
+                        INSERT INTO users (email, username, role_key)
+                        VALUES (%s, %s, %s)
+                        ON CONFLICT (email) DO UPDATE SET username = EXCLUDED.username, role_key = EXCLUDED.role_key
+                        RETURNING id
+                        """,
+                        (email, row.username, row.roleKey),
+                    )
+                    (user_id,) = cur.fetchone()
+                    cur.execute("DELETE FROM user_permissions WHERE user_id = %s", (user_id,))
+                    for pk in row.permissionKeys:
+                        cur.execute(
+                            "INSERT INTO user_permissions (user_id, permission_key) VALUES (%s, %s)",
+                            (user_id, pk),
+                        )
+                conn.commit()
+                results.append({"email": email, "status": "ok"})
+            except Exception as e:
+                conn.rollback()
+                results.append({"email": row.email, "status": "error", "detail": str(e)})
+    finally:
+        db.put_conn(conn)
+
+    return {"results": results}
 
 
 @router.delete("/api/admin/users/{email}")
@@ -144,14 +282,14 @@ def remove_user(email: str, admin_email: str = Depends(require_admin)):
             cur.execute(
                 """
                 SELECT count(*) FROM users u JOIN roles r ON r.role_key = u.role_key
-                WHERE r.role_key = 'ssot_administrator' AND lower(u.email) != lower(%s)
+                WHERE r.role_key = 'administrator' AND lower(u.email) != lower(%s)
                 """,
                 (email,),
             )
             (other_admins,) = cur.fetchone()
             cur.execute("SELECT role_key FROM users WHERE lower(email) = lower(%s)", (email,))
             target = cur.fetchone()
-            if target and target[0] == "ssot_administrator" and other_admins == 0:
+            if target and target[0] == "administrator" and other_admins == 0:
                 raise HTTPException(status_code=400, detail="Cannot remove the last remaining administrator")
 
             cur.execute("DELETE FROM users WHERE lower(email) = lower(%s) RETURNING id", (email,))

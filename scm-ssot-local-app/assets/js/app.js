@@ -1258,6 +1258,7 @@ document.addEventListener('change',function(e){
 /* ================= ROUTER + DRAWER ================= */
 const TITLES = {
   admin:['Administration','User Management'],
+  'content-admin':['Content Administration','Update site content & data'],
   overview:['Supply Chain Management','Overview'],
   scmkpi:['Analytics','SCM KPIs'],
   monthly:['Reporting','Monthly Intelligence'],

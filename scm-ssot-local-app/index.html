@@ -9,6 +9,7 @@
 <link rel="stylesheet" href="assets/css/theme.css">
 <link rel="stylesheet" href="assets/css/portalbasictheme.css">
 <link rel="stylesheet" href="assets/css/app.css">
+<link rel="stylesheet" href="assets/css/page-admin.css">
 <!-- starts fetching this large SDK file immediately, in parallel with everything
      else, instead of waiting until app.js finishes executing to even begin -->
 <link rel="preload" as="script" href="assets/js/dronahq.js">
@@ -33,6 +34,7 @@
   <div class="side__scope">Navigation</div>
   <nav class="nav" id="nav">
     <button class="nav__item" data-page="admin"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><circle cx="12" cy="8" r="4"/><path d="M4 21c0-4.4 3.6-8 8-8s8 3.6 8 8"/></svg>User Management</button>
+    <button class="nav__item" data-page="content-admin"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M12 20h9"/><path d="M16.5 3.5a2.12 2.12 0 0 1 3 3L7 19l-4 1 1-4Z"/></svg>Content Administration</button>
     <button class="nav__item" data-page="overview"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><rect x="3" y="3" width="7" height="7"/><rect x="14" y="3" width="7" height="7"/><rect x="3" y="14" width="7" height="7"/><rect x="14" y="14" width="7" height="7"/></svg>Overview</button>
     <button class="nav__item" data-page="scmkpi"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M3 20h18"/><path d="M6 20V9M11 20V4M16 20v-7M21 20v-4"/></svg>SCM KPIs</button>
     <button class="nav__item" data-page="monthly"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><rect x="3" y="4" width="18" height="17"/><path d="M3 9h18M8 2v4M16 2v4"/></svg>Monthly Intelligence</button>
@@ -76,6 +78,60 @@
     <div class="eyebrow">Administration</div>
     <h1 style="margin:0 0 16px">User Management</h1>
     <div id="adminHost">Loading…</div>
+  </section>
+
+  <!-- ============ CONTENT ADMINISTRATION (editor + administrator only) ============ -->
+  <section class="page" data-page="content-admin">
+    <div class="pghead">
+      <div class="pghead__l">
+        <p class="eyebrow adm__eyebrow">Content Administration · Single Source of Truth</p>
+        <h2 class="pghead__t">Update site content &amp; data</h2>
+      </div>
+      <div class="pghead__r"><span class="scdemo" id="admWho">Signed in</span></div>
+    </div>
+
+    <div class="adm">
+      <nav class="adm__rail" id="admRail" aria-label="Content sections"></nav>
+
+      <div class="adm__main">
+        <div class="adm__bar">
+          <div class="adm__bartitle">
+            <h3 id="admTitle">&nbsp;</h3>
+            <p id="admDesc"></p>
+          </div>
+          <div class="adm__barmeta">
+            <span class="srcchip" id="admSrc">loading…</span>
+            <span class="adm__dirty" id="admDirty" hidden>Unsaved changes</span>
+          </div>
+        </div>
+
+        <div class="adm__tabs" role="tablist">
+          <button type="button" class="admtab is-on" id="admTabForm" role="tab" aria-selected="true" data-act="admView" data-a1="form">Form</button>
+          <button type="button" class="admtab" id="admTabJson" role="tab" aria-selected="false" data-act="admView" data-a1="json">JSON</button>
+        </div>
+
+        <div class="adm__msg" id="admMsg" hidden></div>
+        <div class="adm__pane" id="admForm"></div>
+        <div class="adm__pane" id="admJson" hidden>
+          <p class="adm__hint">The full document. Editing here is the fastest route for the large
+            datasets (AVL, SEC, Cost Structure) that have no field-by-field form.
+            <b>Apply</b> parses it and updates the form; nothing is downloaded until you save.</p>
+          <textarea class="adm__ta" id="admTa" spellcheck="false" aria-label="Raw JSON"></textarea>
+          <div class="adm__tabtn">
+            <button type="button" class="scbtn" data-act="admApplyJson">Apply JSON to form</button>
+            <button type="button" class="scbtn" data-act="admFormatJson">Reformat</button>
+            <button type="button" class="scbtn" data-act="admUpload">Replace from file…</button>
+            <input type="file" id="admFile" accept="application/json,.json" hidden>
+          </div>
+        </div>
+
+        <div class="adm__foot">
+          <button type="button" class="admbtn admbtn--go" data-act="admDownload">Download .json</button>
+          <button type="button" class="admbtn" data-act="admPreview">Open the page</button>
+          <button type="button" class="admbtn admbtn--warn" data-act="admRevert">Discard changes</button>
+        </div>
+      </div>
+    </div>
   </section>
 
   <!-- ============ OVERVIEW ============ -->
@@ -526,6 +582,7 @@
      once the container bridge is up. Must load before dronahq-sso.js. -->
 <script src="assets/js/dronahq.js"></script>
 <script src="assets/js/dronahq-sso.js"></script>
+<script src="assets/js/content-admin.js"></script>
 <script src="assets/js/rbac.js"></script>
 </body>
 </html>

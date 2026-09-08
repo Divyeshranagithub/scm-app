@@ -97,6 +97,13 @@
 
   function applyAccess(data){
     var allowed = new Set(data.modules||[]);
+    // Content Administration is role-gated (editor + administrator), not
+    // part of the module/permission list — never shown to a viewer. Folding
+    // it into `allowed` here means the generic show/hide loop and the
+    // enforce() guard below both handle it correctly with no special-casing.
+    var contentAdminAllowed = data.roleKey === 'editor' || data.roleKey === 'administrator';
+    if(contentAdminAllowed) allowed.add('content-admin');
+
     window.SCM_USER = Object.assign(window.SCM_USER||{}, data);
     window.SCM_RBAC = { modules: data.modules||[], roleKey: data.roleKey };
 
@@ -118,6 +125,7 @@
     new MutationObserver(enforce).observe(document.body, {subtree:true, attributes:true, attributeFilter:['class']});
 
     if(allowed.has('admin')) renderAdminPage(data.email);
+    if(contentAdminAllowed && window.renderContentAdminPage) window.renderContentAdminPage(data);
     showSignedInBadge(data);
     hideOverlay();
   }
@@ -163,20 +171,52 @@
     });
   }
 
+  // Minimal RFC4180-ish CSV parser — handles quoted fields, embedded commas,
+  // doubled-quote escaping, and CRLF/LF line endings. Good enough for a
+  // template filled in Excel; not meant to handle arbitrary malformed CSV.
+  function parseCsv(text){
+    var rows = [], row = [], field = '', inQuotes = false;
+    for(var i=0;i<text.length;i++){
+      var c = text[i];
+      if(inQuotes){
+        if(c === '"'){
+          if(text[i+1] === '"'){ field += '"'; i++; }
+          else inQuotes = false;
+        } else field += c;
+      } else if(c === '"'){
+        inQuotes = true;
+      } else if(c === ','){
+        row.push(field); field = '';
+      } else if(c === '\r'){
+        // skip; \n (bare or following \r) ends the row
+      } else if(c === '\n'){
+        row.push(field); field = '';
+        if(row.length > 1 || row[0] !== '') rows.push(row);
+        row = [];
+      } else {
+        field += c;
+      }
+    }
+    if(field !== '' || row.length > 0){ row.push(field); rows.push(row); }
+    return rows;
+  }
+
   async function renderAdminPage(adminEmail){
     var host = document.getElementById('adminHost');
     if(!host) return;
     host.innerHTML = 'Loading…';
 
-    var roles, users;
+    var roles, permissions, users;
     try{
       var hdr = authHeaders({'X-User-Email': adminEmail});
-      var [rolesRes, usersRes] = await Promise.all([
+      var [rolesRes, permsRes, usersRes] = await Promise.all([
         fetch(apiBase()+'/api/admin/roles', {headers: hdr}),
+        fetch(apiBase()+'/api/admin/permissions', {headers: hdr}),
         fetch(apiBase()+'/api/admin/users', {headers: hdr})
       ]);
-      if(!rolesRes.ok || !usersRes.ok) throw new Error('admin fetch failed');
+      if(!rolesRes.ok || !permsRes.ok || !usersRes.ok) throw new Error('admin fetch failed');
       roles = await rolesRes.json();
+      permissions = await permsRes.json();
       users = await usersRes.json();
     }catch(err){
       host.innerHTML = '<p style="color:#7a1620">Could not load user management data. '+escapeHtml(err.message)+'</p>';
@@ -190,11 +230,22 @@
       }).join('');
     }
 
+    function permissionCheckboxes(){
+      return permissions.map(function(p){
+        return '<label style="display:flex;align-items:center;gap:6px;font-size:13px;padding:4px 0">'+
+          '<input type="checkbox" name="permissionKeys" value="'+escapeHtml(p.permissionKey)+'"> '+
+          escapeHtml(p.permissionName)+
+        '</label>';
+      }).join('');
+    }
+
     function userRow(u){
+      var permsText = (u.permissionNames||[]).join(', ') || '—';
       return '<tr>'+
         '<td style="padding:8px 10px">'+escapeHtml(u.email)+'</td>'+
         '<td style="padding:8px 10px">'+escapeHtml(u.username||'')+'</td>'+
         '<td style="padding:8px 10px">'+escapeHtml(u.roleName)+'</td>'+
+        '<td style="padding:8px 10px;color:#6b5b4d">'+escapeHtml(permsText)+'</td>'+
         '<td style="padding:8px 10px;color:#8a7a6c">'+escapeHtml((u.createdAt||'').slice(0,10))+'</td>'+
         '<td style="padding:8px 10px"><button type="button" class="admin-remove" data-email="'+escapeHtml(u.email)+'" '+
           'style="border:1px solid #c9463a;color:#c9463a;background:none;border-radius:6px;padding:4px 10px;cursor:pointer">Remove</button></td>'+
@@ -204,19 +255,39 @@
     host.innerHTML =
       '<div style="background:#fff;border:1px solid #eee1d3;border-radius:10px;padding:18px;margin-bottom:20px;max-width:640px">'+
         '<h3 style="margin:0 0 12px;font-size:15px">Add user</h3>'+
-        '<form id="adminAddForm" style="display:flex;gap:8px;flex-wrap:wrap;align-items:center">'+
-          '<input name="email" type="email" required placeholder="name@algihaz.com" style="flex:1 1 220px;padding:8px 10px;border:1px solid #ddd;border-radius:6px">'+
-          '<input name="username" type="text" placeholder="Display name" style="flex:1 1 160px;padding:8px 10px;border:1px solid #ddd;border-radius:6px">'+
-          '<select name="roleKey" required style="padding:8px 10px;border:1px solid #ddd;border-radius:6px">'+roleOptions()+'</select>'+
+        '<form id="adminAddForm">'+
+          '<div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-bottom:12px">'+
+            '<input name="email" type="email" required placeholder="name@algihaz.com" style="flex:1 1 220px;padding:8px 10px;border:1px solid #ddd;border-radius:6px">'+
+            '<input name="username" type="text" placeholder="Display name" style="flex:1 1 160px;padding:8px 10px;border:1px solid #ddd;border-radius:6px">'+
+            '<select name="roleKey" required style="padding:8px 10px;border:1px solid #ddd;border-radius:6px">'+roleOptions()+'</select>'+
+          '</div>'+
+          '<div style="margin-bottom:12px">'+
+            '<div style="font-size:12px;color:#8a7a6c;margin-bottom:4px">Permissions (which modules this user can access — Editors see every page but only edit these; Viewers only see these)</div>'+
+            permissionCheckboxes()+
+          '</div>'+
           '<button type="submit" style="background:#7a1620;color:#fff;border:none;border-radius:6px;padding:8px 16px;cursor:pointer">Add</button>'+
         '</form>'+
         '<p id="adminAddMsg" style="margin:10px 0 0;font-size:13px"></p>'+
+      '</div>'+
+      '<div style="background:#fff;border:1px solid #eee1d3;border-radius:10px;padding:18px;margin-bottom:20px;max-width:640px">'+
+        '<h3 style="margin:0 0 8px;font-size:15px">Bulk add users</h3>'+
+        '<p style="margin:0 0 10px;font-size:12px;color:#8a7a6c;line-height:1.5">'+
+          'Download the template, fill one row per user, then upload it. '+
+          'Role must be exactly <code>administrator</code>, <code>editor</code> or <code>viewer</code>. '+
+          'Permissions is optional — separate multiple with a semicolon, using the exact names shown above '+
+          '(e.g. <code>SCM Data Analytics;Procurement Risk &amp; Intelligence</code>).'+
+        '</p>'+
+        '<button type="button" id="adminDownloadTemplate" style="border:1px solid #ddd;background:#fff;border-radius:6px;padding:8px 14px;cursor:pointer;margin-right:8px">Download template (.csv)</button>'+
+        '<input type="file" id="adminBulkFile" accept=".csv" style="margin-right:8px">'+
+        '<button type="button" id="adminBulkUpload" style="background:#7a1620;color:#fff;border:none;border-radius:6px;padding:8px 16px;cursor:pointer">Upload</button>'+
+        '<div id="adminBulkResults" style="margin-top:12px"></div>'+
       '</div>'+
       '<div style="background:#fff;border:1px solid #eee1d3;border-radius:10px;overflow:auto">'+
         '<table style="width:100%;border-collapse:collapse;font-size:13px">'+
           '<thead><tr style="text-align:left;border-bottom:1px solid #eee1d3;color:#8a7a6c">'+
             '<th style="padding:8px 10px">Email</th><th style="padding:8px 10px">Name</th>'+
-            '<th style="padding:8px 10px">Role</th><th style="padding:8px 10px">Added</th><th></th>'+
+            '<th style="padding:8px 10px">Role</th><th style="padding:8px 10px">Permissions</th>'+
+            '<th style="padding:8px 10px">Added</th><th></th>'+
           '</tr></thead>'+
           '<tbody id="adminUserRows">'+users.map(userRow).join('')+'</tbody>'+
         '</table>'+
@@ -226,7 +297,12 @@
       e.preventDefault();
       var msg = document.getElementById('adminAddMsg');
       var fd = new FormData(e.target);
-      var body = {email: fd.get('email'), username: fd.get('username')||null, roleKey: fd.get('roleKey')};
+      var body = {
+        email: fd.get('email'),
+        username: fd.get('username')||null,
+        roleKey: fd.get('roleKey'),
+        permissionKeys: fd.getAll('permissionKeys')
+      };
       msg.textContent = 'Adding…'; msg.style.color = '#6b5b4d';
       try{
         var res = await fetch(apiBase()+'/api/admin/users', {
@@ -243,18 +319,122 @@
       }
     });
 
-    host.querySelectorAll('.admin-remove').forEach(function(btn){
-      btn.addEventListener('click', async function(){
-        if(!confirm('Remove '+btn.dataset.email+'?')) return;
+    function bindRemoveButtons(){
+      host.querySelectorAll('.admin-remove').forEach(function(btn){
+        btn.addEventListener('click', async function(){
+          if(!confirm('Remove '+btn.dataset.email+'?')) return;
+          try{
+            var res = await fetch(apiBase()+'/api/admin/users/'+encodeURIComponent(btn.dataset.email), {
+              method:'DELETE',
+              headers: authHeaders({'X-User-Email': adminEmail})
+            });
+            if(!res.ok){ var t = await res.text(); throw new Error(t); }
+            renderAdminPage(adminEmail);
+          }catch(err){ alert('Could not remove user: '+err.message); }
+        });
+      });
+    }
+    bindRemoveButtons();
+
+    document.getElementById('adminDownloadTemplate').addEventListener('click', function(){
+      var csv = 'Email,Name,Role,Permissions\r\n'+
+        'jane.doe@algihaz.com,Jane Doe,editor,SCM Data Analytics;Procurement Risk & Intelligence\r\n';
+      var blob = new Blob([csv], {type: 'text/csv'});
+      var url = URL.createObjectURL(blob);
+      var a = document.createElement('a');
+      a.href = url; a.download = 'scm-user-upload-template.csv';
+      document.body.appendChild(a); a.click(); a.remove();
+      URL.revokeObjectURL(url);
+    });
+
+    document.getElementById('adminBulkUpload').addEventListener('click', async function(){
+      var fileInput = document.getElementById('adminBulkFile');
+      var resultsEl = document.getElementById('adminBulkResults');
+      var file = fileInput.files[0];
+      if(!file){ resultsEl.innerHTML = '<p style="color:#c9463a;font-size:13px">Choose a CSV file first.</p>'; return; }
+
+      var roleByName = {}; roles.forEach(function(r){ roleByName[r.roleKey.toLowerCase()] = r.roleKey; });
+      var permByName = {}; permissions.forEach(function(p){
+        permByName[p.permissionName.toLowerCase()] = p.permissionKey;
+        permByName[p.permissionKey.toLowerCase()] = p.permissionKey;
+      });
+
+      var text = await file.text();
+      var rows = parseCsv(text);
+      if(!rows.length){ resultsEl.innerHTML = '<p style="color:#c9463a;font-size:13px">File is empty.</p>'; return; }
+      var header = rows[0].map(function(h){ return h.trim().toLowerCase(); });
+      var iEmail = header.indexOf('email'), iName = header.indexOf('name'),
+          iRole = header.indexOf('role'), iPerm = header.indexOf('permissions');
+      if(iEmail<0 || iRole<0){
+        resultsEl.innerHTML = '<p style="color:#c9463a;font-size:13px">Header row must include at least "Email" and "Role" columns.</p>';
+        return;
+      }
+
+      var users = [], parseErrors = [];
+      rows.slice(1).forEach(function(r, idx){
+        if(r.every(function(c){ return c.trim()===''; })) return; // skip blank rows
+        var email = (r[iEmail]||'').trim();
+        var roleRaw = (r[iRole]||'').trim();
+        var roleKey = roleByName[roleRaw.toLowerCase()];
+        if(!email || !roleKey){
+          parseErrors.push({email: email||'(row '+(idx+2)+')', status:'error', detail: !email ? 'missing email' : 'unrecognised role "'+roleRaw+'"'});
+          return;
+        }
+        var permNames = iPerm>=0 ? (r[iPerm]||'').split(';').map(function(s){return s.trim();}).filter(Boolean) : [];
+        var permKeys = [], badPerm = null;
+        permNames.forEach(function(n){
+          var k = permByName[n.toLowerCase()];
+          if(k) permKeys.push(k); else badPerm = n;
+        });
+        if(badPerm){
+          parseErrors.push({email: email, status:'error', detail: 'unrecognised permission "'+badPerm+'"'});
+          return;
+        }
+        users.push({email: email, username: (iName>=0 ? (r[iName]||'').trim() : '') || null, roleKey: roleKey, permissionKeys: permKeys});
+      });
+
+      resultsEl.innerHTML = '<p style="font-size:13px;color:#6b5b4d">Uploading '+users.length+' row(s)…</p>';
+      var apiResults = [];
+      if(users.length){
         try{
-          var res = await fetch(apiBase()+'/api/admin/users/'+encodeURIComponent(btn.dataset.email), {
-            method:'DELETE',
-            headers: authHeaders({'X-User-Email': adminEmail})
+          var res = await fetch(apiBase()+'/api/admin/users/bulk', {
+            method:'POST',
+            headers: authHeaders({'X-User-Email': adminEmail, 'Content-Type':'application/json'}),
+            body: JSON.stringify({users: users})
           });
           if(!res.ok){ var t = await res.text(); throw new Error(t); }
-          renderAdminPage(adminEmail);
-        }catch(err){ alert('Could not remove user: '+err.message); }
-      });
+          var data = await res.json();
+          apiResults = data.results || [];
+        }catch(err){
+          resultsEl.innerHTML = '<p style="color:#c9463a;font-size:13px">Upload failed: '+escapeHtml(err.message)+'</p>';
+          return;
+        }
+      }
+
+      var all = apiResults.concat(parseErrors);
+      var okCount = all.filter(function(r){return r.status==='ok';}).length;
+      resultsEl.innerHTML =
+        '<p style="font-size:13px;margin-bottom:6px">'+okCount+' of '+all.length+' row(s) added successfully.</p>'+
+        '<table style="width:100%;border-collapse:collapse;font-size:12px">'+
+          '<tbody>'+all.map(function(r){
+            var ok = r.status==='ok';
+            return '<tr><td style="padding:3px 6px;color:'+(ok?'#2e7d32':'#c9463a')+'">'+(ok?'✓':'✗')+'</td>'+
+              '<td style="padding:3px 6px">'+escapeHtml(r.email)+'</td>'+
+              '<td style="padding:3px 6px;color:#8a7a6c">'+escapeHtml(r.detail||'')+'</td></tr>';
+          }).join('')+
+          '</tbody>'+
+        '</table>';
+      fileInput.value = '';
+      if(okCount>0){
+        try{
+          var refreshed = await fetch(apiBase()+'/api/admin/users', {headers: authHeaders({'X-User-Email': adminEmail})});
+          if(refreshed.ok){
+            var refreshedUsers = await refreshed.json();
+            document.getElementById('adminUserRows').innerHTML = refreshedUsers.map(userRow).join('');
+            bindRemoveButtons();
+          }
+        }catch(e){ /* results panel above still shows what happened; list refresh is best-effort */ }
+      }
     });
   }
 })();

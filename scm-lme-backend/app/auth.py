@@ -1,8 +1,13 @@
 import os
 from typing import Optional, Dict, List
+from dotenv import load_dotenv
 from fastapi import HTTPException, Security
 from fastapi.security import APIKeyHeader
 from starlette.status import HTTP_403_FORBIDDEN
+
+# called here too (not just in main.py) so API_KEYS below is correct
+# regardless of which module happens to import this one first
+load_dotenv()
 
 API_KEY_HEADER = "X-API-Key"
 

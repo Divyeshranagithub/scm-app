@@ -1,0 +1,118 @@
+/* ============ CONTENT ADMINISTRATION ============
+   Editor chrome for the admin page. Deliberately plain: it is a back-office
+   tool, so it borrows the app's palette and type but none of its ornament.
+   =============================================================== */
+
+.adm{display:grid;grid-template-columns:236px minmax(0,1fr);gap:20px;align-items:start}
+@media(max-width:900px){.adm{grid-template-columns:1fr}}
+
+/* ---- left rail ---- */
+.adm__rail{display:flex;flex-direction:column;border:1px solid var(--line);background:var(--white);
+  position:sticky;top:78px}
+@media(max-width:900px){.adm__rail{position:static;flex-direction:row;flex-wrap:wrap}}
+.admrail__h{padding:11px 14px 7px;font-size:9.5px;letter-spacing:1.6px;text-transform:uppercase;
+  color:var(--light);font-weight:700;border-bottom:1px solid var(--line);background:var(--soft)}
+.admrail__b{display:flex;align-items:center;gap:9px;padding:11px 14px;border:0;border-bottom:1px solid var(--soft);
+  background:none;font-family:inherit;font-size:12.5px;color:var(--muted);text-align:left;cursor:pointer;width:100%}
+.admrail__b:hover{background:var(--soft)}
+.admrail__b.is-on{background:var(--soft);color:var(--red);font-weight:700;box-shadow:inset 3px 0 0 var(--red)}
+.admrail__b i{width:7px;height:7px;flex:0 0 auto;border-radius:50%;background:var(--line)}
+.admrail__b.ok i{background:var(--ok)}
+.admrail__b.warn i{background:var(--warn)}
+.admrail__b.dirty i{background:var(--red)}
+.admrail__b span{flex:1 1 auto;min-width:0}
+
+/* ---- header bar ---- */
+.adm__bar{display:flex;justify-content:space-between;align-items:flex-start;gap:16px;flex-wrap:wrap;
+  border:1px solid var(--line);border-bottom:0;background:var(--white);padding:14px 16px}
+.adm__bartitle h3{margin:0;font-family:var(--serif);font-size:18px;font-weight:700;color:var(--ink)}
+.adm__bartitle p{margin:4px 0 0;font-size:12px;color:var(--muted);line-height:1.55;max-width:62ch}
+.adm__barmeta{display:flex;align-items:center;gap:10px;flex-wrap:wrap}
+.adm__dirty{font-size:10px;letter-spacing:1.4px;text-transform:uppercase;font-weight:700;
+  color:#fff;background:var(--red);padding:4px 9px}
+.adm__eyebrow{margin:0}
+
+/* ---- tabs ---- */
+.adm__tabs{display:flex;gap:0;border:1px solid var(--line);border-bottom:0;background:var(--soft)}
+.admtab{border:0;border-right:1px solid var(--line);background:none;font-family:inherit;font-size:12px;
+  letter-spacing:.5px;color:var(--muted);padding:9px 16px;cursor:pointer}
+.admtab:hover{color:var(--red)}
+.admtab.is-on{background:var(--white);color:var(--red);font-weight:700;box-shadow:inset 0 -2px 0 var(--red)}
+
+/* ---- panes ---- */
+.adm__pane{border:1px solid var(--line);background:var(--white);padding:18px 16px;min-height:240px}
+.adm__hint{margin:0 0 12px;font-size:12px;color:var(--muted);line-height:1.6}
+.adm__hint b{color:var(--ink)}
+
+.adm__msg{border:1px solid var(--line);border-left:3px solid var(--red);background:#FDF6F6;
+  padding:11px 14px;font-size:12.5px;color:var(--muted);line-height:1.55}
+.adm__msg.ok{border-left-color:var(--ok);background:#F4FAF6}
+.adm__msg.warn{border-left-color:var(--warn);background:#FDFAF2}
+.adm__msg b{display:block;color:var(--ink);margin-bottom:3px}
+.adm__msg code{font-family:Consolas,"Courier New",monospace;font-size:11.5px}
+
+/* ---- raw JSON ---- */
+.adm__ta{width:100%;min-height:430px;resize:vertical;font-family:Consolas,"Courier New",monospace;
+  font-size:12px;line-height:1.55;color:var(--ink);background:var(--soft);
+  border:1px solid var(--line);padding:12px;white-space:pre;overflow:auto}
+.adm__ta:focus{outline:2px solid var(--red);outline-offset:-2px;background:var(--white)}
+.adm__tabtn{display:flex;gap:8px;flex-wrap:wrap;margin-top:12px}
+
+/* ---- form primitives ---- */
+.admgrp{border:1px solid var(--line);margin-bottom:16px}
+.admgrp__h{display:flex;align-items:center;justify-content:space-between;gap:12px;
+  background:var(--soft);border-bottom:1px solid var(--line);padding:9px 13px}
+.admgrp__h b{font-family:var(--serif);font-size:13.5px;color:var(--ink)}
+.admgrp__h em{font-style:normal;font-size:11px;color:var(--light)}
+.admgrp__b{padding:13px}
+
+.admrow{display:grid;grid-template-columns:repeat(auto-fit,minmax(190px,1fr));gap:12px 16px}
+.admf{display:flex;flex-direction:column;gap:4px;min-width:0}
+.admf__l{font-size:10px;letter-spacing:.9px;text-transform:uppercase;color:var(--muted);font-weight:700}
+.admf__l em{font-style:normal;color:var(--light);letter-spacing:0;text-transform:none;font-weight:400;margin-left:5px}
+.admf input,.admf select,.admf textarea{font-family:inherit;font-size:12.5px;color:var(--ink);
+  background:var(--white);border:1px solid var(--line);padding:8px 9px;min-width:0;width:100%}
+.admf textarea{min-height:66px;resize:vertical;line-height:1.5}
+.admf input:focus,.admf select:focus,.admf textarea:focus{outline:2px solid var(--red);outline-offset:-2px}
+.admf--wide{grid-column:1/-1}
+.admf__hint{font-size:10.5px;color:var(--light);font-style:italic}
+
+/* ---- repeating rows ---- */
+.admlist{display:flex;flex-direction:column;gap:10px}
+.admitem{border:1px solid var(--line);border-left:3px solid var(--sand,#D8B6B9)}
+.admitem__h{display:flex;align-items:center;gap:8px;background:var(--soft);padding:7px 10px;
+  border-bottom:1px solid var(--line)}
+.admitem__n{font-size:10px;letter-spacing:1px;color:var(--light);font-weight:700;min-width:26px}
+.admitem__t{flex:1 1 auto;min-width:0;font-size:12.5px;font-weight:700;color:var(--ink);
+  overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.admitem__b{padding:11px}
+.admicon{width:26px;height:26px;flex:0 0 auto;display:grid;place-items:center;border:1px solid var(--line);
+  background:var(--white);color:var(--muted);font-size:13px;line-height:1;cursor:pointer;font-family:inherit}
+.admicon:hover:not(:disabled){border-color:var(--red);color:var(--red)}
+.admicon:disabled{opacity:.35;cursor:default}
+.admicon--del:hover{border-color:var(--red);background:var(--red);color:#fff}
+.admadd{align-self:flex-start;margin-top:4px;background:var(--soft);border:1px dashed var(--line);
+  color:var(--red);font-family:inherit;font-size:12px;font-weight:700;padding:8px 14px;cursor:pointer}
+.admadd:hover{background:var(--red);color:#fff;border-color:var(--red);border-style:solid}
+
+/* ---- footer actions ---- */
+.adm__foot{display:flex;gap:8px;flex-wrap:wrap;border:1px solid var(--line);border-top:0;
+  background:var(--soft);padding:12px 14px}
+.admbtn{font-family:inherit;font-size:12.5px;font-weight:700;padding:9px 16px;cursor:pointer;
+  border:1px solid var(--line);background:var(--white);color:var(--muted)}
+.admbtn:hover{border-color:var(--red);color:var(--red)}
+.admbtn--go{background:var(--red);border-color:var(--red);color:#fff}
+.admbtn--go:hover{background:var(--deep);border-color:var(--deep);color:#fff}
+.admbtn--warn:hover{border-color:var(--warn);color:var(--warn)}
+.admbtn[disabled]{opacity:.45;cursor:default}
+.admbtn[disabled]:hover{border-color:var(--line);color:var(--muted)}
+
+/* ---- data-source pane ---- */
+.admsrc__note{font-size:12px;color:var(--muted);line-height:1.65;margin:0 0 14px;max-width:74ch}
+.admsrc__note code{font-family:Consolas,"Courier New",monospace;font-size:11.5px;color:var(--red)}
+
+/* ---- nested groups and spacing helpers (kept as classes, not inline styles,
+        so the page stays clean under a CSP that forbids inline style) ---- */
+.admgrp--nest{margin-top:12px;margin-bottom:0}
+.admrow--gap{margin-top:12px}
+.admhr{border:0;border-top:1px solid var(--line);margin:14px 0}
