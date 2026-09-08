@@ -48,7 +48,7 @@ const CONFIG = {
   remote: 'api',                // backend used by 'auto' over http(s)
 
   api: {                        // 'api' backend (FastAPI + Postgres)
-    base: 'http://localhost:18000',  // <- only this line changes when the backend moves (e.g. to EC2)
+    base: 'https://orion.algihaz.com/scm',  // <- only this line changes when the backend moves
     key : 'algihaz_bHJ2e7KqLp8XrF5vYzT9dC3mD8sW6gA'   // must match one entry in the backend's API_KEYS env var
   },
 
