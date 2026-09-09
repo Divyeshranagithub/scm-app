@@ -30,28 +30,8 @@ def require_admin(x_user_email: str = Header(...)) -> str:
     return x_user_email
 
 
-def _user_permissions(cur, user_id: int):
-    cur.execute(
-        """
-        SELECT p.permission_key, p.permission_name
-        FROM user_permissions up JOIN permissions p ON p.permission_key = up.permission_key
-        WHERE up.user_id = %s
-        ORDER BY p.permission_name
-        """,
-        (user_id,),
-    )
-    return cur.fetchall()
-
-
-def _permission_modules(cur, user_id: int) -> List[str]:
-    cur.execute(
-        """
-        SELECT DISTINCT pm.module_key
-        FROM user_permissions up JOIN permission_modules pm ON pm.permission_key = up.permission_key
-        WHERE up.user_id = %s
-        """,
-        (user_id,),
-    )
+def _user_modules(cur, user_id: int) -> List[str]:
+    cur.execute("SELECT module_key FROM user_modules WHERE user_id = %s ORDER BY module_key", (user_id,))
     return [r[0] for r in cur.fetchall()]
 
 
@@ -81,8 +61,7 @@ def auth_me(email: str = Query(...)):
                 raise HTTPException(status_code=404, detail="User not registered for this app")
 
             user_id, email_, username, role_key, role_name = row
-            perms = _user_permissions(cur, user_id)
-            editable_modules = _permission_modules(cur, user_id)
+            editable_modules = _user_modules(cur, user_id)
 
             if role_key == "administrator":
                 modules = _all_module_keys(cur, include_admin=True)
@@ -100,8 +79,6 @@ def auth_me(email: str = Query(...)):
         "username": username,
         "roleKey": role_key,
         "roleName": role_name,
-        "permissions": [k for k, _ in perms],
-        "permissionNames": [n for _, n in perms],
         "modules": modules,
         "editableModules": editable_modules,
     }
@@ -119,16 +96,16 @@ def list_roles(admin_email: str = Depends(require_admin)):
     return [{"roleKey": k, "roleName": n} for k, n in rows]
 
 
-@router.get("/api/admin/permissions")
-def list_permissions(admin_email: str = Depends(require_admin)):
+@router.get("/api/admin/modules")
+def list_modules(admin_email: str = Depends(require_admin)):
     conn = db.get_conn()
     try:
         with conn.cursor() as cur:
-            cur.execute("SELECT permission_key, permission_name FROM permissions ORDER BY permission_name")
+            cur.execute("SELECT module_key, module_name FROM modules WHERE module_key != 'admin' ORDER BY sort_order")
             rows = cur.fetchall()
     finally:
         db.put_conn(conn)
-    return [{"permissionKey": k, "permissionName": n} for k, n in rows]
+    return [{"moduleKey": k, "moduleName": n} for k, n in rows]
 
 
 @router.get("/api/admin/users")
@@ -146,12 +123,20 @@ def list_users(admin_email: str = Depends(require_admin)):
             users = cur.fetchall()
             result = []
             for i, e, un, rk, rn, ca in users:
-                perms = _user_permissions(cur, i)
+                cur.execute(
+                    """
+                    SELECT m.module_key, m.module_name
+                    FROM user_modules um JOIN modules m ON m.module_key = um.module_key
+                    WHERE um.user_id = %s ORDER BY m.sort_order
+                    """,
+                    (i,),
+                )
+                mods = cur.fetchall()
                 result.append({
                     "id": i, "email": e, "username": un,
                     "roleKey": rk, "roleName": rn,
-                    "permissions": [k for k, _ in perms],
-                    "permissionNames": [n for _, n in perms],
+                    "moduleKeys": [k for k, _ in mods],
+                    "moduleNames": [n for _, n in mods],
                     "createdAt": ca.isoformat(),
                 })
     finally:
@@ -163,7 +148,7 @@ class NewUser(BaseModel):
     email: str
     username: Optional[str] = None
     roleKey: str
-    permissionKeys: List[str] = []
+    moduleKeys: List[str] = []
 
 
 @router.post("/api/admin/users")
@@ -175,10 +160,10 @@ def add_user(body: NewUser, admin_email: str = Depends(require_admin)):
             if cur.fetchone() is None:
                 raise HTTPException(status_code=400, detail=f"Unknown roleKey: {body.roleKey}")
 
-            for pk in body.permissionKeys:
-                cur.execute("SELECT 1 FROM permissions WHERE permission_key = %s", (pk,))
+            for mk in body.moduleKeys:
+                cur.execute("SELECT 1 FROM modules WHERE module_key = %s", (mk,))
                 if cur.fetchone() is None:
-                    raise HTTPException(status_code=400, detail=f"Unknown permissionKey: {pk}")
+                    raise HTTPException(status_code=400, detail=f"Unknown moduleKey: {mk}")
 
             cur.execute(
                 """
@@ -191,11 +176,11 @@ def add_user(body: NewUser, admin_email: str = Depends(require_admin)):
             )
             user_id, e, un, rk, ca = cur.fetchone()
 
-            cur.execute("DELETE FROM user_permissions WHERE user_id = %s", (user_id,))
-            for pk in body.permissionKeys:
+            cur.execute("DELETE FROM user_modules WHERE user_id = %s", (user_id,))
+            for mk in body.moduleKeys:
                 cur.execute(
-                    "INSERT INTO user_permissions (user_id, permission_key) VALUES (%s, %s)",
-                    (user_id, pk),
+                    "INSERT INTO user_modules (user_id, module_key) VALUES (%s, %s)",
+                    (user_id, mk),
                 )
         conn.commit()
     except HTTPException:
@@ -209,7 +194,7 @@ def add_user(body: NewUser, admin_email: str = Depends(require_admin)):
 
     return {
         "id": user_id, "email": e, "username": un, "roleKey": rk,
-        "permissionKeys": body.permissionKeys, "createdAt": ca.isoformat(),
+        "moduleKeys": body.moduleKeys, "createdAt": ca.isoformat(),
     }
 
 
@@ -217,7 +202,7 @@ class BulkUserRow(BaseModel):
     email: str
     username: Optional[str] = None
     roleKey: str
-    permissionKeys: List[str] = []
+    moduleKeys: List[str] = []
 
 
 class BulkUsersRequest(BaseModel):
@@ -232,8 +217,8 @@ def bulk_add_users(body: BulkUsersRequest, admin_email: str = Depends(require_ad
         with conn.cursor() as cur:
             cur.execute("SELECT role_key FROM roles")
             valid_roles = {r[0] for r in cur.fetchall()}
-            cur.execute("SELECT permission_key FROM permissions")
-            valid_perms = {r[0] for r in cur.fetchall()}
+            cur.execute("SELECT module_key FROM modules")
+            valid_modules = {r[0] for r in cur.fetchall()}
 
         for row in body.users:
             try:
@@ -242,9 +227,9 @@ def bulk_add_users(body: BulkUsersRequest, admin_email: str = Depends(require_ad
                     raise ValueError(f"invalid email: '{row.email}'")
                 if row.roleKey not in valid_roles:
                     raise ValueError(f"unknown role '{row.roleKey}' (must be one of {sorted(valid_roles)})")
-                bad_perms = [p for p in row.permissionKeys if p not in valid_perms]
-                if bad_perms:
-                    raise ValueError(f"unknown permission(s): {', '.join(bad_perms)}")
+                bad_modules = [m for m in row.moduleKeys if m not in valid_modules]
+                if bad_modules:
+                    raise ValueError(f"unknown module(s): {', '.join(bad_modules)}")
 
                 with conn.cursor() as cur:
                     cur.execute(
@@ -257,11 +242,11 @@ def bulk_add_users(body: BulkUsersRequest, admin_email: str = Depends(require_ad
                         (email, row.username, row.roleKey),
                     )
                     (user_id,) = cur.fetchone()
-                    cur.execute("DELETE FROM user_permissions WHERE user_id = %s", (user_id,))
-                    for pk in row.permissionKeys:
+                    cur.execute("DELETE FROM user_modules WHERE user_id = %s", (user_id,))
+                    for mk in row.moduleKeys:
                         cur.execute(
-                            "INSERT INTO user_permissions (user_id, permission_key) VALUES (%s, %s)",
-                            (user_id, pk),
+                            "INSERT INTO user_modules (user_id, module_key) VALUES (%s, %s)",
+                            (user_id, mk),
                         )
                 conn.commit()
                 results.append({"email": email, "status": "ok"})

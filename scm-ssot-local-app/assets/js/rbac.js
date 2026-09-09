@@ -206,17 +206,17 @@
     if(!host) return;
     host.innerHTML = 'Loading…';
 
-    var roles, permissions, users;
+    var roles, modules, users;
     try{
       var hdr = authHeaders({'X-User-Email': adminEmail});
-      var [rolesRes, permsRes, usersRes] = await Promise.all([
+      var [rolesRes, modsRes, usersRes] = await Promise.all([
         fetch(apiBase()+'/api/admin/roles', {headers: hdr}),
-        fetch(apiBase()+'/api/admin/permissions', {headers: hdr}),
+        fetch(apiBase()+'/api/admin/modules', {headers: hdr}),
         fetch(apiBase()+'/api/admin/users', {headers: hdr})
       ]);
-      if(!rolesRes.ok || !permsRes.ok || !usersRes.ok) throw new Error('admin fetch failed');
+      if(!rolesRes.ok || !modsRes.ok || !usersRes.ok) throw new Error('admin fetch failed');
       roles = await rolesRes.json();
-      permissions = await permsRes.json();
+      modules = await modsRes.json();
       users = await usersRes.json();
     }catch(err){
       host.innerHTML = '<p style="color:#7a1620">Could not load user management data. '+escapeHtml(err.message)+'</p>';
@@ -230,22 +230,22 @@
       }).join('');
     }
 
-    function permissionCheckboxes(){
-      return permissions.map(function(p){
+    function moduleCheckboxes(){
+      return modules.map(function(m){
         return '<label style="display:flex;align-items:center;gap:6px;font-size:13px;padding:4px 0">'+
-          '<input type="checkbox" name="permissionKeys" value="'+escapeHtml(p.permissionKey)+'"> '+
-          escapeHtml(p.permissionName)+
+          '<input type="checkbox" name="moduleKeys" value="'+escapeHtml(m.moduleKey)+'"> '+
+          escapeHtml(m.moduleName)+
         '</label>';
       }).join('');
     }
 
     function userRow(u){
-      var permsText = (u.permissionNames||[]).join(', ') || '—';
+      var modsText = (u.moduleNames||[]).join(', ') || '—';
       return '<tr>'+
         '<td style="padding:8px 10px">'+escapeHtml(u.email)+'</td>'+
         '<td style="padding:8px 10px">'+escapeHtml(u.username||'')+'</td>'+
         '<td style="padding:8px 10px">'+escapeHtml(u.roleName)+'</td>'+
-        '<td style="padding:8px 10px;color:#6b5b4d">'+escapeHtml(permsText)+'</td>'+
+        '<td style="padding:8px 10px;color:#6b5b4d">'+escapeHtml(modsText)+'</td>'+
         '<td style="padding:8px 10px;color:#8a7a6c">'+escapeHtml((u.createdAt||'').slice(0,10))+'</td>'+
         '<td style="padding:8px 10px"><button type="button" class="admin-remove" data-email="'+escapeHtml(u.email)+'" '+
           'style="border:1px solid #c9463a;color:#c9463a;background:none;border-radius:6px;padding:4px 10px;cursor:pointer">Remove</button></td>'+
@@ -262,8 +262,8 @@
             '<select name="roleKey" required style="padding:8px 10px;border:1px solid #ddd;border-radius:6px">'+roleOptions()+'</select>'+
           '</div>'+
           '<div style="margin-bottom:12px">'+
-            '<div style="font-size:12px;color:#8a7a6c;margin-bottom:4px">Permissions (which modules this user can access — Editors see every page but only edit these; Viewers only see these)</div>'+
-            permissionCheckboxes()+
+            '<div style="font-size:12px;color:#8a7a6c;margin-bottom:4px">Modules (Editors see every page but only edit these; Viewers only see these)</div>'+
+            moduleCheckboxes()+
           '</div>'+
           '<button type="submit" style="background:#7a1620;color:#fff;border:none;border-radius:6px;padding:8px 16px;cursor:pointer">Add</button>'+
         '</form>'+
@@ -274,8 +274,8 @@
         '<p class="admbulk__hint">'+
           'Download the template, fill one row per user, then upload it. '+
           'Role must be exactly <code>administrator</code>, <code>editor</code> or <code>viewer</code>. '+
-          'Permissions is optional — separate multiple with a semicolon, using the exact names shown above '+
-          '(e.g. <code>SCM Data Analytics;Procurement Risk &amp; Intelligence</code>).'+
+          'Modules is optional — separate multiple with a semicolon, using the exact page names shown above '+
+          '(e.g. <code>AGC Approved Vendor List;Risk Register</code>).'+
         '</p>'+
         '<div class="admbulk__steps">'+
           '<div class="admstep">'+
@@ -298,7 +298,7 @@
         '<table style="width:100%;border-collapse:collapse;font-size:13px">'+
           '<thead><tr style="text-align:left;border-bottom:1px solid #eee1d3;color:#8a7a6c">'+
             '<th style="padding:8px 10px">Email</th><th style="padding:8px 10px">Name</th>'+
-            '<th style="padding:8px 10px">Role</th><th style="padding:8px 10px">Permissions</th>'+
+            '<th style="padding:8px 10px">Role</th><th style="padding:8px 10px">Modules</th>'+
             '<th style="padding:8px 10px">Added</th><th></th>'+
           '</tr></thead>'+
           '<tbody id="adminUserRows">'+users.map(userRow).join('')+'</tbody>'+
@@ -313,7 +313,7 @@
         email: fd.get('email'),
         username: fd.get('username')||null,
         roleKey: fd.get('roleKey'),
-        permissionKeys: fd.getAll('permissionKeys')
+        moduleKeys: fd.getAll('moduleKeys')
       };
       msg.textContent = 'Adding…'; msg.style.color = '#6b5b4d';
       try{
@@ -349,8 +349,8 @@
     bindRemoveButtons();
 
     document.getElementById('adminDownloadTemplate').addEventListener('click', function(){
-      var csv = 'Email,Name,Role,Permissions\r\n'+
-        'jane.doe@algihaz.com,Jane Doe,editor,SCM Data Analytics;Procurement Risk & Intelligence\r\n';
+      var csv = 'Email,Name,Role,Modules\r\n'+
+        'jane.doe@algihaz.com,Jane Doe,editor,AGC Approved Vendor List;Risk Register\r\n';
       var blob = new Blob([csv], {type: 'text/csv'});
       var url = URL.createObjectURL(blob);
       var a = document.createElement('a');
@@ -373,9 +373,9 @@
       if(!file){ resultsEl.innerHTML = '<p style="color:#c9463a;font-size:13px">Choose a CSV file first.</p>'; return; }
 
       var roleByName = {}; roles.forEach(function(r){ roleByName[r.roleKey.toLowerCase()] = r.roleKey; });
-      var permByName = {}; permissions.forEach(function(p){
-        permByName[p.permissionName.toLowerCase()] = p.permissionKey;
-        permByName[p.permissionKey.toLowerCase()] = p.permissionKey;
+      var moduleByName = {}; modules.forEach(function(m){
+        moduleByName[m.moduleName.toLowerCase()] = m.moduleKey;
+        moduleByName[m.moduleKey.toLowerCase()] = m.moduleKey;
       });
 
       var text = await file.text();
@@ -383,7 +383,7 @@
       if(!rows.length){ resultsEl.innerHTML = '<p style="color:#c9463a;font-size:13px">File is empty.</p>'; return; }
       var header = rows[0].map(function(h){ return h.trim().toLowerCase(); });
       var iEmail = header.indexOf('email'), iName = header.indexOf('name'),
-          iRole = header.indexOf('role'), iPerm = header.indexOf('permissions');
+          iRole = header.indexOf('role'), iMods = header.indexOf('modules');
       if(iEmail<0 || iRole<0){
         resultsEl.innerHTML = '<p style="color:#c9463a;font-size:13px">Header row must include at least "Email" and "Role" columns.</p>';
         return;
@@ -399,17 +399,17 @@
           parseErrors.push({email: email||'(row '+(idx+2)+')', status:'error', detail: !email ? 'missing email' : 'unrecognised role "'+roleRaw+'"'});
           return;
         }
-        var permNames = iPerm>=0 ? (r[iPerm]||'').split(';').map(function(s){return s.trim();}).filter(Boolean) : [];
-        var permKeys = [], badPerm = null;
-        permNames.forEach(function(n){
-          var k = permByName[n.toLowerCase()];
-          if(k) permKeys.push(k); else badPerm = n;
+        var modNames = iMods>=0 ? (r[iMods]||'').split(';').map(function(s){return s.trim();}).filter(Boolean) : [];
+        var modKeys = [], badMod = null;
+        modNames.forEach(function(n){
+          var k = moduleByName[n.toLowerCase()];
+          if(k) modKeys.push(k); else badMod = n;
         });
-        if(badPerm){
-          parseErrors.push({email: email, status:'error', detail: 'unrecognised permission "'+badPerm+'"'});
+        if(badMod){
+          parseErrors.push({email: email, status:'error', detail: 'unrecognised module "'+badMod+'"'});
           return;
         }
-        users.push({email: email, username: (iName>=0 ? (r[iName]||'').trim() : '') || null, roleKey: roleKey, permissionKeys: permKeys});
+        users.push({email: email, username: (iName>=0 ? (r[iName]||'').trim() : '') || null, roleKey: roleKey, moduleKeys: modKeys});
       });
 
       resultsEl.innerHTML = '<p class="admbulk__summary">Uploading '+users.length+' row(s)…</p>';
