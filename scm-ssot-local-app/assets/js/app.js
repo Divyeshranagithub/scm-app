@@ -682,6 +682,19 @@ async function loadAVL(){
   if(location.protocol==='file:'){
     why.push('opened from disk (file://) — the browser blocks fetch; deploy the page to test live data');
   } else {
+    // 0) Backend API — RBAC-gated, the source of truth (no public data files)
+    const email = window.SCM_USER && window.SCM_USER.email;
+    if(email && window.SCM_API){
+      try{
+        const r=await fetch(window.SCM_API.base+'/api/data/avl?email='+encodeURIComponent(email),
+          {credentials:'same-origin',cache:'no-store',headers:{'Accept':'application/json','X-API-Key':window.SCM_API.key}});
+        if(r.ok){
+          window.AVL_DATA=normalize(await r.text());
+          SRC={txt:'Live · API',cls:'live'}; bind(); render(); return;
+        }
+        why.push('api/data/avl -> HTTP '+r.status);
+      }catch(e){ why.push('api/data/avl fetch failed: '+e.message); }
+    }
     // 1) Dataverse (only if a table is actually configured)
     if(AVL_CFG.webapi && AVL_CFG.webapi.tableSet){
       try{
@@ -939,6 +952,12 @@ const CONFIG_SCM = {
     url: 'scm-masterdata.json',
     webapi: null
   },
+  monthly: { url: 'scm-monthly.json', webapi: null },
+  coststructure: { url: 'cost-structure.json', webapi: null },
+  'embed-scmkpi':       { url: 'scm-embed-scmkpi.json',       webapi: null },
+  'embed-secavl':       { url: 'scm-embed-secavl.json',       webapi: null },
+  'embed-riskregister': { url: 'scm-embed-riskregister.json', webapi: null },
+  'embed-cfpPt':        { url: 'scm-embed-cfp-powertransformers.json', webapi: null },
   quiet: true                            // keep defaults silently if the file isn't there yet
 };
 
@@ -961,6 +980,21 @@ async function loadFromWebapi(w){
 async function loadSection(key, globalName, renderFn){
   const c = CONFIG_SCM[key];
   if(location.protocol === 'file:') return;         // preview: keep defaults
+  // Backend API first — RBAC-gated, the source of truth. Falls through to
+  // Dataverse/static-JSON only if unavailable (no user email yet, API down, etc).
+  const email = window.SCM_USER && window.SCM_USER.email;
+  if(email && window.SCM_API){
+    try{
+      const r = await fetch(window.SCM_API.base+'/api/data/'+encodeURIComponent(key)+'?email='+encodeURIComponent(email),
+        {credentials:'same-origin',cache:'no-store',headers:{'Accept':'application/json','X-API-Key':window.SCM_API.key}});
+      if(r.ok){
+        window[globalName] = await r.json();
+        renderFn();
+        console.info('[SCM] '+key+' loaded from API');
+        return;
+      }
+    }catch(e){ /* fall through to the file/Dataverse path below */ }
+  }
   try{
     const data = c.webapi ? await loadFromWebapi(c.webapi) : await loadJson(c.url);
     window[globalName] = data;
@@ -1255,6 +1289,42 @@ document.addEventListener('change',function(e){
   if(e.target && e.target.id==='moSelect'){ MO_ACTIVE=e.target.value; renderMonthly(); }
 });
 
+/* ================= SIMPLE POWER BI / SHAREPOINT EMBEDS =================
+   title+src pairs, editable from Content Administration the same way as
+   the JSON-driven datasets above — see CONFIG_SCM / loadSection. */
+window.SCM_EMBED_SCMKPI = {
+  title: "3-SCM Dashboard - 2026 - 7-24-2026 - V2",
+  src: "https://app.powerbi.com/view?r=eyJrIjoiZjQzYWU5OWQtMmRhZC00ODQyLWFkYmYtZDRjMDc0NjBmMWZhIiwidCI6Ijk3ZGE5ZDRmLWRlM2EtNDMxMC04MWM5LTcwZDU4ZjM3YWJkNSIsImMiOjl9"
+};
+window.SCM_EMBED_SECAVL = {
+  title: "SEC Vendor Approved List",
+  src: "https://app.powerbi.com/view?r=eyJrIjoiZTQ5MzJlMDktMWE1NS00ZDViLWJlODktYmQ1YzZlYjY0YjY3IiwidCI6Ijk3ZGE5ZDRmLWRlM2EtNDMxMC04MWM5LTcwZDU4ZjM3YWJkNSIsImMiOjl9"
+};
+window.SCM_EMBED_RISKREGISTER = {
+  title: "Risk Register",
+  src: "https://app.powerbi.com/view?r=eyJrIjoiNWMwMjVjM2EtMjA5ZC00YzZmLWIwZDEtOTY5ZDcwMWM5ODI3IiwidCI6Ijk3ZGE5ZDRmLWRlM2EtNDMxMC04MWM5LTcwZDU4ZjM3YWJkNSIsImMiOjl9"
+};
+window.SCM_EMBED_CFPPT = {
+  title: "Power Transformers Fact Pack",
+  src: "https://algihaz-my.sharepoint.com/personal/omar_ehab_algihaz_com/_layouts/15/embed.aspx?UniqueId=IQAxwpPUOETTRKUTotYysWiVAQfP_bIbMjVI2wT6dfOwRXM",
+  openUrl: "https://algihaz-my.sharepoint.com/:b:/p/omar_ehab/IQAxwpPUOETTRKUTotYysWiVAQfP_bIbMjVI2wT6dfOwRXM?e=eMvVej"
+};
+function renderEmbed(hostId, data){
+  const host=document.getElementById(hostId); if(!host) return;
+  if(!data || !data.src){ host.innerHTML='<div class="biempty">No report published yet.</div>'; return; }
+  host.innerHTML = `<iframe title="${(data.title||'').replace(/"/g,'&quot;')}" src="${data.src}" frameborder="0" allowFullScreen="true"></iframe>`;
+}
+function renderScmkpi(){ renderEmbed('scmkpiHost', window.SCM_EMBED_SCMKPI); }
+function renderSecavl(){ renderEmbed('secavlHost', window.SCM_EMBED_SECAVL); }
+function renderRiskregister(){ renderEmbed('riskregisterHost', window.SCM_EMBED_RISKREGISTER); }
+function renderCfpPt(){
+  renderEmbed('cfpPtHost', window.SCM_EMBED_CFPPT);
+  const a=document.getElementById('cfpPtOpenLink');
+  if(a && window.SCM_EMBED_CFPPT && window.SCM_EMBED_CFPPT.openUrl) a.href=window.SCM_EMBED_CFPPT.openUrl;
+}
+window.renderScmkpi=renderScmkpi; window.renderSecavl=renderSecavl;
+window.renderRiskregister=renderRiskregister; window.renderCfpPt=renderCfpPt;
+
 /* ================= ROUTER + DRAWER ================= */
 const TITLES = {
   admin:['Administration','User Management'],
@@ -1284,7 +1354,10 @@ var openSide = function(o){
 function go(page){
   if(!page || !TITLES[page]) page='overview';
   if(page==='secsole' && !window._secBooted){ window._secBooted=1; try{ loadSEC(); }catch(e){ console.warn(e); } }
-  if(page==='coststructure'){ try{ renderCostStructure(); }catch(e){ console.warn('[SCM] cost structure:',e); } }
+  if(page==='coststructure'){
+    try{ renderCostStructure(); }catch(e){ console.warn('[SCM] cost structure:',e); }
+    if(!window._costStructureBooted){ window._costStructureBooted=1; loadSection('coststructure','COST_STRUCTURE',function(){ try{ renderCostStructure(); }catch(e){ console.warn('[SCM] cost structure:',e); } }); }
+  }
   if(page==='shouldcost'){ try{ renderDemoSelect(); }catch(e){ console.warn('[SCM] demo select:',e); } }
   document.querySelectorAll('.nav__item').forEach(n=>n.classList.toggle('is-active',n.dataset.page===page));
   document.querySelectorAll('.page').forEach(p=>p.classList.toggle('is-active',p.dataset.page===page));
@@ -1314,7 +1387,26 @@ function go(page){
   window.scrollTo({top:0});
   if(page==='lme' && !lmeBooted){ lmeBooted=true; if(window.LME_BOOT) window.LME_BOOT(); }
   if(page==='avl' && !avlBooted){ avlBooted=true; if(window.loadAVL) window.loadAVL(); }
-  if(page==='monthly'){ try{ renderMonthly(); }catch(e){ console.warn('[SCM] monthly:',e); } }
+  if(page==='monthly'){
+    try{ renderMonthly(); }catch(e){ console.warn('[SCM] monthly:',e); }
+    if(!window._monthlyBooted){ window._monthlyBooted=1; loadSection('monthly','SCM_MONTHLY',renderMonthly); }
+  }
+  if(page==='scmkpi'){
+    try{ renderScmkpi(); }catch(e){ console.warn('[SCM] scmkpi:',e); }
+    if(!window._scmkpiBooted){ window._scmkpiBooted=1; loadSection('embed-scmkpi','SCM_EMBED_SCMKPI',renderScmkpi); }
+  }
+  if(page==='secavl'){
+    try{ renderSecavl(); }catch(e){ console.warn('[SCM] secavl:',e); }
+    if(!window._secavlBooted){ window._secavlBooted=1; loadSection('embed-secavl','SCM_EMBED_SECAVL',renderSecavl); }
+  }
+  if(page==='riskregister'){
+    try{ renderRiskregister(); }catch(e){ console.warn('[SCM] riskregister:',e); }
+    if(!window._riskregisterBooted){ window._riskregisterBooted=1; loadSection('embed-riskregister','SCM_EMBED_RISKREGISTER',renderRiskregister); }
+  }
+  if(page==='cfp-power-transformers'){
+    try{ renderCfpPt(); }catch(e){ console.warn('[SCM] cfpPt:',e); }
+    if(!window._cfpPtBooted){ window._cfpPtBooted=1; loadSection('embed-cfpPt','SCM_EMBED_CFPPT',renderCfpPt); }
+  }
 }
 /* =============================================================================
    NAVIGATION — bound by delegation on `document`, so it can never break:
@@ -1746,16 +1838,26 @@ function normalize(p){
 }
 /* ---- lazy-loaded detail file (long free-text fields) ---- */
 let DET=null,DETpending=null;
+function toDetailRows(j){
+  const c=j.cols;
+  return j.data.map(function(a){const o={};for(let i=0;i<c.length;i++)o[c[i]]=a[i];return o;});
+}
 function loadDetails(){
   if(DET)return Promise.resolve(DET);
   if(DETpending)return DETpending;
-  DETpending=fetch(CFG.detailUrl+'?v='+Date.now(),{credentials:'same-origin',cache:'no-store'})
-    .then(r=>r.ok?r.json():Promise.reject(new Error('HTTP '+r.status)))
-    .then(function(j){
-      const c=j.cols;
-      DET=j.data.map(function(a){const o={};for(let i=0;i<c.length;i++)o[c[i]]=a[i];return o;});
-      return DET;
-    }).catch(function(err){console.warn('[SEC] details unavailable:',err.message);DET=[];return DET;});
+  const email = window.SCM_USER && window.SCM_USER.email;
+  const apiReq = (email && window.SCM_API)
+    ? fetch(window.SCM_API.base+'/api/data/sec-avl-details?email='+encodeURIComponent(email),
+        {credentials:'same-origin',cache:'no-store',headers:{'Accept':'application/json','X-API-Key':window.SCM_API.key}})
+        .then(r=>r.ok?r.json():Promise.reject(new Error('HTTP '+r.status)))
+    : Promise.reject(new Error('no user email yet'));
+  DETpending=apiReq
+    .catch(function(){
+      return fetch(CFG.detailUrl+'?v='+Date.now(),{credentials:'same-origin',cache:'no-store'})
+        .then(r=>r.ok?r.json():Promise.reject(new Error('HTTP '+r.status)));
+    })
+    .then(function(j){ DET=toDetailRows(j); return DET; })
+    .catch(function(err){console.warn('[SEC] details unavailable:',err.message);DET=[];return DET;});
   return DETpending;
 }
 window.secDetail=function(i){
@@ -1797,6 +1899,17 @@ async function loadSEC(){
   const why=[];
   if(location.protocol==='file:')why.push('file:// blocks fetch');
   else{
+    const email = window.SCM_USER && window.SCM_USER.email;
+    if(email && window.SCM_API){
+      try{
+        const r=await fetch(window.SCM_API.base+'/api/data/sec-sole-source?email='+encodeURIComponent(email),
+          {credentials:'same-origin',cache:'no-store',headers:{'Accept':'application/json','X-API-Key':window.SCM_API.key}});
+        if(r.ok){
+          window.SEC_DATA=normalize(await r.json());SRC={txt:'Live · API',cls:'live'};render();return;
+        }
+        why.push('api/data/sec-sole-source -> HTTP '+r.status);
+      }catch(e){ why.push('api/data/sec-sole-source fetch failed: '+e.message); }
+    }
     if(CFG.webapi&&CFG.webapi.tableSet){
       try{
         const dv=await fromDataverse(CFG.webapi);

@@ -3,16 +3,12 @@
 
    Adapted from the business-supplied reference (scm-vibecode/_src/js/page-admin.js).
    Differences from that reference, both because we have no Dataverse tables:
-     - No "Publish to Dataverse" / Data source tab. The only publish route is
-       "Download .json" — edit here, download the file, then whoever has S3
-       access uploads it to replace the file on CloudFront. That needs nothing
-       provisioned and matches how avl.json etc. already get updated today.
-     - Datasets are scoped to what the site actually reads from a JSON file
-       right now: Overview, Master Data, Cost Structure, AGC AVL, SEC sole-
-       source and SEC record details. "Site & navigation" and "Monthly
-       reports" from the reference aren't included yet — our Overview/Monthly
-       pages don't read those as external config today, so editing them here
-       would have no visible effect until that's wired up.
+     - No "Publish to Dataverse" / Data source tab.
+     - Every dataset here has moved off static files (see RESOURCES[].apiKey)
+       and publishes straight to the backend (PUT /api/data/{key}, RBAC-
+       gated) via the "Publish" button — the live page picks it up
+       immediately, no file upload. "Download .json" is kept as a manual
+       backup/export route, not the primary save path.
      - Visible only to editor/administrator (gated in rbac.js, not here).
        Which datasets an *editor* sees is further scoped to their assigned
        permissions; an administrator sees all of them.
@@ -31,39 +27,69 @@
   var RESOURCES = [
     {
       key: 'overview', label: 'Overview KPIs', moduleKey: 'overview',
-      file: 'scm-overview.json',
+      file: 'scm-overview.json', apiKey: 'overview',
       desc: 'The executive summary: overall score, value captured, and every KPI group on the Overview page.',
       editor: 'overview'
     },
     {
       key: 'masterdata', label: 'Master data progress', moduleKey: 'masterdata',
-      file: 'scm-masterdata.json',
+      file: 'scm-masterdata.json', apiKey: 'masterdata',
       desc: 'Item-code cleansing: headline figures, batch progress, and the taxonomy-mapping section.',
       editor: 'masterdata'
     },
     {
       key: 'coststructure', label: 'Cost structure', moduleKey: 'coststructure',
-      file: 'cost-structure.json',
+      file: 'cost-structure.json', apiKey: 'coststructure',
       desc: 'Commodity cost breakdowns behind the Should-Cost reference library. Edit as JSON or replace the whole document from a file.',
       editor: 'json'
     },
     {
       key: 'avl', label: 'AGC vendor list', moduleKey: 'avl',
-      file: 'avl.json',
+      file: 'avl.json', apiKey: 'avl',
       desc: 'The approved vendor extract behind the AGC AVL dashboard. Large and machine-generated — replace the whole document rather than hand-editing rows.',
       editor: 'json'
     },
     {
       key: 'sec', label: 'SEC sole-source data', moduleKey: 'secsole',
-      file: 'sec-sole-source.json',
+      file: 'sec-sole-source.json', apiKey: 'sec-sole-source',
       desc: 'Vendor records behind the SEC sole-source risk analysis. Replace as a whole document.',
       editor: 'json'
     },
     {
       key: 'secdetails', label: 'SEC record details', moduleKey: 'secsole',
-      file: 'sec-avl-details.json',
+      file: 'sec-avl-details.json', apiKey: 'sec-avl-details',
       desc: 'The long free-text fields shown in the SEC record drawer. Loaded only when a record is opened, so it is kept in its own file.',
       editor: 'json'
+    },
+    {
+      key: 'monthly', label: 'Monthly reports', moduleKey: 'monthly',
+      file: 'scm-monthly.json', apiKey: 'monthly',
+      desc: 'The month picker on Monthly Intelligence. Add a month here to publish its report; leave the URL empty to show "not published yet".',
+      editor: 'monthly'
+    },
+    {
+      key: 'embed-scmkpi', label: 'SCM KPIs — Power BI link', moduleKey: 'scmkpi',
+      file: 'scm-embed-scmkpi.json', apiKey: 'embed-scmkpi',
+      desc: 'The Power BI report embedded on the SCM KPIs page.',
+      editor: 'embed'
+    },
+    {
+      key: 'embed-secavl', label: 'SEC Approved Vendor List — Power BI link', moduleKey: 'secavl',
+      file: 'scm-embed-secavl.json', apiKey: 'embed-secavl',
+      desc: 'The Power BI report embedded on the SEC Approved Vendor List page.',
+      editor: 'embed'
+    },
+    {
+      key: 'embed-riskregister', label: 'Risk Register — Power BI link', moduleKey: 'riskregister',
+      file: 'scm-embed-riskregister.json', apiKey: 'embed-riskregister',
+      desc: 'The Power BI report embedded on the Risk Register page.',
+      editor: 'embed'
+    },
+    {
+      key: 'embed-cfpPt', label: 'Power Transformers Fact Pack — SharePoint link', moduleKey: 'categoryfactpacks',
+      file: 'scm-embed-cfp-powertransformers.json', apiKey: 'embed-cfpPt',
+      desc: 'The SharePoint document embedded on the Power Transformers fact pack page.',
+      editor: 'embed'
     }
   ];
   var byKey = {}; RESOURCES.forEach(function (r) { byKey[r.key] = r; });
@@ -154,6 +180,7 @@
       if (tail === 'kpis') return { cap: '', value: '', sub: '' };
       if (tail === 'steps') return { b: '', p: '' };
     }
+    if (key === 'monthly' && tail === 'months') return { key: '', label: '', status: 'updating', src: '' };
     return {};
   }
 
@@ -243,7 +270,33 @@
       '<button type="button" class="admadd" data-act="admView" data-a1="json">Open the JSON editor</button>');
   }
 
-  var FORMS = { overview: formOverview, masterdata: formMasterdata, json: formJson };
+  function formMonthly() {
+    return group('Published months', 'Newest first — the first row is what opens by default',
+      list('months', {
+        addLabel: 'Add month',
+        title: function (m) { return (m.label || m.key || '(month)') + (m.src ? '' : ' · no report'); },
+        render: function (p) {
+          return '<div class="admrow">' +
+            field(p + '.key', 'Key', { hint: 'e.g. 2026-08' }) +
+            field(p + '.label', 'Label', { hint: 'e.g. August 2026' }) +
+            field(p + '.status', 'Status', { type: 'select', options: [{ v: 'published', l: 'Published' }, { v: 'updating', l: 'Updating' }] }) +
+            field(p + '.src', 'Power BI URL', { wide: true, hint: 'leave empty for "not published yet"' }) +
+            '</div>';
+        }
+      }));
+  }
+
+  function formEmbed() {
+    var r = cur();
+    var out = group('Report link', 'Shown on the ' + r.label.split(' — ')[0] + ' page',
+      '<div class="admrow">' + field('title', 'Title', { wide: true }) +
+      field('src', 'Embed URL', { wide: true, hint: 'https, powerbi.com or sharepoint.com only' }) +
+      (getPath(ST.data[ST.key], 'openUrl') !== undefined ? field('openUrl', '"Open in" link', { wide: true }) : '') +
+      '</div>');
+    return out;
+  }
+
+  var FORMS = { overview: formOverview, masterdata: formMasterdata, monthly: formMonthly, embed: formEmbed, json: formJson };
 
   function msg(kind, title, body) {
     var m = el('admMsg'); if (!m) return;
@@ -278,6 +331,12 @@
     chip.textContent = s || 'not loaded';
     chip.className = 'srcchip' + (s && s.indexOf('Built-in') === 0 ? ' is-sample' : (s ? ' is-live' : ''));
     el('admDirty').hidden = !ST.dirty[r.key];
+    var pb = el('admPublishBtn'); if (pb) pb.hidden = !r.apiKey;
+    var db = el('admDownloadBtn');
+    if (db) {
+      db.textContent = r.apiKey ? 'Download backup .json' : 'Download .json';
+      db.classList.toggle('admbtn--go', !r.apiKey);
+    }
   }
   function renderView() {
     var v = ST.view;
@@ -325,6 +384,33 @@
       'Send this file to whoever deploys the site to replace <code>' + E(r.file) + '</code> at the site root. ' +
       'The live page reads it directly, so the change appears as soon as it is uploaded — no code deployment needed.');
   };
+  window.admPublish = function () {
+    var r = cur();
+    if (!r.apiKey) return;
+    var email = window.SCM_USER && window.SCM_USER.email;
+    if (!email || !window.SCM_API) { msg('', 'Cannot publish', 'Your sign-in details are not available yet. Refresh the page and try again.'); return; }
+    var btn = document.querySelector('[data-act="admPublish"]');
+    if (btn) btn.disabled = true;
+    fetch(window.SCM_API.base + '/api/data/' + encodeURIComponent(r.apiKey), {
+      method: 'PUT', credentials: 'same-origin',
+      headers: { 'Content-Type': 'application/json', 'X-API-Key': window.SCM_API.key, 'X-User-Email': email },
+      body: JSON.stringify(ST.data[r.key])
+    }).then(function (res) {
+      if (!res.ok) return res.json().catch(function () { return {}; }).then(function (b) {
+        throw new Error(b.detail || ('HTTP ' + res.status));
+      });
+      return res.json();
+    }).then(function () {
+      ST.dirty[r.key] = false; ST.orig[r.key] = clone(ST.data[r.key]); ST.src[r.key] = 'Live · API';
+      ST.loaded[r.key] = true;
+      renderRail(); renderHead();
+      msg('ok', 'Published', 'The live site now reads this document from the backend — the change is visible immediately, no file upload needed.');
+    }).catch(function (e) {
+      msg('', 'Publish failed', E(e.message));
+    }).then(function () {
+      if (btn) btn.disabled = false;
+    });
+  };
   window.admPreview = function () {
     if (window.SCM && typeof window.SCM.go === 'function') window.SCM.go(cur().moduleKey);
   };
@@ -338,10 +424,20 @@
   function load(key) {
     var r = byKey[key];
     if (ST.data[key]) return Promise.resolve();
+    var email = window.SCM_USER && window.SCM_USER.email;
+    var apiReq = (r.apiKey && email && window.SCM_API)
+      ? fetch(window.SCM_API.base + '/api/data/' + encodeURIComponent(r.apiKey) + '?email=' + encodeURIComponent(email),
+          { cache: 'no-cache', headers: { 'X-API-Key': window.SCM_API.key } })
+          .then(function (res) { if (!res.ok) throw new Error(String(res.status)); return res.json(); })
+          .then(function (d) { return { d: d, from: 'Live · API' }; })
+      : Promise.reject(new Error('no api for this dataset'));
     var url = '/' + r.file;
-    return fetch(url, { cache: 'no-cache' })
-      .then(function (res) { if (!res.ok) throw new Error(String(res.status)); return res.json(); })
-      .then(function (d) { return { d: d, from: 'Web File · ' + url }; })
+    return apiReq
+      .catch(function () {
+        return fetch(url, { cache: 'no-cache' })
+          .then(function (res) { if (!res.ok) throw new Error(String(res.status)); return res.json(); })
+          .then(function (d) { return { d: d, from: 'Web File · ' + url }; });
+      })
       .catch(function () { return { d: fallback(key), from: 'Built-in default' }; })
       .then(function (res) {
         ST.data[key] = res.d; ST.orig[key] = clone(res.d); ST.src[key] = res.from;
@@ -351,6 +447,8 @@
   function fallback(key) {
     if (key === 'overview') return { title: '', cutoff: '', cadence: 'Monthly', poDate: '', overallScore: 0, value: {}, groups: [] };
     if (key === 'masterdata') return { title: '', sub: '', context: '', headline: [], completed: [], remaining: [], taxonomy: { kpis: [], steps: [] } };
+    if (key === 'monthly') return { months: [] };
+    if (String(key).indexOf('embed-') === 0) return { title: '', src: '' };
     return {};
   }
 

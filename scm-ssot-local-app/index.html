@@ -8,8 +8,11 @@
 <link rel="stylesheet" href="assets/css/bootstrap.min.css">
 <link rel="stylesheet" href="assets/css/theme.css">
 <link rel="stylesheet" href="assets/css/portalbasictheme.css">
-<link rel="stylesheet" href="assets/css/app.css">
-<link rel="stylesheet" href="assets/css/page-admin.css">
+<!-- cache-busting: DronaHQ's own container caches this page's assets even after
+     CloudFront serves the fresh version, so every one of our own files below
+     carries ?v=N — bump N (search/replace) whenever any of them change. -->
+<link rel="stylesheet" href="assets/css/app.css?v=1">
+<link rel="stylesheet" href="assets/css/page-admin.css?v=2">
 <!-- starts fetching this large SDK file immediately, in parallel with everything
      else, instead of waiting until app.js finishes executing to even begin -->
 <link rel="preload" as="script" href="assets/js/dronahq.js">
@@ -126,7 +129,8 @@
         </div>
 
         <div class="adm__foot">
-          <button type="button" class="admbtn admbtn--go" data-act="admDownload">Download .json</button>
+          <button type="button" class="admbtn admbtn--go" id="admPublishBtn" data-act="admPublish" hidden>Publish</button>
+          <button type="button" class="admbtn" id="admDownloadBtn" data-act="admDownload">Download .json</button>
           <button type="button" class="admbtn" data-act="admPreview">Open the page</button>
           <button type="button" class="admbtn admbtn--warn" data-act="admRevert">Discard changes</button>
         </div>
@@ -149,8 +153,7 @@
   <!-- ============ SCM KPIs (Power BI) ============ -->
   <section class="page" data-page="scmkpi">
        <p class="eyebrow">SCM Dashboard — 2026 · Power BI</p>
-    <div class="bi">
-      <iframe title="3-SCM Dashboard - 2026 - 7-24-2026 - V2" src="https://app.powerbi.com/view?r=eyJrIjoiZjQzYWU5OWQtMmRhZC00ODQyLWFkYmYtZDRjMDc0NjBmMWZhIiwidCI6Ijk3ZGE5ZDRmLWRlM2EtNDMxMC04MWM5LTcwZDU4ZjM3YWJkNSIsImMiOjl9" frameborder="0" allowFullScreen="true"></iframe> </div>
+    <div class="bi" id="scmkpiHost"></div>
   </section>
 
   <!-- ============ MONTHLY (Power BI) ============ -->
@@ -264,9 +267,7 @@
 
   <section class="page" data-page="secavl">
     <p class="eyebrow">SEC Approved Vendor List · Power BI</p>
-    <div class="bi">
-      <iframe title="SEC Vendor Approved List" src="https://app.powerbi.com/view?r=eyJrIjoiZTQ5MzJlMDktMWE1NS00ZDViLWJlODktYmQ1YzZlYjY0YjY3IiwidCI6Ijk3ZGE5ZDRmLWRlM2EtNDMxMC04MWM5LTcwZDU4ZjM3YWJkNSIsImMiOjl9" frameborder="0" allowFullScreen="true"></iframe>
-    </div>
+    <div class="bi" id="secavlHost"></div>
   </section>
 
   <section class="page" data-page="secsole">
@@ -360,9 +361,7 @@
 
   <section class="page" data-page="riskregister">
     <p class="eyebrow">SCM Risk Register · Power BI</p>
-    <div class="bi">
-      <iframe title="Risk Register" src="https://app.powerbi.com/view?r=eyJrIjoiNWMwMjVjM2EtMjA5ZC00YzZmLWIwZDEtOTY5ZDcwMWM5ODI3IiwidCI6Ijk3ZGE5ZDRmLWRlM2EtNDMxMC04MWM5LTcwZDU4ZjM3YWJkNSIsImMiOjl9" frameborder="0" allowFullScreen="true"></iframe>
-    </div>
+    <div class="bi" id="riskregisterHost"></div>
   </section>
 
   <section class="page" data-page="l0projects">
@@ -497,13 +496,9 @@
         <button class="backlink" data-page="categoryfactpacks">← Category Fact Packs</button>
         <h2 class="pghead__t">Power Transformers <span class="mi__no" style="position:static">#02</span></h2>
       </div>
-      <div class="pghead__r"><a class="scdemo" href="https://algihaz-my.sharepoint.com/:b:/p/omar_ehab/IQAxwpPUOETTRKUTotYysWiVAQfP_bIbMjVI2wT6dfOwRXM?e=eMvVej" target="_blank" rel="noopener">Open in SharePoint ↗</a></div>
+      <div class="pghead__r"><a class="scdemo" id="cfpPtOpenLink" href="https://algihaz-my.sharepoint.com/:b:/p/omar_ehab/IQAxwpPUOETTRKUTotYysWiVAQfP_bIbMjVI2wT6dfOwRXM?e=eMvVej" target="_blank" rel="noopener">Open in SharePoint ↗</a></div>
     </div>
-    <div class="pdfframe">
-      <iframe title="Power Transformers Fact Pack"
-        src="https://algihaz-my.sharepoint.com/personal/omar_ehab_algihaz_com/_layouts/15/embed.aspx?UniqueId=IQAxwpPUOETTRKUTotYysWiVAQfP_bIbMjVI2wT6dfOwRXM"
-        frameborder="0" allowfullscreen></iframe>
-    </div>
+    <div class="pdfframe" id="cfpPtHost"></div>
   </section>
 
 
@@ -577,12 +572,12 @@
 <footer class="appftr">
   <span>Prepared by Omar Ehab · Revised by Mohamed Radwan · Procurement Strategy Department</span>
   <span class="r">Al Gihaz Contracting</span>
-</footer><script src="assets/js/app.js"></script>
+</footer><script src="assets/js/app.js?v=4"></script>
 <!-- DronaHQ Native Container SDK: creates window.DronaHQ and fires "deviceready"
      once the container bridge is up. Must load before dronahq-sso.js. -->
 <script src="assets/js/dronahq.js"></script>
-<script src="assets/js/dronahq-sso.js"></script>
-<script src="assets/js/content-admin.js"></script>
-<script src="assets/js/rbac.js"></script>
+<script src="assets/js/dronahq-sso.js?v=1"></script>
+<script src="assets/js/content-admin.js?v=4"></script>
+<script src="assets/js/rbac.js?v=2"></script>
 </body>
 </html>

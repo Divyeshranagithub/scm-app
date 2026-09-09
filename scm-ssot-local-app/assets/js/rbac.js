@@ -271,16 +271,28 @@
       '</div>'+
       '<div style="background:#fff;border:1px solid #eee1d3;border-radius:10px;padding:18px;margin-bottom:20px;max-width:640px">'+
         '<h3 style="margin:0 0 8px;font-size:15px">Bulk add users</h3>'+
-        '<p style="margin:0 0 10px;font-size:12px;color:#8a7a6c;line-height:1.5">'+
+        '<p class="admbulk__hint">'+
           'Download the template, fill one row per user, then upload it. '+
           'Role must be exactly <code>administrator</code>, <code>editor</code> or <code>viewer</code>. '+
           'Permissions is optional — separate multiple with a semicolon, using the exact names shown above '+
           '(e.g. <code>SCM Data Analytics;Procurement Risk &amp; Intelligence</code>).'+
         '</p>'+
-        '<button type="button" id="adminDownloadTemplate" style="border:1px solid #ddd;background:#fff;border-radius:6px;padding:8px 14px;cursor:pointer;margin-right:8px">Download template (.csv)</button>'+
-        '<input type="file" id="adminBulkFile" accept=".csv" style="margin-right:8px">'+
-        '<button type="button" id="adminBulkUpload" style="background:#7a1620;color:#fff;border:none;border-radius:6px;padding:8px 16px;cursor:pointer">Upload</button>'+
-        '<div id="adminBulkResults" style="margin-top:12px"></div>'+
+        '<div class="admbulk__steps">'+
+          '<div class="admstep">'+
+            '<span class="admstep__n">1</span>'+
+            '<button type="button" class="admbtn" id="adminDownloadTemplate">Download template (.csv)</button>'+
+          '</div>'+
+          '<div class="admstep">'+
+            '<span class="admstep__n">2</span>'+
+            '<label class="admfile" for="adminBulkFile">'+
+              '<span class="admfile__btn">Choose file</span>'+
+              '<span class="admfile__name" id="adminBulkFileName">No file chosen</span>'+
+            '</label>'+
+            '<input type="file" id="adminBulkFile" accept=".csv" hidden>'+
+            '<button type="button" class="admbtn admbtn--go" id="adminBulkUpload">Upload</button>'+
+          '</div>'+
+        '</div>'+
+        '<div class="admbulk__results" id="adminBulkResults"></div>'+
       '</div>'+
       '<div style="background:#fff;border:1px solid #eee1d3;border-radius:10px;overflow:auto">'+
         '<table style="width:100%;border-collapse:collapse;font-size:13px">'+
@@ -347,6 +359,13 @@
       URL.revokeObjectURL(url);
     });
 
+    document.getElementById('adminBulkFile').addEventListener('change', function(e){
+      var nameEl = document.getElementById('adminBulkFileName');
+      var f = e.target.files[0];
+      nameEl.textContent = f ? f.name : 'No file chosen';
+      nameEl.classList.toggle('has-file', !!f);
+    });
+
     document.getElementById('adminBulkUpload').addEventListener('click', async function(){
       var fileInput = document.getElementById('adminBulkFile');
       var resultsEl = document.getElementById('adminBulkResults');
@@ -393,7 +412,7 @@
         users.push({email: email, username: (iName>=0 ? (r[iName]||'').trim() : '') || null, roleKey: roleKey, permissionKeys: permKeys});
       });
 
-      resultsEl.innerHTML = '<p style="font-size:13px;color:#6b5b4d">Uploading '+users.length+' row(s)…</p>';
+      resultsEl.innerHTML = '<p class="admbulk__summary">Uploading '+users.length+' row(s)…</p>';
       var apiResults = [];
       if(users.length){
         try{
@@ -413,18 +432,23 @@
 
       var all = apiResults.concat(parseErrors);
       var okCount = all.filter(function(r){return r.status==='ok';}).length;
+      var allOk = okCount === all.length;
       resultsEl.innerHTML =
-        '<p style="font-size:13px;margin-bottom:6px">'+okCount+' of '+all.length+' row(s) added successfully.</p>'+
-        '<table style="width:100%;border-collapse:collapse;font-size:12px">'+
+        '<p class="admbulk__summary" style="color:'+(allOk?'#2e7d32':'#6b5b4d')+'">'+
+          (allOk ? '✓ ' : '') + okCount+' of '+all.length+' row(s) added successfully.'+
+        '</p>'+
+        '<table>'+
           '<tbody>'+all.map(function(r){
             var ok = r.status==='ok';
-            return '<tr><td style="padding:3px 6px;color:'+(ok?'#2e7d32':'#c9463a')+'">'+(ok?'✓':'✗')+'</td>'+
-              '<td style="padding:3px 6px">'+escapeHtml(r.email)+'</td>'+
-              '<td style="padding:3px 6px;color:#8a7a6c">'+escapeHtml(r.detail||'')+'</td></tr>';
+            return '<tr><td style="width:20px;color:'+(ok?'#2e7d32':'#c9463a')+';font-weight:700">'+(ok?'✓':'✗')+'</td>'+
+              '<td>'+escapeHtml(r.email)+'</td>'+
+              '<td style="color:#8a7a6c">'+escapeHtml(r.detail||'')+'</td></tr>';
           }).join('')+
           '</tbody>'+
         '</table>';
       fileInput.value = '';
+      var fnEl = document.getElementById('adminBulkFileName');
+      fnEl.textContent = 'No file chosen'; fnEl.classList.remove('has-file');
       if(okCount>0){
         try{
           var refreshed = await fetch(apiBase()+'/api/admin/users', {headers: authHeaders({'X-User-Email': adminEmail})});
