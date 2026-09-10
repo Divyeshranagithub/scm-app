@@ -90,6 +90,21 @@
       file: 'scm-embed-cfp-powertransformers.json', apiKey: 'embed-cfpPt',
       desc: 'The SharePoint document embedded on the Power Transformers fact pack page.',
       editor: 'embed'
+    },
+    {
+      key: 'l0projects', label: 'L0 Projects', moduleKey: 'l0projects',
+      desc: 'Marked "Coming soon" on the site — no content has been built for this page yet.',
+      editor: 'soon'
+    },
+    {
+      key: 'shouldcost', label: 'Demo Should Cost Model', moduleKey: 'shouldcost',
+      desc: 'A demo/sample page, not real production content — nothing to manage here yet.',
+      editor: 'soon'
+    },
+    {
+      key: 'strategy', label: 'Strategy Recommendation', moduleKey: 'strategy',
+      desc: 'Marked "Coming soon" on the site — no content has been built for this page yet.',
+      editor: 'soon'
     }
   ];
   var byKey = {}; RESOURCES.forEach(function (r) { byKey[r.key] = r; });
@@ -296,7 +311,16 @@
     return out;
   }
 
-  var FORMS = { overview: formOverview, masterdata: formMasterdata, monthly: formMonthly, embed: formEmbed, json: formJson };
+  function formSoon() {
+    var r = cur();
+    return '<div class="admgrp"><div class="admgrp__b">' +
+      '<p class="adm__hint"><b>' + E(r.label) + ' has no content yet.</b> This page is marked ' +
+      '&ldquo;coming soon&rdquo; on the site — there is nothing to edit until the business defines ' +
+      'what goes on it. Once real content or data exists, it can be wired up here the same way as ' +
+      'the other pages.</p></div></div>';
+  }
+
+  var FORMS = { overview: formOverview, masterdata: formMasterdata, monthly: formMonthly, embed: formEmbed, json: formJson, soon: formSoon };
 
   function msg(kind, title, body) {
     var m = el('admMsg'); if (!m) return;
@@ -324,22 +348,27 @@
   }
   function renderJson() { var ta = el('admTa'); if (ta) ta.value = JSON.stringify(ST.data[ST.key], null, 2); }
   function renderHead() {
-    var r = cur();
+    var r = cur(); var soon = r.editor === 'soon';
     el('admTitle').textContent = r.label;
     el('admDesc').textContent = r.desc;
     var chip = el('admSrc'); var s = ST.src[r.key];
-    chip.textContent = s || 'not loaded';
-    chip.className = 'srcchip' + (s && s.indexOf('Built-in') === 0 ? ' is-sample' : (s ? ' is-live' : ''));
+    chip.textContent = soon ? 'Not built yet' : (s || 'not loaded');
+    chip.className = 'srcchip' + (soon ? ' is-sample' : (s && s.indexOf('Built-in') === 0 ? ' is-sample' : (s ? ' is-live' : '')));
     el('admDirty').hidden = !ST.dirty[r.key];
     var pb = el('admPublishBtn'); if (pb) pb.hidden = !r.apiKey;
     var db = el('admDownloadBtn');
     if (db) {
+      db.hidden = soon;
       db.textContent = r.apiKey ? 'Download backup .json' : 'Download .json';
       db.classList.toggle('admbtn--go', !r.apiKey);
     }
+    var revertBtn = document.querySelector('[data-act="admRevert"]');
+    if (revertBtn) revertBtn.hidden = soon;
   }
   function renderView() {
-    var v = ST.view;
+    var soon = cur().editor === 'soon';
+    var tabs = el('admTabs'); if (tabs) tabs.hidden = soon;
+    var v = soon ? 'form' : ST.view;
     el('admForm').hidden = v !== 'form';
     el('admJson').hidden = v !== 'json';
     [['admTabForm', 'form'], ['admTabJson', 'json']].forEach(function (p) {
@@ -424,6 +453,10 @@
   function load(key) {
     var r = byKey[key];
     if (ST.data[key]) return Promise.resolve();
+    if (r.editor === 'soon') {
+      ST.data[key] = {}; ST.orig[key] = {}; ST.src[key] = 'Not built yet'; ST.loaded[key] = false;
+      return Promise.resolve();
+    }
     var email = window.SCM_USER && window.SCM_USER.email;
     var apiReq = (r.apiKey && email && window.SCM_API)
       ? fetch(window.SCM_API.base + '/api/data/' + encodeURIComponent(r.apiKey) + '?email=' + encodeURIComponent(email),
