@@ -247,14 +247,18 @@
         '<td style="padding:8px 10px">'+escapeHtml(u.roleName)+'</td>'+
         '<td style="padding:8px 10px;color:#6b5b4d">'+escapeHtml(modsText)+'</td>'+
         '<td style="padding:8px 10px;color:#8a7a6c">'+escapeHtml((u.createdAt||'').slice(0,10))+'</td>'+
-        '<td style="padding:8px 10px"><button type="button" class="admin-remove" data-email="'+escapeHtml(u.email)+'" '+
-          'style="border:1px solid #c9463a;color:#c9463a;background:none;border-radius:6px;padding:4px 10px;cursor:pointer">Remove</button></td>'+
+        '<td style="padding:8px 10px;white-space:nowrap">'+
+          '<button type="button" class="admin-edit" data-email="'+escapeHtml(u.email)+'" '+
+            'style="border:1px solid #7a1620;color:#7a1620;background:none;border-radius:6px;padding:4px 10px;cursor:pointer;margin-right:6px">Edit</button>'+
+          '<button type="button" class="admin-remove" data-email="'+escapeHtml(u.email)+'" '+
+            'style="border:1px solid #c9463a;color:#c9463a;background:none;border-radius:6px;padding:4px 10px;cursor:pointer">Remove</button>'+
+        '</td>'+
       '</tr>';
     }
 
     host.innerHTML =
       '<div style="background:#fff;border:1px solid #eee1d3;border-radius:10px;padding:18px;margin-bottom:20px;max-width:640px">'+
-        '<h3 style="margin:0 0 12px;font-size:15px">Add user</h3>'+
+        '<h3 id="adminFormHeading" style="margin:0 0 12px;font-size:15px">Add user</h3>'+
         '<form id="adminAddForm">'+
           '<div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-bottom:12px">'+
             '<input name="email" type="email" required placeholder="name@algihaz.com" style="flex:1 1 220px;padding:8px 10px;border:1px solid #ddd;border-radius:6px">'+
@@ -265,7 +269,8 @@
             '<div style="font-size:12px;color:#8a7a6c;margin-bottom:4px">Modules (Editors see every page but only edit these; Viewers only see these)</div>'+
             moduleCheckboxes()+
           '</div>'+
-          '<button type="submit" style="background:#7a1620;color:#fff;border:none;border-radius:6px;padding:8px 16px;cursor:pointer">Add</button>'+
+          '<button type="submit" id="adminFormSubmitBtn" style="background:#7a1620;color:#fff;border:none;border-radius:6px;padding:8px 16px;cursor:pointer">Add</button>'+
+          '<button type="button" id="adminFormCancelBtn" hidden style="background:none;border:1px solid #ddd;border-radius:6px;padding:8px 16px;cursor:pointer;margin-left:8px">Cancel</button>'+
         '</form>'+
         '<p id="adminAddMsg" style="margin:10px 0 0;font-size:13px"></p>'+
       '</div>'+
@@ -305,6 +310,33 @@
         '</table>'+
       '</div>';
 
+    var editingEmail = null;   // set while the form is pre-filled to edit an existing user
+
+    function enterEditMode(u){
+      editingEmail = u.email;
+      var form = document.getElementById('adminAddForm');
+      form.email.value = u.email;
+      form.email.readOnly = true;
+      form.username.value = u.username || '';
+      form.roleKey.value = u.roleKey;
+      var have = new Set(u.moduleKeys || []);
+      form.querySelectorAll('input[name="moduleKeys"]').forEach(function(cb){ cb.checked = have.has(cb.value); });
+      document.getElementById('adminFormHeading').textContent = 'Edit user — '+u.email;
+      document.getElementById('adminFormSubmitBtn').textContent = 'Save changes';
+      document.getElementById('adminFormCancelBtn').hidden = false;
+      form.scrollIntoView({behavior:'smooth', block:'start'});
+    }
+    function exitEditMode(){
+      editingEmail = null;
+      var form = document.getElementById('adminAddForm');
+      form.reset();
+      form.email.readOnly = false;
+      document.getElementById('adminFormHeading').textContent = 'Add user';
+      document.getElementById('adminFormSubmitBtn').textContent = 'Add';
+      document.getElementById('adminFormCancelBtn').hidden = true;
+    }
+    document.getElementById('adminFormCancelBtn').addEventListener('click', exitEditMode);
+
     document.getElementById('adminAddForm').addEventListener('submit', async function(e){
       e.preventDefault();
       var msg = document.getElementById('adminAddMsg');
@@ -315,7 +347,8 @@
         roleKey: fd.get('roleKey'),
         moduleKeys: fd.getAll('moduleKeys')
       };
-      msg.textContent = 'Adding…'; msg.style.color = '#6b5b4d';
+      var wasEditing = !!editingEmail;
+      msg.textContent = wasEditing ? 'Saving…' : 'Adding…'; msg.style.color = '#6b5b4d';
       try{
         var res = await fetch(apiBase()+'/api/admin/users', {
           method:'POST',
@@ -323,13 +356,24 @@
           body: JSON.stringify(body)
         });
         if(!res.ok){ var t = await res.text(); throw new Error(t); }
-        msg.textContent = 'Added.'; msg.style.color = '#2e7d32';
+        msg.textContent = wasEditing ? 'Saved.' : 'Added.'; msg.style.color = '#2e7d32';
         e.target.reset();
         renderAdminPage(adminEmail);
       }catch(err){
         msg.textContent = 'Failed: '+err.message; msg.style.color = '#c9463a';
       }
     });
+
+    function bindEditButtons(){
+      var byEmail = {}; users.forEach(function(u){ byEmail[u.email] = u; });
+      host.querySelectorAll('.admin-edit').forEach(function(btn){
+        btn.addEventListener('click', function(){
+          var u = byEmail[btn.dataset.email];
+          if(u) enterEditMode(u);
+        });
+      });
+    }
+    bindEditButtons();
 
     function bindRemoveButtons(){
       host.querySelectorAll('.admin-remove').forEach(function(btn){
@@ -453,9 +497,10 @@
         try{
           var refreshed = await fetch(apiBase()+'/api/admin/users', {headers: authHeaders({'X-User-Email': adminEmail})});
           if(refreshed.ok){
-            var refreshedUsers = await refreshed.json();
-            document.getElementById('adminUserRows').innerHTML = refreshedUsers.map(userRow).join('');
+            users = await refreshed.json();
+            document.getElementById('adminUserRows').innerHTML = users.map(userRow).join('');
             bindRemoveButtons();
+            bindEditButtons();
           }
         }catch(e){ /* results panel above still shows what happened; list refresh is best-effort */ }
       }
