@@ -198,67 +198,6 @@ def add_user(body: NewUser, admin_email: str = Depends(require_admin)):
     }
 
 
-class BulkUserRow(BaseModel):
-    email: str
-    username: Optional[str] = None
-    roleKey: str
-    moduleKeys: List[str] = []
-
-
-class BulkUsersRequest(BaseModel):
-    users: List[BulkUserRow]
-
-
-@router.post("/api/admin/users/bulk")
-def bulk_add_users(body: BulkUsersRequest, admin_email: str = Depends(require_admin)):
-    conn = db.get_conn()
-    results = []
-    try:
-        with conn.cursor() as cur:
-            cur.execute("SELECT role_key FROM roles")
-            valid_roles = {r[0] for r in cur.fetchall()}
-            cur.execute("SELECT module_key FROM modules")
-            valid_modules = {r[0] for r in cur.fetchall()}
-
-        for row in body.users:
-            try:
-                email = (row.email or "").strip()
-                if not email or "@" not in email:
-                    raise ValueError(f"invalid email: '{row.email}'")
-                if row.roleKey not in valid_roles:
-                    raise ValueError(f"unknown role '{row.roleKey}' (must be one of {sorted(valid_roles)})")
-                bad_modules = [m for m in row.moduleKeys if m not in valid_modules]
-                if bad_modules:
-                    raise ValueError(f"unknown module(s): {', '.join(bad_modules)}")
-
-                with conn.cursor() as cur:
-                    cur.execute(
-                        """
-                        INSERT INTO users (email, username, role_key)
-                        VALUES (%s, %s, %s)
-                        ON CONFLICT (email) DO UPDATE SET username = EXCLUDED.username, role_key = EXCLUDED.role_key
-                        RETURNING id
-                        """,
-                        (email, row.username, row.roleKey),
-                    )
-                    (user_id,) = cur.fetchone()
-                    cur.execute("DELETE FROM user_modules WHERE user_id = %s", (user_id,))
-                    for mk in row.moduleKeys:
-                        cur.execute(
-                            "INSERT INTO user_modules (user_id, module_key) VALUES (%s, %s)",
-                            (user_id, mk),
-                        )
-                conn.commit()
-                results.append({"email": email, "status": "ok"})
-            except Exception as e:
-                conn.rollback()
-                results.append({"email": row.email, "status": "error", "detail": str(e)})
-    finally:
-        db.put_conn(conn)
-
-    return {"results": results}
-
-
 @router.delete("/api/admin/users/{email}")
 def remove_user(email: str, admin_email: str = Depends(require_admin)):
     conn = db.get_conn()
