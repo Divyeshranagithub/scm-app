@@ -202,7 +202,7 @@
 
     function moduleCheckboxes(){
       return modules.map(function(m){
-        return '<label style="display:flex;align-items:center;gap:6px;font-size:13px;padding:4px 0">'+
+        return '<label class="ummod">'+
           '<input type="checkbox" name="moduleKeys" value="'+escapeHtml(m.moduleKey)+'"> '+
           escapeHtml(m.moduleName)+
         '</label>';
@@ -212,44 +212,41 @@
     function userRow(u){
       var modsText = (u.moduleNames||[]).join(', ') || '—';
       return '<tr>'+
-        '<td style="padding:8px 10px">'+escapeHtml(u.email)+'</td>'+
-        '<td style="padding:8px 10px">'+escapeHtml(u.username||'')+'</td>'+
-        '<td style="padding:8px 10px">'+escapeHtml(u.roleName)+'</td>'+
-        '<td style="padding:8px 10px;color:#6b5b4d">'+escapeHtml(modsText)+'</td>'+
-        '<td style="padding:8px 10px;color:#8a7a6c">'+escapeHtml((u.createdAt||'').slice(0,10))+'</td>'+
-        '<td style="padding:8px 10px;white-space:nowrap">'+
-          '<button type="button" class="admin-edit" data-email="'+escapeHtml(u.email)+'" '+
-            'style="border:1px solid #7a1620;color:#7a1620;background:none;border-radius:6px;padding:4px 10px;cursor:pointer;margin-right:6px">Edit</button>'+
-          '<button type="button" class="admin-remove" data-email="'+escapeHtml(u.email)+'" '+
-            'style="border:1px solid #c9463a;color:#c9463a;background:none;border-radius:6px;padding:4px 10px;cursor:pointer">Remove</button>'+
+        '<td>'+escapeHtml(u.email)+'</td>'+
+        '<td>'+escapeHtml(u.username||'')+'</td>'+
+        '<td><span class="umrole umrole--'+escapeHtml(u.roleKey)+'">'+escapeHtml(u.roleName)+'</span></td>'+
+        '<td class="umtable__mods">'+escapeHtml(modsText)+'</td>'+
+        '<td class="umtable__date">'+escapeHtml((u.createdAt||'').slice(0,10))+'</td>'+
+        '<td class="umtable__actions">'+
+          '<button type="button" class="admin-edit umiconbtn umiconbtn--edit" data-email="'+escapeHtml(u.email)+'">Edit</button>'+
+          '<button type="button" class="admin-remove umiconbtn umiconbtn--remove" data-email="'+escapeHtml(u.email)+'">Remove</button>'+
         '</td>'+
       '</tr>';
     }
 
     host.innerHTML =
-      '<div style="background:#fff;border:1px solid #eee1d3;border-radius:10px;padding:18px;margin-bottom:20px;max-width:640px">'+
-        '<h3 id="adminFormHeading" style="margin:0 0 12px;font-size:15px">Add user</h3>'+
+      '<div class="umcard">'+
+        '<h3 id="adminFormHeading" class="umcard__h">Add user</h3>'+
+        '<p class="umcard__sub">Register a new user and choose which pages they can access.</p>'+
         '<form id="adminAddForm">'+
-          '<div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-bottom:12px">'+
-            '<input name="email" type="email" required placeholder="name@algihaz.com" style="flex:1 1 220px;padding:8px 10px;border:1px solid #ddd;border-radius:6px">'+
-            '<input name="username" type="text" placeholder="Display name" style="flex:1 1 160px;padding:8px 10px;border:1px solid #ddd;border-radius:6px">'+
-            '<select name="roleKey" required style="padding:8px 10px;border:1px solid #ddd;border-radius:6px">'+roleOptions()+'</select>'+
+          '<div class="umform__row">'+
+            '<input name="email" type="email" required placeholder="name@algihaz.com">'+
+            '<input name="username" type="text" placeholder="Display name">'+
+            '<select name="roleKey" required>'+roleOptions()+'</select>'+
           '</div>'+
-          '<div style="margin-bottom:12px">'+
-            '<div style="font-size:12px;color:#8a7a6c;margin-bottom:4px">Modules (Editors see every page but only edit these; Viewers only see these)</div>'+
-            moduleCheckboxes()+
-          '</div>'+
-          '<button type="submit" id="adminFormSubmitBtn" style="background:#7a1620;color:#fff;border:none;border-radius:6px;padding:8px 16px;cursor:pointer">Add</button>'+
-          '<button type="button" id="adminFormCancelBtn" hidden style="background:none;border:1px solid #ddd;border-radius:6px;padding:8px 16px;cursor:pointer;margin-left:8px">Cancel</button>'+
+          '<label class="umlabel">Modules — Editors see every page but only edit these; Viewers only see these</label>'+
+          '<div class="ummods">'+moduleCheckboxes()+'</div>'+
+          '<button type="submit" id="adminFormSubmitBtn" class="umbtn umbtn--go">Add</button>'+
+          '<button type="button" id="adminFormCancelBtn" class="umbtn" hidden style="margin-left:8px">Cancel</button>'+
         '</form>'+
-        '<p id="adminAddMsg" style="margin:10px 0 0;font-size:13px"></p>'+
+        '<p id="adminAddMsg" class="ummsg"></p>'+
       '</div>'+
-      '<div style="background:#fff;border:1px solid #eee1d3;border-radius:10px;overflow:auto">'+
-        '<table style="width:100%;border-collapse:collapse;font-size:13px">'+
-          '<thead><tr style="text-align:left;border-bottom:1px solid #eee1d3;color:#8a7a6c">'+
-            '<th style="padding:8px 10px">Email</th><th style="padding:8px 10px">Name</th>'+
-            '<th style="padding:8px 10px">Role</th><th style="padding:8px 10px">Modules</th>'+
-            '<th style="padding:8px 10px">Added</th><th></th>'+
+      '<div class="umtablewrap">'+
+        '<table class="umtable">'+
+          '<thead><tr>'+
+            '<th>Email</th><th>Name</th>'+
+            '<th>Role</th><th>Modules</th>'+
+            '<th>Added</th><th></th>'+
           '</tr></thead>'+
           '<tbody id="adminUserRows">'+users.map(userRow).join('')+'</tbody>'+
         '</table>'+
