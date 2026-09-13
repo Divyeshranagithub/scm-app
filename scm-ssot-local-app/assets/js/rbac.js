@@ -106,6 +106,11 @@
 
     window.SCM_USER = Object.assign(window.SCM_USER||{}, data);
     window.SCM_RBAC = { modules: data.modules||[], roleKey: data.roleKey };
+    // app.js's data loaders may run before this resolves (e.g. the eager
+    // overview/masterdata load at boot, or a page reached via URL hash) —
+    // they wait on this event instead of assuming window.SCM_USER.email is
+    // already set by the time they're called.
+    document.dispatchEvent(new CustomEvent('scm:rbac-ready', {detail: data}));
 
     document.querySelectorAll('.nav__item[data-page]').forEach(function(el){
       if(allowed.has(el.dataset.page)) showNavItem(el); else hideNavItem(el);

@@ -38,6 +38,38 @@ window.scmCover=function(hostId,title,detail){
     '<h4>'+title+'</h4><p>'+detail+'</p></div>';
 };
 window.LME_SAMPLE=null; /* sample removed — served from Dataverse cra95_lmesnapshots */
+
+/* Every API-first data loader needs window.SCM_USER.email before it can call
+   the backend. rbac.js resolves that asynchronously (SSO round-trip + an
+   auth/me fetch) and may still be in flight when a loader is invoked — the
+   eager overview/masterdata load at boot runs before RBAC could possibly be
+   done, and any page reached via a URL hash on first load races it too.
+   Checking window.SCM_USER.email once and giving up (the previous approach)
+   meant a lost race got stuck on the embedded default forever, since the
+   static-JSON fallback these loaders used to fall back to no longer exists.
+   This waits for rbac.js's 'scm:rbac-ready' event instead of guessing. */
+function waitForScmUser(timeoutMs){
+  if(window.SCM_USER && window.SCM_USER.email) return Promise.resolve(window.SCM_USER.email);
+  return new Promise(function(resolve){
+    var done = false;
+    var timer = setTimeout(function(){
+      if(done) return; done = true;
+      document.removeEventListener('scm:rbac-ready', onReady);
+      resolve(null);
+    }, timeoutMs);
+    function onReady(){
+      if(done) return;
+      var email = window.SCM_USER && window.SCM_USER.email;
+      if(!email) return; // shouldn't happen, but keep waiting for the timeout if it does
+      done = true; clearTimeout(timer);
+      document.removeEventListener('scm:rbac-ready', onReady);
+      resolve(email);
+    }
+    document.addEventListener('scm:rbac-ready', onReady);
+  });
+}
+window.waitForScmUser = waitForScmUser;
+
 /* ---------- LME dashboard app (Dataverse Web API backend, cra95_) ---------- */
 (function(){
 const LME_DIAG=[];
@@ -683,7 +715,7 @@ async function loadAVL(){
     why.push('opened from disk (file://) — the browser blocks fetch; deploy the page to test live data');
   } else {
     // 0) Backend API — RBAC-gated, the source of truth (no public data files)
-    const email = window.SCM_USER && window.SCM_USER.email;
+    const email = await waitForScmUser(18000);
     if(email && window.SCM_API){
       try{
         const r=await fetch(window.SCM_API.base+'/api/data/avl?email='+encodeURIComponent(email),
@@ -981,8 +1013,8 @@ async function loadSection(key, globalName, renderFn){
   const c = CONFIG_SCM[key];
   if(location.protocol === 'file:') return;         // preview: keep defaults
   // Backend API first — RBAC-gated, the source of truth. Falls through to
-  // Dataverse/static-JSON only if unavailable (no user email yet, API down, etc).
-  const email = window.SCM_USER && window.SCM_USER.email;
+  // Dataverse/static-JSON only if unavailable (RBAC never resolved, API down, etc).
+  const email = await waitForScmUser(18000);
   if(email && window.SCM_API){
     try{
       const r = await fetch(window.SCM_API.base+'/api/data/'+encodeURIComponent(key)+'?email='+encodeURIComponent(email),
@@ -1266,7 +1298,9 @@ src:"https://app.powerbi.com/view?r=eyJrIjoiZjc4NDNlOTMtNWNhMy00Yzc2LWI1YzUtNjYz
 const MO_LABEL = { published:{ t:"Published", c:"" }, updating:{ t:"Updating", c:"draft" } };
 let MO_ACTIVE = null;
 function renderMonthly(){
-  const list=((window.SCM_MONTHLY||{}).months)||[]; if(!list.length) return;
+  const raw=((window.SCM_MONTHLY||{}).months)||[];
+  const list=raw.filter(m=>m && m.key && m.label); // ignore a blank/incomplete row (e.g. "+ Add month" published before it was filled in)
+  if(!list.length) return;
   if(MO_ACTIVE==null || !list.some(m=>m.key===MO_ACTIVE)) MO_ACTIVE=list[0].key;
   const m=list.find(x=>x.key===MO_ACTIVE)||list[0], st=MO_LABEL[m.status]||MO_LABEL.published;
   const sel=document.getElementById('moSelect');
@@ -1845,12 +1879,12 @@ function toDetailRows(j){
 function loadDetails(){
   if(DET)return Promise.resolve(DET);
   if(DETpending)return DETpending;
-  const email = window.SCM_USER && window.SCM_USER.email;
-  const apiReq = (email && window.SCM_API)
-    ? fetch(window.SCM_API.base+'/api/data/sec-avl-details?email='+encodeURIComponent(email),
+  const apiReq = waitForScmUser(18000).then(function(email){
+    if(!(email && window.SCM_API)) return Promise.reject(new Error('no user email'));
+    return fetch(window.SCM_API.base+'/api/data/sec-avl-details?email='+encodeURIComponent(email),
         {credentials:'same-origin',cache:'no-store',headers:{'Accept':'application/json','X-API-Key':window.SCM_API.key}})
-        .then(r=>r.ok?r.json():Promise.reject(new Error('HTTP '+r.status)))
-    : Promise.reject(new Error('no user email yet'));
+        .then(r=>r.ok?r.json():Promise.reject(new Error('HTTP '+r.status)));
+  });
   DETpending=apiReq
     .catch(function(){
       return fetch(CFG.detailUrl+'?v='+Date.now(),{credentials:'same-origin',cache:'no-store'})
@@ -1899,7 +1933,7 @@ async function loadSEC(){
   const why=[];
   if(location.protocol==='file:')why.push('file:// blocks fetch');
   else{
-    const email = window.SCM_USER && window.SCM_USER.email;
+    const email = await waitForScmUser(18000);
     if(email && window.SCM_API){
       try{
         const r=await fetch(window.SCM_API.base+'/api/data/sec-sole-source?email='+encodeURIComponent(email),
