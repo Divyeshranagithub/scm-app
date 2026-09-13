@@ -103,6 +103,12 @@
     // enforce() guard below both handle it correctly with no special-casing.
     var contentAdminAllowed = data.roleKey === 'editor' || data.roleKey === 'administrator';
     if(contentAdminAllowed) allowed.add('content-admin');
+    // cfp-power-transformers is a drill-down sub-page of categoryfactpacks, not
+    // an independently-navigable one — it has no nav item of its own, only a
+    // card inside the parent page. Requiring it as a *separate* RBAC module
+    // meant checking only "Category Fact Packs" in User Management left the
+    // one working card inside it unreachable (click bounced straight back).
+    if(allowed.has('categoryfactpacks')) allowed.add('cfp-power-transformers');
 
     window.SCM_USER = Object.assign(window.SCM_USER||{}, data);
     window.SCM_RBAC = { modules: data.modules||[], roleKey: data.roleKey };

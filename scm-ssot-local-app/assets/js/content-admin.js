@@ -92,6 +92,11 @@
       editor: 'embed'
     },
     {
+      key: 'categoryfactpacks-other', label: 'Category Fact Packs — other categories', moduleKey: 'categoryfactpacks',
+      desc: 'Of the 15 category cards on this page, only Power Transformers has a fact pack built. The other 14 (Switchgears, Reactors, Cables, Insulators, etc.) are marked "Coming soon" with no content yet.',
+      editor: 'soon'
+    },
+    {
       key: 'l0projects', label: 'L0 Projects', moduleKey: 'l0projects',
       desc: 'Marked "Coming soon" on the site — no content has been built for this page yet.',
       editor: 'soon'
