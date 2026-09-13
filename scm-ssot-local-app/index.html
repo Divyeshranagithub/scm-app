@@ -16,6 +16,69 @@
 <!-- starts fetching this large SDK file immediately, in parallel with everything
      else, instead of waiting until app.js finishes executing to even begin -->
 <link rel="preload" as="script" href="assets/js/dronahq.js">
+
+<!-- ===== SELF-HEALING VERSION CHECK =====
+     ?v=N on the asset URLs above only helps if THIS page is fresh. When a
+     browser (or DronaHQ's container) serves a cached copy of this page, it
+     keeps pointing at the old ?v= URLs, which are cached too — nothing
+     updates and no server-side header can reach it, because the client never
+     asks. This check is inline (so it travels with the page itself, never
+     from a cacheable .js file) and compares the build baked in here against
+     version.json, which is always fetched from the network. On a mismatch it
+     reloads via a URL the cache has never seen, which forces a genuinely
+     fresh page and, with it, fresh assets. -->
+<script>
+window.SCM_BUILD = '20260913-1';
+(function(){
+  var BUILT = window.SCM_BUILD, KEY = 'scmReloadedFor';
+  function fresh(){ return fetch('version.json?t=' + Date.now(), {cache:'no-store'})
+    .then(function(r){ return r.ok ? r.json() : null; })
+    .then(function(j){ return (j && j.build) ? j.build : null; })
+    .catch(function(){ return null; }); }
+
+  function banner(build){
+    if(document.getElementById('scmUpd')) return;
+    var d = document.createElement('div');
+    d.id = 'scmUpd';
+    d.style.cssText = 'position:fixed;left:50%;transform:translateX(-50%);bottom:18px;z-index:100000;'+
+      'background:#4A3C3C;color:#fff;border-radius:24px;padding:10px 14px 10px 18px;display:flex;'+
+      'align-items:center;gap:12px;font:600 12.5px/1.2 system-ui,sans-serif;box-shadow:0 4px 16px rgba(0,0,0,.25)';
+    d.innerHTML = '<span>A newer version of this app is available.</span>';
+    var b = document.createElement('button');
+    b.textContent = 'Refresh';
+    b.style.cssText = 'border:0;border-radius:18px;background:#A20F1B;color:#fff;font:700 12px system-ui,sans-serif;'+
+      'padding:7px 14px;cursor:pointer';
+    b.onclick = function(){ bust(build); };
+    d.appendChild(b);
+    document.body.appendChild(d);
+  }
+
+  // Load a URL this cache has never seen — the only reliable way out of a
+  // stale entry, since location.reload(true) is ignored by modern browsers.
+  function bust(build){
+    try{ sessionStorage.setItem(KEY, build); }catch(e){}
+    location.replace(location.pathname + '?b=' + encodeURIComponent(build) + location.hash);
+  }
+
+  function check(initial){
+    fresh().then(function(build){
+      if(!build || build === BUILT) return;
+      if(initial){
+        var last = null;
+        try{ last = sessionStorage.getItem(KEY); }catch(e){}
+        if(last === build) return;   // already bounced for this build — don't loop
+        bust(build);
+      } else if(document.readyState === 'complete'){
+        banner(build);               // app is in use; let the user pick the moment
+      }
+    });
+  }
+
+  check(true);
+  setInterval(function(){ check(false); }, 120000);
+  window.addEventListener('focus', function(){ check(false); });
+})();
+</script>
 </head>
 <body>
 <!-- ===== TOP BAR ===== -->
