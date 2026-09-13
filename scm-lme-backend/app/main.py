@@ -1,8 +1,10 @@
 import json
+import uuid
 from contextlib import asynccontextmanager
+from datetime import date
 
 from dotenv import load_dotenv
-from fastapi import Depends, FastAPI, HTTPException
+from fastapi import Body, Depends, FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 
 from . import db, datasets, rbac
@@ -120,3 +122,46 @@ def get_latest(api_key: str = Depends(get_api_key)):
     payload.setdefault("reportDate", report_date.isoformat())
     payload.setdefault("reportDateLabel", label)
     return payload
+
+
+@app.put("/api/lme/snapshot/{report_date}")
+def put_snapshot(report_date: str, body: dict = Body(...), api_key: str = Depends(get_api_key)):
+    try:
+        date.fromisoformat(report_date)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="report_date must be YYYY-MM-DD")
+    if not isinstance(body, dict) or not body.get("metals"):
+        raise HTTPException(status_code=400, detail="Body must be the full Golden Schema payload (missing 'metals')")
+
+    report_date_label = body.get("reportDateLabel") or report_date
+    name = f"LME Snapshot {report_date_label}"
+
+    conn = db.get_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO lme_snapshots (id, report_date, report_date_label, payload_json, name)
+                VALUES (%s, %s, %s, %s, %s)
+                ON CONFLICT (report_date) DO UPDATE SET
+                    report_date_label = EXCLUDED.report_date_label,
+                    payload_json = EXCLUDED.payload_json,
+                    name = EXCLUDED.name
+                RETURNING id, (xmax = 0) AS inserted
+                """,
+                (str(uuid.uuid4()), report_date, report_date_label, json.dumps(body), name),
+            )
+            row_id, inserted = cur.fetchone()
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        db.put_conn(conn)
+
+    return {
+        "status": "ok",
+        "action": "insert" if inserted else "update",
+        "reportDate": report_date,
+        "id": str(row_id),
+    }
