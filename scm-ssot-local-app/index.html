@@ -28,7 +28,7 @@
      reloads via a URL the cache has never seen, which forces a genuinely
      fresh page and, with it, fresh assets. -->
 <script>
-window.SCM_BUILD = '20260913-1';
+window.SCM_BUILD = '20260913-2';
 (function(){
   var BUILT = window.SCM_BUILD, KEY = 'scmReloadedFor';
   function fresh(){ return fetch('version.json?t=' + Date.now(), {cache:'no-store'})
@@ -643,6 +643,6 @@ window.SCM_BUILD = '20260913-1';
 <script src="assets/js/dronahq.js"></script>
 <script src="assets/js/dronahq-sso.js?v=1"></script>
 <script src="assets/js/content-admin.js?v=6"></script>
-<script src="assets/js/rbac.js?v=10"></script>
+<script src="assets/js/rbac.js?v=11"></script>
 </body>
 </html>

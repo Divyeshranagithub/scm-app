@@ -232,7 +232,7 @@
     }
     var ROLE_HINT = {
       administrator: 'Administrators always have full access to every page — the list below is ignored for them.',
-      editor: 'Tick <b>Can view</b> for the pages they should see, and <b>Can edit</b> for the pages they can also change. Ticking Edit ticks View automatically.',
+      editor: 'Tick <b>Can view</b> for pages they should see on the site, and <b>Can edit</b> for pages they can change in Content Administration. The two are independent — a page can be view-only, edit-only (e.g. a data-entry role that updates a page without seeing the live dashboard), or both.',
       viewer: 'Viewers can only look, never change. Tick <b>Can view</b> for the pages they should see — the Edit column does not apply.'
     };
 
@@ -275,11 +275,7 @@
         }
         if(!t.matches || !t.matches('input[type=checkbox]')) return;
         if(t.name !== 'viewModuleKeys' && t.name !== 'editModuleKeys') return;
-        var mod = t.value;
-        var viewCb = form.querySelector('input[name="viewModuleKeys"][value="'+mod+'"]');
-        var editCb = form.querySelector('input[name="editModuleKeys"][value="'+mod+'"]');
-        if(t.name === 'editModuleKeys' && t.checked) viewCb.checked = true;          // edit implies view
-        if(t.name === 'viewModuleKeys' && !t.checked && editCb.checked) editCb.checked = false; // dropping view drops edit
+        // View and Edit are independent — a page can be view-only, edit-only, or both
         refresh();
       });
 
@@ -291,16 +287,7 @@
         var name = col === 'view' ? 'viewModuleKeys' : 'editModuleKeys';
         var boxes = form.querySelectorAll('input[name="'+name+'"]');
         var allOn = Array.prototype.every.call(boxes, function(cb){ return cb.checked; });
-        boxes.forEach(function(cb){
-          cb.checked = !allOn;
-          if(col === 'edit'){ // keep edit ⊆ view
-            var v = form.querySelector('input[name="viewModuleKeys"][value="'+cb.value+'"]');
-            if(v && !allOn) v.checked = true;
-          } else if(allOn){    // clearing view clears edit too
-            var e = form.querySelector('input[name="editModuleKeys"][value="'+cb.value+'"]');
-            if(e) e.checked = false;
-          }
-        });
+        boxes.forEach(function(cb){ cb.checked = !allOn; });
         refresh();
       });
 

@@ -70,7 +70,10 @@ def get_dataset(dataset_key: str, email: str = Query(...)):
     access = _resolve_access(email)
     if access is None:
         raise HTTPException(status_code=404, detail="User not registered for this app")
-    if module_key not in access["modules"]:
+    # readable if either viewable (the live page) or editable (Content
+    # Administration needs to fetch the current document into the form even
+    # for an edit-only module with no view access)
+    if module_key not in access["modules"] and module_key not in access["editableModules"]:
         raise HTTPException(status_code=403, detail="Not permitted to view this dataset")
 
     conn = db.get_conn()

@@ -31,7 +31,10 @@ def require_admin(x_user_email: str = Header(...)) -> str:
 
 
 def _user_view_modules(cur, user_id: int) -> List[str]:
-    cur.execute("SELECT module_key FROM user_modules WHERE user_id = %s ORDER BY module_key", (user_id,))
+    cur.execute(
+        "SELECT module_key FROM user_modules WHERE user_id = %s AND can_view ORDER BY module_key",
+        (user_id,),
+    )
     return [r[0] for r in cur.fetchall()]
 
 
@@ -137,7 +140,7 @@ def list_users(admin_email: str = Depends(require_admin)):
             for i, e, un, rk, rn, ca in users:
                 cur.execute(
                     """
-                    SELECT m.module_key, m.module_name, um.can_edit
+                    SELECT m.module_key, m.module_name, um.can_view, um.can_edit
                     FROM user_modules um JOIN modules m ON m.module_key = um.module_key
                     WHERE um.user_id = %s ORDER BY m.sort_order
                     """,
@@ -147,10 +150,10 @@ def list_users(admin_email: str = Depends(require_admin)):
                 result.append({
                     "id": i, "email": e, "username": un,
                     "roleKey": rk, "roleName": rn,
-                    "viewModuleKeys": [k for k, _, _ in mods],
-                    "viewModuleNames": [n for _, n, _ in mods],
-                    "editModuleKeys": [k for k, _, ce in mods if ce],
-                    "editModuleNames": [n for _, n, ce in mods if ce],
+                    "viewModuleKeys": [k for k, _, cv, _ in mods if cv],
+                    "viewModuleNames": [n for _, n, cv, _ in mods if cv],
+                    "editModuleKeys": [k for k, _, _, ce in mods if ce],
+                    "editModuleNames": [n for _, n, _, ce in mods if ce],
                     "createdAt": ca.isoformat(),
                 })
     finally:
@@ -168,10 +171,12 @@ class NewUser(BaseModel):
 
 @router.post("/api/admin/users")
 def add_user(body: NewUser, admin_email: str = Depends(require_admin)):
-    # anything editable must also be viewable — union rather than reject, so
-    # checking "Edit" in the UI without separately checking "View" still works
-    view_set = set(body.viewModuleKeys) | set(body.editModuleKeys)
+    # view and edit are independent — a module can be view-only, edit-only
+    # (e.g. a data-entry role that updates a page without seeing the live
+    # dashboard), or both
+    view_set = set(body.viewModuleKeys)
     edit_set = set(body.editModuleKeys)
+    all_set = view_set | edit_set
 
     conn = db.get_conn()
     try:
@@ -180,7 +185,7 @@ def add_user(body: NewUser, admin_email: str = Depends(require_admin)):
             if cur.fetchone() is None:
                 raise HTTPException(status_code=400, detail=f"Unknown roleKey: {body.roleKey}")
 
-            for mk in view_set:
+            for mk in all_set:
                 cur.execute("SELECT 1 FROM modules WHERE module_key = %s", (mk,))
                 if cur.fetchone() is None:
                     raise HTTPException(status_code=400, detail=f"Unknown moduleKey: {mk}")
@@ -197,10 +202,10 @@ def add_user(body: NewUser, admin_email: str = Depends(require_admin)):
             user_id, e, un, rk, ca = cur.fetchone()
 
             cur.execute("DELETE FROM user_modules WHERE user_id = %s", (user_id,))
-            for mk in view_set:
+            for mk in all_set:
                 cur.execute(
-                    "INSERT INTO user_modules (user_id, module_key, can_edit) VALUES (%s, %s, %s)",
-                    (user_id, mk, mk in edit_set),
+                    "INSERT INTO user_modules (user_id, module_key, can_view, can_edit) VALUES (%s, %s, %s, %s)",
+                    (user_id, mk, mk in view_set, mk in edit_set),
                 )
         conn.commit()
     except HTTPException:
