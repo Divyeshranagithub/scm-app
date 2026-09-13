@@ -714,7 +714,7 @@ async function loadAVL(_isRetry){
     SRC={txt:'Live · API',cls:'live'}; bind(); render(); return;
   }catch(e){
     console.warn('[AVL] fetch failed: '+e.message);
-    if(!_isRetry){ setTimeout(()=>loadAVL(true), 3000); return; }
+    if(!_isRetry){ setTimeout(()=>loadAVL(true), 15000); return; }
     SRC={txt:'Could not load data',cls:'warn'}; bind(); render();
     const el=document.getElementById('avlSrcChip'); if(el) el.title = e.message;
   }
@@ -752,7 +752,7 @@ async function loadSection(key, globalName, renderFn, _isRetry){
     console.info('[SCM] '+key+' loaded from API');
   }catch(err){
     console.warn('[SCM] '+key+' fetch failed: '+err.message);
-    if(!_isRetry) setTimeout(()=>loadSection(key, globalName, renderFn, true), 3000);
+    if(!_isRetry) setTimeout(()=>loadSection(key, globalName, renderFn, true), 15000);
   }
 }
 
@@ -1636,7 +1636,7 @@ async function loadSEC(_isRetry){
     SRC={txt:'Live · API',cls:'live'}; render();
   }catch(e){
     console.warn('[SEC] fetch failed: '+e.message);
-    if(!_isRetry){ setTimeout(()=>loadSEC(true), 3000); return; }
+    if(!_isRetry){ setTimeout(()=>loadSEC(true), 15000); return; }
     SRC={txt:'Could not load data',cls:'warn'}; render();
   }
 }

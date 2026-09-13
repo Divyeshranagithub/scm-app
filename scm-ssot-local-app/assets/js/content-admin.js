@@ -496,7 +496,7 @@
         ST.data[key] = d; ST.orig[key] = clone(d); ST.src[key] = 'Live · API'; ST.loaded[key] = true;
       })
       .catch(function (err) {
-        if (!isRetry) return new Promise(function (resolve) { setTimeout(resolve, 3000); }).then(function () { return fetchDataset(key, r, true); });
+        if (!isRetry) return new Promise(function (resolve) { setTimeout(resolve, 15000); }).then(function () { return fetchDataset(key, r, true); });
         console.warn('[content-admin] ' + key + ' fetch failed: ' + err.message);
         ST.src[key] = 'Could not load current data — do not publish until this loads correctly';
         if (ST.key === key) { renderHead(); renderForm(); }
