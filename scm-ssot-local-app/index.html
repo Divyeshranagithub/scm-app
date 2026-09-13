@@ -8,25 +8,13 @@
 <link rel="stylesheet" href="assets/css/bootstrap.min.css">
 <link rel="stylesheet" href="assets/css/theme.css">
 <link rel="stylesheet" href="assets/css/portalbasictheme.css">
-<!-- cache-busting: DronaHQ's own container caches this page's assets even after
-     CloudFront serves the fresh version, so every one of our own files below
-     carries ?v=N — bump N (search/replace) whenever any of them change. -->
+<!-- cache-busting: bump ?v=N on any file below whenever it changes -->
 <link rel="stylesheet" href="assets/css/app.css?v=1">
 <link rel="stylesheet" href="assets/css/page-admin.css?v=6">
-<!-- starts fetching this large SDK file immediately, in parallel with everything
-     else, instead of waiting until app.js finishes executing to even begin -->
+<!-- preload so this large SDK starts fetching before app.js finishes executing -->
 <link rel="preload" as="script" href="assets/js/dronahq.js">
 
-<!-- ===== SELF-HEALING VERSION CHECK =====
-     ?v=N on the asset URLs above only helps if THIS page is fresh. When a
-     browser (or DronaHQ's container) serves a cached copy of this page, it
-     keeps pointing at the old ?v= URLs, which are cached too — nothing
-     updates and no server-side header can reach it, because the client never
-     asks. This check is inline (so it travels with the page itself, never
-     from a cacheable .js file) and compares the build baked in here against
-     version.json, which is always fetched from the network. On a mismatch it
-     reloads via a URL the cache has never seen, which forces a genuinely
-     fresh page and, with it, fresh assets. -->
+<!-- self-healing version check: inline (uncacheable) build id vs. version.json; mismatch forces a fresh reload -->
 <script>
 window.SCM_BUILD = '20260913-4';
 (function(){
@@ -53,8 +41,7 @@ window.SCM_BUILD = '20260913-4';
     document.body.appendChild(d);
   }
 
-  // Load a URL this cache has never seen — the only reliable way out of a
-  // stale entry, since location.reload(true) is ignored by modern browsers.
+  // location.reload(true) is ignored by modern browsers, so use a URL the cache has never seen instead
   function bust(build){
     try{ sessionStorage.setItem(KEY, build); }catch(e){}
     location.replace(location.pathname + '?b=' + encodeURIComponent(build) + location.hash);
@@ -638,8 +625,7 @@ window.SCM_BUILD = '20260913-4';
   <span>Prepared by Omar Ehab · Revised by Mohamed Radwan · Procurement Strategy Department</span>
   <span class="r">Al Gihaz Contracting</span>
 </footer><script src="assets/js/app.js?v=7"></script>
-<!-- DronaHQ Native Container SDK: creates window.DronaHQ and fires "deviceready"
-     once the container bridge is up. Must load before dronahq-sso.js. -->
+<!-- DronaHQ Native Container SDK — must load before dronahq-sso.js -->
 <script src="assets/js/dronahq.js"></script>
 <script src="assets/js/dronahq-sso.js?v=1"></script>
 <script src="assets/js/content-admin.js?v=8"></script>

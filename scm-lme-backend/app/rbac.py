@@ -171,9 +171,7 @@ class NewUser(BaseModel):
 
 @router.post("/api/admin/users")
 def add_user(body: NewUser, admin_email: str = Depends(require_admin)):
-    # view and edit are independent — a module can be view-only, edit-only
-    # (e.g. a data-entry role that updates a page without seeing the live
-    # dashboard), or both
+    # view and edit are independent per module — view-only, edit-only, or both
     view_set = set(body.viewModuleKeys)
     edit_set = set(body.editModuleKeys)
     all_set = view_set | edit_set

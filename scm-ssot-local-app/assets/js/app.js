@@ -39,15 +39,7 @@ window.scmCover=function(hostId,title,detail){
 };
 window.LME_SAMPLE=null; /* sample removed — served from Dataverse cra95_lmesnapshots */
 
-/* Every API-first data loader needs window.SCM_USER.email before it can call
-   the backend. rbac.js resolves that asynchronously (SSO round-trip + an
-   auth/me fetch) and may still be in flight when a loader is invoked — the
-   eager overview/masterdata load at boot runs before RBAC could possibly be
-   done, and any page reached via a URL hash on first load races it too.
-   Checking window.SCM_USER.email once and giving up (the previous approach)
-   meant a lost race got stuck on the embedded default forever, since the
-   static-JSON fallback these loaders used to fall back to no longer exists.
-   This waits for rbac.js's 'scm:rbac-ready' event instead of guessing. */
+// waits for rbac.js's 'scm:rbac-ready' event instead of racing SCM_USER.email at boot
 function waitForScmUser(timeoutMs){
   if(window.SCM_USER && window.SCM_USER.email) return Promise.resolve(window.SCM_USER.email);
   return new Promise(function(resolve){
@@ -730,12 +722,7 @@ window.SCM_OVERVIEW = null; /* was a huge hardcoded default — data must come f
 window.SCM_MASTERDATA = null; /* was a hardcoded default — data must come from the backend now, no fallback */
 
 
-/* ================= BACKEND DATA LOADER =================
-   Every dataset comes from the backend API, gated by RBAC — no static
-   file, no Dataverse, no embedded default to fall back to. If the fetch
-   fails, the render functions themselves show a "Loading…" state (see
-   their own !d guards) rather than ever displaying stale/wrong numbers;
-   this retries once before giving up so a transient blip self-heals. */
+// backend API only, gated by RBAC — no static/embedded fallback; retries once before giving up
 async function loadSection(key, globalName, renderFn, _isRetry){
   if(location.protocol === 'file:') return;         // local preview: no backend to call
   const email = await waitForScmUser(18000);
@@ -972,11 +959,7 @@ function renderMaster(){
 
 
 
-/* ============ CSP-SAFE EVENT DISPATCH ============
-   Power Pages enforces a Content Security Policy without 'unsafe-inline',
-   which blocks inline on* handler attributes. All interactive controls
-   therefore declare data-act / data-chg / data-inp and are dispatched here
-   through delegated listeners, which CSP permits. ============ */
+// CSP-safe event dispatch: data-act/data-chg/data-inp + delegated listeners instead of inline on* handlers
 (function(){
   function argsOf(el, ev){
     var a=[], d=el.dataset;
@@ -1042,9 +1025,7 @@ document.addEventListener('change',function(e){
   if(e.target && e.target.id==='moSelect'){ MO_ACTIVE=e.target.value; renderMonthly(); }
 });
 
-/* ================= SIMPLE POWER BI / SHAREPOINT EMBEDS =================
-   title+src pairs, editable from Content Administration the same way as
-   the JSON-driven datasets above — see loadSection. */
+/* ================= SIMPLE POWER BI / SHAREPOINT EMBEDS ================= */
 window.SCM_EMBED_SCMKPI = null;
 window.SCM_EMBED_SECAVL = null;
 window.SCM_EMBED_RISKREGISTER = null;
@@ -1101,9 +1082,7 @@ function go(page){
   if(page==='shouldcost'){ try{ renderDemoSelect(); }catch(e){ console.warn('[SCM] demo select:',e); } }
   document.querySelectorAll('.nav__item').forEach(n=>n.classList.toggle('is-active',n.dataset.page===page));
   document.querySelectorAll('.page').forEach(p=>p.classList.toggle('is-active',p.dataset.page===page));
-  /* SELF-HEAL: if a host/portal stylesheet overrides our .page rules, the class
-     toggle above changes nothing visually and the menu looks dead. Enforce it
-     with inline styles, which outrank any external sheet. */
+  // enforce visibility with inline styles in case a host stylesheet overrides .page rules
   try{
     document.querySelectorAll('.page').forEach(function(p){
       const want = p.dataset.page===page;
@@ -1148,11 +1127,7 @@ function go(page){
     if(!window._cfpPtBooted){ window._cfpPtBooted=1; loadSection('embed-cfpPt','SCM_EMBED_CFPPT',renderCfpPt); }
   }
 }
-/* =============================================================================
-   NAVIGATION — bound by delegation on `document`, so it can never break:
-   it works even if the script runs before the markup exists, if an element is
-   replaced by the portal, or if any renderer throws.
-   ============================================================================= */
+// NAVIGATION — bound by delegation on `document` so it works before markup exists or if a renderer throws
 function scmOpenSide(open){
   const side=document.getElementById('side'), scrim=document.getElementById('scrim');
   if(side)  side.classList.toggle('is-open', open);
@@ -1225,12 +1200,7 @@ setTimeout(function(){
 window.SCM = { go:function(p){ try{ go(p); }catch(e){ console.warn(e); } },
                menu:scmOpenSide, boot:scmBoot };
 
-/* ===== SEC AVL SOLE SOURCE — Strategic AVL Dashboard engine (v3) =====
-   Methodology mirrors AGC_Strategic_AVL_Dashboard:
-   - MATERIAL-level analysis uses rows where distinctMarker > 0 (canonical row per material)
-   - RECORD-level analysis uses all rows
-   Sections 1-5 = portfolio view (full dataset) · Section 6 = interactive explorer
-==================================================================== */
+// SEC AVL Sole Source engine: MATERIAL-level uses rows with distinctMarker > 0, RECORD-level uses all rows
 (function(){
 const RED='#A20F1B',RED2='#982A33',ROSE='#C0656B',SAND='#D8B6B9',
       TAUPE='#6E5A5A',OK='#2E7D57',WARN='#B5852A';
@@ -1647,12 +1617,7 @@ window.loadSEC=loadSEC;
 /* ===== COST STRUCTURE DATA (embedded from Cost Structure.xlsx) ===== */
 window.COST_STRUCTURE=null; /* was a huge hardcoded default (all 12 commodities) — data must come from the backend now, no fallback */
 
-/* ============ COST STRUCTURE FOR MAIN EQUIPMENT (native) ============
-   Source: Cost Structure.xlsx · rebuilt on AGC brand DNA.
-   All 12 commodities, breakdowns, sub-breakdowns, cable variants and
-   notes preserved verbatim. Layout follows the source dashboard:
-   segmented classification + commodity multi-select + 5 KPI cards.
-==================================================================== */
+// COST STRUCTURE FOR MAIN EQUIPMENT — segmented classification + commodity multi-select + 5 KPI cards
 (function(){
 const RED='#A20F1B',DEEP='#8A0C17',RED2='#982A33',ROSE='#C0656B',SAND='#D8B6B9',
       TAUPE='#6E5A5A';
@@ -1721,9 +1686,7 @@ function renderKpis(){
   const V=shown();
   const A=all();
   const counts={};A.forEach(c=>{counts[c.classification]=(counts[c.classification]||0)+1;});
-  /* Average raw-material share, over commodities that actually carry a
-     raw-material line. Switchgears and Ring Main Units are assembly-based
-     and have none, so they are excluded rather than counted as zero. */
+  // avg raw-material share, excluding assembly-based commodities (switchgears, RMUs) that have none
   const RX=/raw material|^materials$/i;
   const rawOf=function(c){
     const h=c.mainBreakdown.items.filter(i=>RX.test(i.label));
@@ -1753,9 +1716,7 @@ function legendHTML(items){
       '<span class="cslg__k">'+esc(it.label)+'</span>'+
       '<span class="cslg__v">'+pc(it.value)+'%</span></div>';}).join('');
 }
-/* Bars are drawn on an absolute 0-100 scale, so a 60% component fills 60% of
-   the track. (Scaling to the largest item would make the top contributor a
-   full row in every card and overstate its share.) */
+// bars use an absolute 0-100 scale, not scaled to the largest item, so shares stay comparable across cards
 function barsHTML(items){
   return '<div class="csbars">'+items.map(function(it,i){
     return '<div class="csbar"><div class="csbar__t"><span>'+esc(it.label)+'</span><b>'+pc(it.value)+'%</b></div>'+
@@ -1858,11 +1819,7 @@ document.addEventListener('click',function(e){
 });
 })();
 
-/* ============ SHOULD-COST — DEMO SELECTOR ============
-   Card picker for parametric models. Only ACSR CONDOR has a live model;
-   the rest advertise as onboarding so the shelf reads as a roadmap
-   rather than a dead end.
-==================================================================== */
+// SHOULD-COST demo selector — only ACSR CONDOR has a live model, the rest advertise as onboarding
 (function(){
 const MODELS=[
   {id:'acsr-condor',name:'ACSR CONDOR Conductor',cat:'Conductors, Bare',
@@ -1911,17 +1868,7 @@ function renderSelect(){
 window.renderDemoSelect=renderSelect;
 })();
 
-/* ============ SHOULD-COST MODEL — ACSR CONDOR (native, v2) ============
-   v2 changes:
-   - Inputs are built ONCE. Slider drags no longer rebuild the DOM, so the
-     control keeps focus and charts never replay their entry animation.
-   - Charts are created once and updated in place with update('none').
-   - Waterfall now reconciles: Base + ΔAlu + ΔSteel + ΔConv + Δ(freight/scrap/
-     margin) = Simulated. Previously the cascade was omitted.
-   - Conversion cost is quoted in SAR/tonne, so it no longer scales with FX.
-   - Typed values are clamped to each field's min/max.
-   - Added: driver sensitivity (tornado) + target-price solver.
-======================================================================== */
+// SHOULD-COST MODEL — ACSR CONDOR: inputs built once (sliders update charts in place, not the DOM)
 (function(){
 const RED='#A20F1B',RED2='#982A33',ROSE='#C0656B',TAUPE='#6E5A5A',SAND='#D8B6B9',
       OK='#2E7D57',WARN='#B5852A',INK='#3A2E2E';

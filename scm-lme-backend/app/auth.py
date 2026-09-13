@@ -1,13 +1,11 @@
 import os
-from typing import Optional, Dict, List
+from typing import Optional
 from dotenv import load_dotenv
 from fastapi import HTTPException, Security
 from fastapi.security import APIKeyHeader
 from starlette.status import HTTP_403_FORBIDDEN
 
-# called here too (not just in main.py) so API_KEYS below is correct
-# regardless of which module happens to import this one first
-load_dotenv()
+load_dotenv()  # also called in main.py, but main imports rbac->auth before that runs
 
 API_KEY_HEADER = "X-API-Key"
 
@@ -17,18 +15,7 @@ API_KEYS = [k.strip() for k in os.getenv("API_KEYS", "").split(",") if k.strip()
 
 
 async def get_api_key(api_key_header: Optional[str] = Security(api_key_header)) -> str:
-    """
-    Validate the API key from the request header.
-
-    Args:
-        api_key_header: The API key from the request header
-
-    Returns:
-        str: The validated API key
-
-    Raises:
-        HTTPException: If the API key is invalid or missing
-    """
+    """Validate the API key from the X-API-Key header."""
     if api_key_header is None:
         raise HTTPException(
             status_code=HTTP_403_FORBIDDEN,
@@ -42,27 +29,3 @@ async def get_api_key(api_key_header: Optional[str] = Security(api_key_header)) 
         )
 
     return api_key_header
-
-
-# Optional: Function to check specific permissions based on API key
-# This can be extended to implement role-based access control
-def check_permissions(api_key: str, required_permissions: List[str]) -> Dict[str, bool]:
-    """
-    Check if the API key has the required permissions.
-
-    Args:
-        api_key: The API key to check
-        required_permissions: The list of required permissions
-
-    Returns:
-        dict: A dictionary of permission to boolean value
-    """
-    # In a real app, this would query a database to get permissions for the API key
-    # This is just a simple example
-    permissions = {
-        "chat:read": True,
-        "chat:write": True,
-        "tools:invoke": True,
-    }
-
-    return {perm: permissions.get(perm, False) for perm in required_permissions}

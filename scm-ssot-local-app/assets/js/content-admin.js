@@ -1,18 +1,4 @@
-/* =============================================================================
-   CONTENT ADMINISTRATION — editor for the datasets the site renders from.
-
-   Adapted from the business-supplied reference (scm-vibecode/_src/js/page-admin.js).
-   Differences from that reference, both because we have no Dataverse tables:
-     - No "Publish to Dataverse" / Data source tab.
-     - Every dataset here has moved off static files (see RESOURCES[].apiKey)
-       and publishes straight to the backend (PUT /api/data/{key}, RBAC-
-       gated) via the "Publish" button — the live page picks it up
-       immediately, no file upload. "Download .json" is kept as a manual
-       backup/export route, not the primary save path.
-     - Visible only to editor/administrator (gated in rbac.js, not here).
-       Which datasets an *editor* sees is further scoped to their assigned
-       permissions; an administrator sees all of them.
-   ============================================================================= */
+// CONTENT ADMINISTRATION — editor for site datasets; publishes straight to the backend (PUT /api/data/{key})
 (function () {
   'use strict';
 
@@ -466,13 +452,7 @@
     msg('ok', 'Changes discarded', 'Back to the version that was loaded from ' + E(ST.src[r.key] || 'defaults') + '.');
   };
 
-  // Every dataset comes from the backend only — no static file, no blank
-  // "built-in default" to fall back to. A blank fallback used to mean a
-  // failed fetch silently handed the admin an EMPTY form with nothing
-  // stopping them from clicking Publish and wiping real production data
-  // with it. On failure now, ST.data[key] is simply never set, so the form
-  // stays on "Loading…" (see renderForm's !ST.data[r.key] guard) rather
-  // than pretending to have a real (empty) document to edit.
+  // no blank fallback on failure — that used to let Publish wipe real data with an empty form
   function load(key) {
     var r = byKey[key];
     if (ST.data[key]) return Promise.resolve();
@@ -536,9 +516,7 @@
     if (Object.keys(ST.dirty).some(function (k) { return ST.dirty[k]; })) { e.preventDefault(); e.returnValue = ''; }
   });
 
-  // Called by rbac.js once we know the signed-in user's role + editable modules.
-  // Administrators can edit every dataset; editors only the ones covered by
-  // their assigned permission(s); this is never called at all for viewers.
+  // called by rbac.js with the signed-in user's role + editable modules; never called for viewers
   window.renderContentAdminPage = function (userData) {
     if (!el('admRail')) return;
     var canEditAll = userData.roleKey === 'administrator';

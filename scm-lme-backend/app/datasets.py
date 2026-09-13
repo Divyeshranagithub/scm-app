@@ -9,9 +9,7 @@ from .rbac import _all_module_keys, _user_edit_modules, _user_view_modules
 
 router = APIRouter(dependencies=[Depends(get_api_key)])
 
-# dataset_key -> the module a caller must have (to view) / have edit rights
-# on (to write) before this endpoint will serve or accept it. Extend this as
-# more datasets move off static files.
+# dataset_key -> module required to view/edit it
 DATASET_MODULE = {
     'avl': 'avl',
     'sec-sole-source': 'secsole',
@@ -70,9 +68,7 @@ def get_dataset(dataset_key: str, email: str = Query(...)):
     access = _resolve_access(email)
     if access is None:
         raise HTTPException(status_code=404, detail="User not registered for this app")
-    # readable if either viewable (the live page) or editable (Content
-    # Administration needs to fetch the current document into the form even
-    # for an edit-only module with no view access)
+    # readable if either viewable or editable (edit-only modules still need to load into the form)
     if module_key not in access["modules"] and module_key not in access["editableModules"]:
         raise HTTPException(status_code=403, detail="Not permitted to view this dataset")
 

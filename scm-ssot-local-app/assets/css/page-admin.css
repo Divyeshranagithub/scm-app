@@ -1,7 +1,4 @@
-/* ============ CONTENT ADMINISTRATION ============
-   Editor chrome for the admin page. Deliberately plain: it is a back-office
-   tool, so it borrows the app's palette and type but none of its ornament.
-   =============================================================== */
+/* CONTENT ADMINISTRATION — plain back-office chrome, borrows the app's palette but none of its ornament */
 
 .adm{display:grid;grid-template-columns:236px minmax(0,1fr);gap:20px;align-items:start}
 @media(max-width:900px){.adm{grid-template-columns:1fr}}
@@ -111,16 +108,12 @@
 .admsrc__note{font-size:12px;color:var(--muted);line-height:1.65;margin:0 0 14px;max-width:74ch}
 .admsrc__note code{font-family:Consolas,"Courier New",monospace;font-size:11.5px;color:var(--red)}
 
-/* ---- nested groups and spacing helpers (kept as classes, not inline styles,
-        so the page stays clean under a CSP that forbids inline style) ---- */
+/* ---- nested groups/spacing as classes, not inline styles, so CSP-forbidden inline style is unneeded ---- */
 .admgrp--nest{margin-top:12px;margin-bottom:0}
 .admrow--gap{margin-top:12px}
 .admhr{border:0;border-top:1px solid var(--line);margin:14px 0}
 
-/* ============ USER MANAGEMENT (admin role only) ============
-   Centered, card-based layout — kept in its own vocabulary (um*) even
-   though it shares the same palette/tokens as Content Administration.
-   =============================================================== */
+/* USER MANAGEMENT (admin role only) — own vocabulary (um*) but shares Content Administration's palette */
 .umwrap{max-width:900px;margin:0 auto}
 
 .umcard{background:var(--white);border:1px solid var(--line);border-radius:10px;
@@ -177,9 +170,7 @@
 .ummodsum{margin:0;padding:9px 14px;font-size:11.5px;font-weight:700;color:var(--muted);
   background:var(--soft);border-top:1px solid var(--line)}
 
-/* role-dependent states — administrators ignore the list entirely, viewers
-   never edit, so the irrelevant parts are visibly stood down rather than
-   silently doing nothing */
+/* role-dependent states: dim the parts that don't apply (admin ignores the list, viewer never edits) */
 .ummodbox.role-administrator .ummodtable{opacity:.4;pointer-events:none}
 .ummodbox.role-viewer .ummodtable th:last-child,
 .ummodbox.role-viewer .ummodtable td:last-child{opacity:.35;pointer-events:none}

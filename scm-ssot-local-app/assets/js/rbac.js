@@ -1,9 +1,4 @@
-/*
- * RBAC gate. Nothing in the app is usable until we know who the user is
- * (via the DronaHQ SSO bridge in dronahq-sso.js) and that their email is
- * registered in our users table with a role. No SSO, or an SSO email that
- * isn't registered -> full lockout screen, no nav, no page content.
- */
+// RBAC gate — no SSO, or an SSO email not registered in our users table, means full lockout screen
 (function(){
   var LOCKOUT_TIMEOUT_MS = 17000; // longer than dronahq-sso.js's own 15s SSO wait
   var settled = false;
@@ -61,9 +56,7 @@
   function hideNavItem(el){ el.style.setProperty('display','none','important'); }
   function showNavItem(el){ el.style.removeProperty('display'); }
 
-  // a .nav__group (collapsible parent + its .nav__sub items) should disappear
-  // too once every data-page item inside it has been hidden — otherwise you
-  // get a dead group header pointing at nothing.
+  // hide a nav__group once every data-page item inside it is hidden, so no dead group header remains
   function syncGroupVisibility(){
     document.querySelectorAll('.nav__group').forEach(function(g){
       var anyVisible = Array.prototype.some.call(g.querySelectorAll('.nav__item[data-page]'), function(el){
@@ -97,25 +90,15 @@
 
   function applyAccess(data){
     var allowed = new Set(data.modules||[]);
-    // Content Administration is role-gated (editor + administrator), not
-    // part of the module/permission list — never shown to a viewer. Folding
-    // it into `allowed` here means the generic show/hide loop and the
-    // enforce() guard below both handle it correctly with no special-casing.
+    // Content Administration is role-gated (editor+admin), not part of the module list
     var contentAdminAllowed = data.roleKey === 'editor' || data.roleKey === 'administrator';
     if(contentAdminAllowed) allowed.add('content-admin');
-    // cfp-power-transformers is a drill-down sub-page of categoryfactpacks, not
-    // an independently-navigable one — it has no nav item of its own, only a
-    // card inside the parent page. Requiring it as a *separate* RBAC module
-    // meant checking only "Category Fact Packs" in User Management left the
-    // one working card inside it unreachable (click bounced straight back).
+    // cfp-power-transformers is a drill-down card inside categoryfactpacks, not its own nav item
     if(allowed.has('categoryfactpacks')) allowed.add('cfp-power-transformers');
 
     window.SCM_USER = Object.assign(window.SCM_USER||{}, data);
     window.SCM_RBAC = { modules: data.modules||[], roleKey: data.roleKey };
-    // app.js's data loaders may run before this resolves (e.g. the eager
-    // overview/masterdata load at boot, or a page reached via URL hash) —
-    // they wait on this event instead of assuming window.SCM_USER.email is
-    // already set by the time they're called.
+    // lets app.js's data loaders wait for this instead of racing window.SCM_USER.email at boot
     document.dispatchEvent(new CustomEvent('scm:rbac-ready', {detail: data}));
 
     document.querySelectorAll('.nav__item[data-page]').forEach(function(el){
@@ -166,9 +149,7 @@
 
   document.addEventListener('scm:sso-ready', function(ev){ onProfile(ev.detail); });
 
-  // dronahq-sso.js may finish (and dispatch scm:sso-ready) before this script's
-  // listener above is even attached — it sets window.SCM_USER either way, so
-  // check that synchronously too as a fallback against that race.
+  // fallback in case dronahq-sso.js already set window.SCM_USER before our listener attached
   if(window.SCM_USER && window.SCM_USER.email) onProfile(window.SCM_USER);
 
   setTimeout(function(){
@@ -266,8 +247,7 @@
       form.addEventListener('change', function(ev){
         var t = ev.target;
         if(t === form.roleKey){
-          // a viewer can never edit anything — drop any edit ticks carried over
-          // from a previous role choice so what's shown matches what's saved
+          // a viewer can never edit — drop any edit ticks carried over from a previous role choice
           if(t.value === 'viewer'){
             form.querySelectorAll('input[name="editModuleKeys"]').forEach(function(cb){ cb.checked = false; });
           }
