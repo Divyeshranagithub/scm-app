@@ -1066,7 +1066,7 @@ const TITLES = {
   shouldcost:['Should-Cost Model','Demo Should Cost Model'],
   strategy:['Advisory','Strategy Recommendation']
 };
-let lmeBooted=false, avlBooted=false;
+let lmeBooted=false;
 var openSide = function(o){
   const s=document.getElementById('side'), c=document.getElementById('scrim');
   if(s) s.classList.toggle('is-open',o);
@@ -1074,10 +1074,14 @@ var openSide = function(o){
 };
 function go(page){
   if(!page || !TITLES[page]) page='overview';
-  if(page==='secsole' && !window._secBooted){ window._secBooted=1; try{ loadSEC(); }catch(e){ console.warn(e); } }
+  // every dataset-backed page refetches on each visit, so a Content Administration
+  // publish shows up immediately on next navigation — not just on the next full reload
+  if(page==='overview'){ try{ loadSection('overview','SCM_OVERVIEW',renderOverview); }catch(e){ console.warn('[SCM] overview:',e); } }
+  if(page==='masterdata'){ try{ loadSection('masterdata','SCM_MASTERDATA',renderMaster); }catch(e){ console.warn('[SCM] masterdata:',e); } }
+  if(page==='secsole'){ try{ loadSEC(); }catch(e){ console.warn(e); } }
   if(page==='coststructure'){
     try{ renderCostStructure(); }catch(e){ console.warn('[SCM] cost structure:',e); }
-    if(!window._costStructureBooted){ window._costStructureBooted=1; loadSection('coststructure','COST_STRUCTURE',function(){ try{ renderCostStructure(); }catch(e){ console.warn('[SCM] cost structure:',e); } }); }
+    loadSection('coststructure','COST_STRUCTURE',function(){ try{ renderCostStructure(); }catch(e){ console.warn('[SCM] cost structure:',e); } });
   }
   if(page==='shouldcost'){ try{ renderDemoSelect(); }catch(e){ console.warn('[SCM] demo select:',e); } }
   document.querySelectorAll('.nav__item').forEach(n=>n.classList.toggle('is-active',n.dataset.page===page));
@@ -1105,26 +1109,26 @@ function go(page){
   openSide(false);
   window.scrollTo({top:0});
   if(page==='lme' && !lmeBooted){ lmeBooted=true; if(window.LME_BOOT) window.LME_BOOT(); }
-  if(page==='avl' && !avlBooted){ avlBooted=true; if(window.loadAVL) window.loadAVL(); }
+  if(page==='avl'){ if(window.loadAVL) window.loadAVL(); }
   if(page==='monthly'){
     try{ renderMonthly(); }catch(e){ console.warn('[SCM] monthly:',e); }
-    if(!window._monthlyBooted){ window._monthlyBooted=1; loadSection('monthly','SCM_MONTHLY',renderMonthly); }
+    loadSection('monthly','SCM_MONTHLY',renderMonthly);
   }
   if(page==='scmkpi'){
     try{ renderScmkpi(); }catch(e){ console.warn('[SCM] scmkpi:',e); }
-    if(!window._scmkpiBooted){ window._scmkpiBooted=1; loadSection('embed-scmkpi','SCM_EMBED_SCMKPI',renderScmkpi); }
+    loadSection('embed-scmkpi','SCM_EMBED_SCMKPI',renderScmkpi);
   }
   if(page==='secavl'){
     try{ renderSecavl(); }catch(e){ console.warn('[SCM] secavl:',e); }
-    if(!window._secavlBooted){ window._secavlBooted=1; loadSection('embed-secavl','SCM_EMBED_SECAVL',renderSecavl); }
+    loadSection('embed-secavl','SCM_EMBED_SECAVL',renderSecavl);
   }
   if(page==='riskregister'){
     try{ renderRiskregister(); }catch(e){ console.warn('[SCM] riskregister:',e); }
-    if(!window._riskregisterBooted){ window._riskregisterBooted=1; loadSection('embed-riskregister','SCM_EMBED_RISKREGISTER',renderRiskregister); }
+    loadSection('embed-riskregister','SCM_EMBED_RISKREGISTER',renderRiskregister);
   }
   if(page==='cfp-power-transformers'){
     try{ renderCfpPt(); }catch(e){ console.warn('[SCM] cfpPt:',e); }
-    if(!window._cfpPtBooted){ window._cfpPtBooted=1; loadSection('embed-cfpPt','SCM_EMBED_CFPPT',renderCfpPt); }
+    loadSection('embed-cfpPt','SCM_EMBED_CFPPT',renderCfpPt);
   }
 }
 // NAVIGATION — bound by delegation on `document` so it works before markup exists or if a renderer throws
@@ -1592,6 +1596,7 @@ window.secDetail=function(i){
 };
 window.secDetailClose=function(){const b=el('secDrawer');if(b){b.classList.remove('on');b.innerHTML='';}};
 async function loadSEC(_isRetry){
+  if(!_isRetry){ DET=null; DETpending=null; }   // drop the cached drawer details so a re-visit picks up any new publish
   if(location.protocol==='file:'){ SRC={txt:'Not available (file://)',cls:'warn'}; render(); return; }
   const email = await waitForScmUser(18000);
   if(!(email && window.SCM_API)){

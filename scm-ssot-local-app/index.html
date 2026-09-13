@@ -16,7 +16,7 @@
 
 <!-- self-healing version check: inline (uncacheable) build id vs. version.json; mismatch forces a fresh reload -->
 <script>
-window.SCM_BUILD = '20260913-4';
+window.SCM_BUILD = '20260913-5';
 (function(){
   var BUILT = window.SCM_BUILD, KEY = 'scmReloadedFor';
   function fresh(){ return fetch('version.json?t=' + Date.now(), {cache:'no-store'})
@@ -624,7 +624,7 @@ window.SCM_BUILD = '20260913-4';
 <footer class="appftr">
   <span>Prepared by Omar Ehab · Revised by Mohamed Radwan · Procurement Strategy Department</span>
   <span class="r">Al Gihaz Contracting</span>
-</footer><script src="assets/js/app.js?v=7"></script>
+</footer><script src="assets/js/app.js?v=8"></script>
 <!-- DronaHQ Native Container SDK — must load before dronahq-sso.js -->
 <script src="assets/js/dronahq.js"></script>
 <script src="assets/js/dronahq-sso.js?v=1"></script>
