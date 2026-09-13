@@ -141,17 +141,48 @@
 .umlabel{font-size:10.5px;letter-spacing:.8px;text-transform:uppercase;color:var(--muted);
   font-weight:700;display:block;margin-bottom:9px}
 
-.ummodtable{width:100%;border-collapse:collapse;font-size:12.5px;margin-bottom:18px;
-  border:1px solid var(--line);border-radius:7px;overflow:hidden}
-.ummodtable thead th{text-align:left;padding:8px 12px;background:var(--soft);color:var(--muted);
-  font-size:10px;letter-spacing:.7px;text-transform:uppercase;font-weight:700;border-bottom:1px solid var(--line)}
-.ummodtable thead th:nth-child(2),.ummodtable thead th:nth-child(3){text-align:center;width:70px}
-.ummodtable tbody td{padding:7px 12px;border-bottom:1px solid var(--soft)}
+.ummodbox{border:1px solid var(--line);border-radius:8px;overflow:hidden;margin-bottom:18px;background:var(--white)}
+.ummodhint{margin:0;padding:10px 14px;font-size:12px;line-height:1.55;color:var(--muted);
+  background:var(--soft);border-bottom:1px solid var(--line)}
+.ummodhint b{color:var(--ink)}
+
+.ummodtable{width:100%;border-collapse:collapse;font-size:12.5px}
+.ummodtable thead th{text-align:left;padding:9px 14px;color:var(--muted);
+  font-size:10px;letter-spacing:.7px;text-transform:uppercase;font-weight:700;
+  border-bottom:1px solid var(--line);white-space:nowrap}
+.ummodtable__cb{text-align:center;width:104px}
+.ummodall{margin-left:7px;border:0;background:none;font-family:inherit;font-size:9.5px;
+  letter-spacing:.5px;text-transform:uppercase;font-weight:700;color:var(--red);cursor:pointer;
+  padding:2px 5px;border-radius:4px}
+.ummodall:hover{background:var(--red);color:#fff}
+.ummodtable tbody td{padding:8px 14px;border-bottom:1px solid var(--soft)}
 .ummodtable tbody tr:last-child td{border-bottom:0}
-.ummodtable tbody tr:hover{background:var(--soft)}
+.ummodtable tbody tr:hover{background:#FDFAFA}
 .ummodtable__name{color:var(--ink)}
-.ummodtable td:nth-child(2),.ummodtable td:nth-child(3){text-align:center}
-.ummodtable input{accent-color:var(--red);width:15px;height:15px;cursor:pointer}
+.ummodtable tbody tr.is-view .ummodtable__name{font-weight:700}
+.ummodtable tbody tr.is-edit{background:#FDF1F2}
+.ummodtable tbody tr.is-edit .ummodtable__name{color:var(--red)}
+
+/* custom tick boxes — bigger hit area, brand colour, clear checked state */
+.ummodtable__cb label{display:inline-flex;align-items:center;justify-content:center;cursor:pointer;padding:3px}
+.ummodtable__cb input{position:absolute;opacity:0;width:0;height:0}
+.ummodtable__cb span{width:18px;height:18px;border:1.5px solid var(--line);border-radius:5px;
+  background:var(--white);display:inline-block;position:relative;transition:background .12s,border-color .12s}
+.ummodtable__cb label:hover span{border-color:var(--red)}
+.ummodtable__cb input:checked + span{background:var(--red);border-color:var(--red)}
+.ummodtable__cb input:checked + span::after{content:"";position:absolute;left:5.5px;top:2px;
+  width:4px;height:9px;border:solid #fff;border-width:0 2px 2px 0;transform:rotate(45deg)}
+.ummodtable__cb input:focus-visible + span{outline:2px solid var(--red);outline-offset:2px}
+
+.ummodsum{margin:0;padding:9px 14px;font-size:11.5px;font-weight:700;color:var(--muted);
+  background:var(--soft);border-top:1px solid var(--line)}
+
+/* role-dependent states — administrators ignore the list entirely, viewers
+   never edit, so the irrelevant parts are visibly stood down rather than
+   silently doing nothing */
+.ummodbox.role-administrator .ummodtable{opacity:.4;pointer-events:none}
+.ummodbox.role-viewer .ummodtable th:last-child,
+.ummodbox.role-viewer .ummodtable td:last-child{opacity:.35;pointer-events:none}
 
 .umbtn{font-family:inherit;font-size:12.5px;font-weight:700;padding:10px 20px;cursor:pointer;
   border-radius:6px;border:1px solid var(--line);background:var(--white);color:var(--muted)}

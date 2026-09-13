@@ -214,26 +214,98 @@
     function moduleTable(){
       var rows = modules.map(function(m){
         var k = escapeHtml(m.moduleKey);
-        return '<tr>'+
+        return '<tr data-module="'+k+'">'+
           '<td class="ummodtable__name">'+escapeHtml(m.moduleName)+'</td>'+
-          '<td><input type="checkbox" name="viewModuleKeys" value="'+k+'"></td>'+
-          '<td><input type="checkbox" name="editModuleKeys" value="'+k+'"></td>'+
+          '<td class="ummodtable__cb"><label><input type="checkbox" name="viewModuleKeys" value="'+k+'"><span></span></label></td>'+
+          '<td class="ummodtable__cb"><label><input type="checkbox" name="editModuleKeys" value="'+k+'"><span></span></label></td>'+
         '</tr>';
       }).join('');
-      return '<table class="ummodtable"><thead><tr><th>Module</th><th>View</th><th>Edit</th></tr></thead>'+
-        '<tbody>'+rows+'</tbody></table>';
+      return '<div class="ummodbox">'+
+        '<p class="ummodhint" id="ummodHint"></p>'+
+        '<table class="ummodtable"><thead><tr>'+
+          '<th>Page</th>'+
+          '<th class="ummodtable__cb">Can view<button type="button" class="ummodall" data-col="view">all</button></th>'+
+          '<th class="ummodtable__cb">Can edit<button type="button" class="ummodall" data-col="edit">all</button></th>'+
+        '</tr></thead><tbody>'+rows+'</tbody></table>'+
+        '<p class="ummodsum" id="ummodSummary"></p>'+
+      '</div>';
     }
+    var ROLE_HINT = {
+      administrator: 'Administrators always have full access to every page — the list below is ignored for them.',
+      editor: 'Tick <b>Can view</b> for the pages they should see, and <b>Can edit</b> for the pages they can also change. Ticking Edit ticks View automatically.',
+      viewer: 'Viewers can only look, never change. Tick <b>Can view</b> for the pages they should see — the Edit column does not apply.'
+    };
+
     function wireModuleTable(form){
-      form.addEventListener('change', function(e){
-        var t = e.target;
-        if(!t.matches('input[type=checkbox]')) return;
+      var box = form.querySelector('.ummodbox');
+      var hint = form.querySelector('#ummodHint');
+      var summary = form.querySelector('#ummodSummary');
+
+      function syncRow(mod){
+        var row = form.querySelector('tr[data-module="'+mod+'"]'); if(!row) return;
+        var v = form.querySelector('input[name="viewModuleKeys"][value="'+mod+'"]');
+        var e = form.querySelector('input[name="editModuleKeys"][value="'+mod+'"]');
+        row.classList.toggle('is-view', !!(v && v.checked));
+        row.classList.toggle('is-edit', !!(e && e.checked));
+      }
+      function refresh(){
+        var role = form.roleKey.value;
+        box.className = 'ummodbox role-'+role;
+        hint.innerHTML = ROLE_HINT[role] || '';
+        var views = form.querySelectorAll('input[name="viewModuleKeys"]:checked').length;
+        var edits = form.querySelectorAll('input[name="editModuleKeys"]:checked').length;
+        var total = modules.length;
+        summary.textContent = role === 'administrator'
+          ? 'Full access to all '+total+' pages'
+          : (role === 'viewer'
+              ? views+' of '+total+' pages visible'
+              : views+' of '+total+' pages visible · '+edits+' editable');
+        form.querySelectorAll('tr[data-module]').forEach(function(r){ syncRow(r.dataset.module); });
+      }
+
+      form.addEventListener('change', function(ev){
+        var t = ev.target;
+        if(t === form.roleKey){
+          // a viewer can never edit anything — drop any edit ticks carried over
+          // from a previous role choice so what's shown matches what's saved
+          if(t.value === 'viewer'){
+            form.querySelectorAll('input[name="editModuleKeys"]').forEach(function(cb){ cb.checked = false; });
+          }
+          refresh(); return;
+        }
+        if(!t.matches || !t.matches('input[type=checkbox]')) return;
         if(t.name !== 'viewModuleKeys' && t.name !== 'editModuleKeys') return;
         var mod = t.value;
         var viewCb = form.querySelector('input[name="viewModuleKeys"][value="'+mod+'"]');
         var editCb = form.querySelector('input[name="editModuleKeys"][value="'+mod+'"]');
         if(t.name === 'editModuleKeys' && t.checked) viewCb.checked = true;          // edit implies view
-        if(t.name === 'viewModuleKeys' && !t.checked && editCb.checked) t.checked = true; // can't drop view while edit is on
+        if(t.name === 'viewModuleKeys' && !t.checked && editCb.checked) editCb.checked = false; // dropping view drops edit
+        refresh();
       });
+
+      form.addEventListener('click', function(ev){
+        var btn = ev.target.closest && ev.target.closest('.ummodall');
+        if(!btn) return;
+        ev.preventDefault();
+        var col = btn.dataset.col;
+        var name = col === 'view' ? 'viewModuleKeys' : 'editModuleKeys';
+        var boxes = form.querySelectorAll('input[name="'+name+'"]');
+        var allOn = Array.prototype.every.call(boxes, function(cb){ return cb.checked; });
+        boxes.forEach(function(cb){
+          cb.checked = !allOn;
+          if(col === 'edit'){ // keep edit ⊆ view
+            var v = form.querySelector('input[name="viewModuleKeys"][value="'+cb.value+'"]');
+            if(v && !allOn) v.checked = true;
+          } else if(allOn){    // clearing view clears edit too
+            var e = form.querySelector('input[name="editModuleKeys"][value="'+cb.value+'"]');
+            if(e) e.checked = false;
+          }
+        });
+        refresh();
+      });
+
+      form.refreshModuleTable = refresh;
+      refresh();
     }
 
     function userRow(u){
@@ -263,7 +335,7 @@
             '<input name="username" type="text" placeholder="Display name">'+
             '<select name="roleKey" required>'+roleOptions()+'</select>'+
           '</div>'+
-          '<label class="umlabel">Modules — check View for pages they can see, Edit for pages they can also change (Edit implies View)</label>'+
+          '<label class="umlabel">Page access</label>'+
           moduleTable()+
           '<button type="submit" id="adminFormSubmitBtn" class="umbtn umbtn--go">Add</button>'+
           '<button type="button" id="adminFormCancelBtn" class="umbtn" hidden style="margin-left:8px">Cancel</button>'+
@@ -296,6 +368,7 @@
       var canEdit = new Set(u.editModuleKeys || []);
       form.querySelectorAll('input[name="viewModuleKeys"]').forEach(function(cb){ cb.checked = canView.has(cb.value); });
       form.querySelectorAll('input[name="editModuleKeys"]').forEach(function(cb){ cb.checked = canEdit.has(cb.value); });
+      if(form.refreshModuleTable) form.refreshModuleTable();
       document.getElementById('adminFormHeading').textContent = 'Edit user — '+u.email;
       document.getElementById('adminFormSubmitBtn').textContent = 'Save changes';
       document.getElementById('adminFormCancelBtn').hidden = false;
@@ -306,6 +379,7 @@
       var form = document.getElementById('adminAddForm');
       form.reset();
       form.email.readOnly = false;
+      if(form.refreshModuleTable) form.refreshModuleTable();
       document.getElementById('adminFormHeading').textContent = 'Add user';
       document.getElementById('adminFormSubmitBtn').textContent = 'Add';
       document.getElementById('adminFormCancelBtn').hidden = true;
