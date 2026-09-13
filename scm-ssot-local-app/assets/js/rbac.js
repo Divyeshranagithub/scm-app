@@ -200,22 +200,40 @@
       }).join('');
     }
 
-    function moduleCheckboxes(){
-      return modules.map(function(m){
-        return '<label class="ummod">'+
-          '<input type="checkbox" name="moduleKeys" value="'+escapeHtml(m.moduleKey)+'"> '+
-          escapeHtml(m.moduleName)+
-        '</label>';
+    function moduleTable(){
+      var rows = modules.map(function(m){
+        var k = escapeHtml(m.moduleKey);
+        return '<tr>'+
+          '<td class="ummodtable__name">'+escapeHtml(m.moduleName)+'</td>'+
+          '<td><input type="checkbox" name="viewModuleKeys" value="'+k+'"></td>'+
+          '<td><input type="checkbox" name="editModuleKeys" value="'+k+'"></td>'+
+        '</tr>';
       }).join('');
+      return '<table class="ummodtable"><thead><tr><th>Module</th><th>View</th><th>Edit</th></tr></thead>'+
+        '<tbody>'+rows+'</tbody></table>';
+    }
+    function wireModuleTable(form){
+      form.addEventListener('change', function(e){
+        var t = e.target;
+        if(!t.matches('input[type=checkbox]')) return;
+        if(t.name !== 'viewModuleKeys' && t.name !== 'editModuleKeys') return;
+        var mod = t.value;
+        var viewCb = form.querySelector('input[name="viewModuleKeys"][value="'+mod+'"]');
+        var editCb = form.querySelector('input[name="editModuleKeys"][value="'+mod+'"]');
+        if(t.name === 'editModuleKeys' && t.checked) viewCb.checked = true;          // edit implies view
+        if(t.name === 'viewModuleKeys' && !t.checked && editCb.checked) t.checked = true; // can't drop view while edit is on
+      });
     }
 
     function userRow(u){
-      var modsText = (u.moduleNames||[]).join(', ') || '—';
+      var viewText = (u.viewModuleNames||[]).join(', ') || '—';
+      var editText = (u.editModuleNames||[]).join(', ') || '—';
       return '<tr>'+
         '<td>'+escapeHtml(u.email)+'</td>'+
         '<td>'+escapeHtml(u.username||'')+'</td>'+
         '<td><span class="umrole umrole--'+escapeHtml(u.roleKey)+'">'+escapeHtml(u.roleName)+'</span></td>'+
-        '<td class="umtable__mods">'+escapeHtml(modsText)+'</td>'+
+        '<td class="umtable__mods">'+escapeHtml(viewText)+'</td>'+
+        '<td class="umtable__mods">'+escapeHtml(editText)+'</td>'+
         '<td class="umtable__date">'+escapeHtml((u.createdAt||'').slice(0,10))+'</td>'+
         '<td class="umtable__actions">'+
           '<button type="button" class="admin-edit umiconbtn umiconbtn--edit" data-email="'+escapeHtml(u.email)+'">Edit</button>'+
@@ -234,8 +252,8 @@
             '<input name="username" type="text" placeholder="Display name">'+
             '<select name="roleKey" required>'+roleOptions()+'</select>'+
           '</div>'+
-          '<label class="umlabel">Modules — Editors see every page but only edit these; Viewers only see these</label>'+
-          '<div class="ummods">'+moduleCheckboxes()+'</div>'+
+          '<label class="umlabel">Modules — check View for pages they can see, Edit for pages they can also change (Edit implies View)</label>'+
+          moduleTable()+
           '<button type="submit" id="adminFormSubmitBtn" class="umbtn umbtn--go">Add</button>'+
           '<button type="button" id="adminFormCancelBtn" class="umbtn" hidden style="margin-left:8px">Cancel</button>'+
         '</form>'+
@@ -245,12 +263,14 @@
         '<table class="umtable">'+
           '<thead><tr>'+
             '<th>Email</th><th>Name</th>'+
-            '<th>Role</th><th>Modules</th>'+
+            '<th>Role</th><th>View</th><th>Edit</th>'+
             '<th>Added</th><th></th>'+
           '</tr></thead>'+
           '<tbody id="adminUserRows">'+users.map(userRow).join('')+'</tbody>'+
         '</table>'+
       '</div>';
+
+    wireModuleTable(document.getElementById('adminAddForm'));
 
     var editingEmail = null;   // set while the form is pre-filled to edit an existing user
 
@@ -261,8 +281,10 @@
       form.email.readOnly = true;
       form.username.value = u.username || '';
       form.roleKey.value = u.roleKey;
-      var have = new Set(u.moduleKeys || []);
-      form.querySelectorAll('input[name="moduleKeys"]').forEach(function(cb){ cb.checked = have.has(cb.value); });
+      var canView = new Set(u.viewModuleKeys || []);
+      var canEdit = new Set(u.editModuleKeys || []);
+      form.querySelectorAll('input[name="viewModuleKeys"]').forEach(function(cb){ cb.checked = canView.has(cb.value); });
+      form.querySelectorAll('input[name="editModuleKeys"]').forEach(function(cb){ cb.checked = canEdit.has(cb.value); });
       document.getElementById('adminFormHeading').textContent = 'Edit user — '+u.email;
       document.getElementById('adminFormSubmitBtn').textContent = 'Save changes';
       document.getElementById('adminFormCancelBtn').hidden = false;
@@ -287,7 +309,8 @@
         email: fd.get('email'),
         username: fd.get('username')||null,
         roleKey: fd.get('roleKey'),
-        moduleKeys: fd.getAll('moduleKeys')
+        viewModuleKeys: fd.getAll('viewModuleKeys'),
+        editModuleKeys: fd.getAll('editModuleKeys')
       };
       var wasEditing = !!editingEmail;
       msg.textContent = wasEditing ? 'Saving…' : 'Adding…'; msg.style.color = '#6b5b4d';

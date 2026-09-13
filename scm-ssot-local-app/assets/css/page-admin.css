@@ -141,13 +141,17 @@
 .umlabel{font-size:10.5px;letter-spacing:.8px;text-transform:uppercase;color:var(--muted);
   font-weight:700;display:block;margin-bottom:9px}
 
-.ummods{display:grid;grid-template-columns:repeat(auto-fill,minmax(200px,1fr));gap:8px;margin-bottom:18px}
-.ummod{display:flex;align-items:center;gap:8px;padding:9px 12px;border:1px solid var(--line);
-  border-radius:7px;background:var(--soft);font-size:12.5px;color:var(--ink);cursor:pointer;
-  transition:border-color .15s,background .15s,color .15s}
-.ummod:hover{border-color:var(--red)}
-.ummod input{accent-color:var(--red);width:15px;height:15px;flex:0 0 auto;cursor:pointer}
-.ummod:has(input:checked){border-color:var(--red);background:#FDF1F2;color:var(--red);font-weight:700}
+.ummodtable{width:100%;border-collapse:collapse;font-size:12.5px;margin-bottom:18px;
+  border:1px solid var(--line);border-radius:7px;overflow:hidden}
+.ummodtable thead th{text-align:left;padding:8px 12px;background:var(--soft);color:var(--muted);
+  font-size:10px;letter-spacing:.7px;text-transform:uppercase;font-weight:700;border-bottom:1px solid var(--line)}
+.ummodtable thead th:nth-child(2),.ummodtable thead th:nth-child(3){text-align:center;width:70px}
+.ummodtable tbody td{padding:7px 12px;border-bottom:1px solid var(--soft)}
+.ummodtable tbody tr:last-child td{border-bottom:0}
+.ummodtable tbody tr:hover{background:var(--soft)}
+.ummodtable__name{color:var(--ink)}
+.ummodtable td:nth-child(2),.ummodtable td:nth-child(3){text-align:center}
+.ummodtable input{accent-color:var(--red);width:15px;height:15px;cursor:pointer}
 
 .umbtn{font-family:inherit;font-size:12.5px;font-weight:700;padding:10px 20px;cursor:pointer;
   border-radius:6px;border:1px solid var(--line);background:var(--white);color:var(--muted)}
@@ -185,8 +189,5 @@
   .umcard{padding:16px}
   .umform__row{flex-direction:column}
   .umform__row input[type=email],.umform__row input[type=text],.umform__row select{width:100%;flex:1 1 auto}
-  .ummods{grid-template-columns:1fr 1fr}
-}
-@media(max-width:420px){
-  .ummods{grid-template-columns:1fr}
+  .ummodtable{font-size:12px}
 }

@@ -30,8 +30,16 @@ def require_admin(x_user_email: str = Header(...)) -> str:
     return x_user_email
 
 
-def _user_modules(cur, user_id: int) -> List[str]:
+def _user_view_modules(cur, user_id: int) -> List[str]:
     cur.execute("SELECT module_key FROM user_modules WHERE user_id = %s ORDER BY module_key", (user_id,))
+    return [r[0] for r in cur.fetchall()]
+
+
+def _user_edit_modules(cur, user_id: int) -> List[str]:
+    cur.execute(
+        "SELECT module_key FROM user_modules WHERE user_id = %s AND can_edit ORDER BY module_key",
+        (user_id,),
+    )
     return [r[0] for r in cur.fetchall()]
 
 
@@ -61,14 +69,18 @@ def auth_me(email: str = Query(...)):
                 raise HTTPException(status_code=404, detail="User not registered for this app")
 
             user_id, email_, username, role_key, role_name = row
-            editable_modules = _user_modules(cur, user_id)
+            view_modules = _user_view_modules(cur, user_id)
+            edit_modules = _user_edit_modules(cur, user_id)
 
             if role_key == "administrator":
                 modules = _all_module_keys(cur, include_admin=True)
+                editable_modules = modules
             elif role_key == "editor":
-                modules = _all_module_keys(cur, include_admin=False)
+                modules = view_modules
+                editable_modules = edit_modules
             else:  # viewer
-                modules = editable_modules
+                modules = view_modules
+                editable_modules = []
     except HTTPException:
         raise
     finally:
@@ -125,7 +137,7 @@ def list_users(admin_email: str = Depends(require_admin)):
             for i, e, un, rk, rn, ca in users:
                 cur.execute(
                     """
-                    SELECT m.module_key, m.module_name
+                    SELECT m.module_key, m.module_name, um.can_edit
                     FROM user_modules um JOIN modules m ON m.module_key = um.module_key
                     WHERE um.user_id = %s ORDER BY m.sort_order
                     """,
@@ -135,8 +147,10 @@ def list_users(admin_email: str = Depends(require_admin)):
                 result.append({
                     "id": i, "email": e, "username": un,
                     "roleKey": rk, "roleName": rn,
-                    "moduleKeys": [k for k, _ in mods],
-                    "moduleNames": [n for _, n in mods],
+                    "viewModuleKeys": [k for k, _, _ in mods],
+                    "viewModuleNames": [n for _, n, _ in mods],
+                    "editModuleKeys": [k for k, _, ce in mods if ce],
+                    "editModuleNames": [n for _, n, ce in mods if ce],
                     "createdAt": ca.isoformat(),
                 })
     finally:
@@ -148,11 +162,17 @@ class NewUser(BaseModel):
     email: str
     username: Optional[str] = None
     roleKey: str
-    moduleKeys: List[str] = []
+    viewModuleKeys: List[str] = []
+    editModuleKeys: List[str] = []
 
 
 @router.post("/api/admin/users")
 def add_user(body: NewUser, admin_email: str = Depends(require_admin)):
+    # anything editable must also be viewable — union rather than reject, so
+    # checking "Edit" in the UI without separately checking "View" still works
+    view_set = set(body.viewModuleKeys) | set(body.editModuleKeys)
+    edit_set = set(body.editModuleKeys)
+
     conn = db.get_conn()
     try:
         with conn.cursor() as cur:
@@ -160,7 +180,7 @@ def add_user(body: NewUser, admin_email: str = Depends(require_admin)):
             if cur.fetchone() is None:
                 raise HTTPException(status_code=400, detail=f"Unknown roleKey: {body.roleKey}")
 
-            for mk in body.moduleKeys:
+            for mk in view_set:
                 cur.execute("SELECT 1 FROM modules WHERE module_key = %s", (mk,))
                 if cur.fetchone() is None:
                     raise HTTPException(status_code=400, detail=f"Unknown moduleKey: {mk}")
@@ -177,10 +197,10 @@ def add_user(body: NewUser, admin_email: str = Depends(require_admin)):
             user_id, e, un, rk, ca = cur.fetchone()
 
             cur.execute("DELETE FROM user_modules WHERE user_id = %s", (user_id,))
-            for mk in body.moduleKeys:
+            for mk in view_set:
                 cur.execute(
-                    "INSERT INTO user_modules (user_id, module_key) VALUES (%s, %s)",
-                    (user_id, mk),
+                    "INSERT INTO user_modules (user_id, module_key, can_edit) VALUES (%s, %s, %s)",
+                    (user_id, mk, mk in edit_set),
                 )
         conn.commit()
     except HTTPException:
@@ -194,7 +214,8 @@ def add_user(body: NewUser, admin_email: str = Depends(require_admin)):
 
     return {
         "id": user_id, "email": e, "username": un, "roleKey": rk,
-        "moduleKeys": body.moduleKeys, "createdAt": ca.isoformat(),
+        "viewModuleKeys": sorted(view_set), "editModuleKeys": sorted(edit_set),
+        "createdAt": ca.isoformat(),
     }
 
 

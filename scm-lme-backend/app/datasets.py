@@ -5,7 +5,7 @@ from fastapi import APIRouter, Depends, Header, HTTPException, Query
 
 from . import db
 from .auth import get_api_key
-from .rbac import _all_module_keys, _user_modules
+from .rbac import _all_module_keys, _user_edit_modules, _user_view_modules
 
 router = APIRouter(dependencies=[Depends(get_api_key)])
 
@@ -44,13 +44,17 @@ def _resolve_access(email: str) -> Optional[dict]:
                 return None
             user_id, role_key = row
 
-            editable = _user_modules(cur, user_id)
+            view_modules = _user_view_modules(cur, user_id)
+            edit_modules = _user_edit_modules(cur, user_id)
             if role_key == "administrator":
                 modules = _all_module_keys(cur, include_admin=True)
+                editable = modules
             elif role_key == "editor":
-                modules = _all_module_keys(cur, include_admin=False)
+                modules = view_modules
+                editable = edit_modules
             else:
-                modules = editable
+                modules = view_modules
+                editable = []
 
             return {"roleKey": role_key, "modules": modules, "editableModules": editable}
     finally:
