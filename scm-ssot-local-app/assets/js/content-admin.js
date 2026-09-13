@@ -345,7 +345,13 @@
   }
   function renderForm() {
     var r = cur(); var host = el('admForm'); if (!host) return;
-    if (!ST.data[r.key]) { host.innerHTML = '<div class="scmload">Loading…</div>'; return; }
+    if (!ST.data[r.key]) {
+      var failed = ST.src[r.key] && ST.src[r.key].indexOf('Could not load') === 0;
+      host.innerHTML = failed
+        ? '<div class="scmerr"><b>Could not load this dataset</b>The current document failed to load from the server, so there is nothing safe to edit or publish yet. Reload the page to try again.</div>'
+        : '<div class="scmload">Loading…</div>';
+      return;
+    }
     try { host.innerHTML = (FORMS[r.editor] || FORMS.json)(); }
     catch (e) {
       host.innerHTML = '<div class="scmerr"><b>This form could not be drawn</b>The document does not match the expected shape. Edit it on the JSON tab instead.<br><code>' + E(e.message) + '</code></div>';
@@ -357,8 +363,9 @@
     el('admTitle').textContent = r.label;
     el('admDesc').textContent = r.desc;
     var chip = el('admSrc'); var s = ST.src[r.key];
+    var isWarn = s && (s.indexOf('Built-in') === 0 || s.indexOf('Could not load') === 0);
     chip.textContent = soon ? 'Not built yet' : (s || 'not loaded');
-    chip.className = 'srcchip' + (soon ? ' is-sample' : (s && s.indexOf('Built-in') === 0 ? ' is-sample' : (s ? ' is-live' : '')));
+    chip.className = 'srcchip' + (soon ? ' is-sample' : (isWarn ? ' is-sample' : (s ? ' is-live' : '')));
     el('admDirty').hidden = !ST.dirty[r.key];
     var pb = el('admPublishBtn'); if (pb) pb.hidden = !r.apiKey;
     var db = el('admDownloadBtn');
@@ -421,6 +428,10 @@
   window.admPublish = function () {
     var r = cur();
     if (!r.apiKey) return;
+    if (!ST.loaded[r.key] || !ST.data[r.key]) {
+      msg('', 'Cannot publish', 'The current document never finished loading, so there is nothing safe to save — publishing now could overwrite real data with a blank document. Reload the page and try again.');
+      return;
+    }
     var email = window.SCM_USER && window.SCM_USER.email;
     if (!email || !window.SCM_API) { msg('', 'Cannot publish', 'Your sign-in details are not available yet. Refresh the page and try again.'); return; }
     var btn = document.querySelector('[data-act="admPublish"]');
@@ -455,6 +466,13 @@
     msg('ok', 'Changes discarded', 'Back to the version that was loaded from ' + E(ST.src[r.key] || 'defaults') + '.');
   };
 
+  // Every dataset comes from the backend only — no static file, no blank
+  // "built-in default" to fall back to. A blank fallback used to mean a
+  // failed fetch silently handed the admin an EMPTY form with nothing
+  // stopping them from clicking Publish and wiping real production data
+  // with it. On failure now, ST.data[key] is simply never set, so the form
+  // stays on "Loading…" (see renderForm's !ST.data[r.key] guard) rather
+  // than pretending to have a real (empty) document to edit.
   function load(key) {
     var r = byKey[key];
     if (ST.data[key]) return Promise.resolve();
@@ -462,32 +480,27 @@
       ST.data[key] = {}; ST.orig[key] = {}; ST.src[key] = 'Not built yet'; ST.loaded[key] = false;
       return Promise.resolve();
     }
-    var email = window.SCM_USER && window.SCM_USER.email;
-    var apiReq = (r.apiKey && email && window.SCM_API)
-      ? fetch(window.SCM_API.base + '/api/data/' + encodeURIComponent(r.apiKey) + '?email=' + encodeURIComponent(email),
-          { cache: 'no-cache', headers: { 'X-API-Key': window.SCM_API.key } })
-          .then(function (res) { if (!res.ok) throw new Error(String(res.status)); return res.json(); })
-          .then(function (d) { return { d: d, from: 'Live · API' }; })
-      : Promise.reject(new Error('no api for this dataset'));
-    var url = '/' + r.file;
-    return apiReq
-      .catch(function () {
-        return fetch(url, { cache: 'no-cache' })
-          .then(function (res) { if (!res.ok) throw new Error(String(res.status)); return res.json(); })
-          .then(function (d) { return { d: d, from: 'Web File · ' + url }; });
-      })
-      .catch(function () { return { d: fallback(key), from: 'Built-in default' }; })
-      .then(function (res) {
-        ST.data[key] = res.d; ST.orig[key] = clone(res.d); ST.src[key] = res.from;
-        ST.loaded[key] = res.from.indexOf('Built-in') !== 0;
-      });
+    return fetchDataset(key, r, false);
   }
-  function fallback(key) {
-    if (key === 'overview') return { title: '', cutoff: '', cadence: 'Monthly', poDate: '', overallScore: 0, value: {}, groups: [] };
-    if (key === 'masterdata') return { title: '', sub: '', context: '', headline: [], completed: [], remaining: [], taxonomy: { kpis: [], steps: [] } };
-    if (key === 'monthly') return { months: [] };
-    if (String(key).indexOf('embed-') === 0) return { title: '', src: '' };
-    return {};
+  function fetchDataset(key, r, isRetry) {
+    var email = window.SCM_USER && window.SCM_USER.email;
+    if (!(r.apiKey && email && window.SCM_API)) {
+      ST.src[key] = 'Could not load — not signed in yet';
+      if (ST.key === key) { renderHead(); renderForm(); }
+      return Promise.resolve();
+    }
+    return fetch(window.SCM_API.base + '/api/data/' + encodeURIComponent(r.apiKey) + '?email=' + encodeURIComponent(email),
+        { cache: 'no-cache', headers: { 'X-API-Key': window.SCM_API.key } })
+      .then(function (res) { if (!res.ok) throw new Error(String(res.status)); return res.json(); })
+      .then(function (d) {
+        ST.data[key] = d; ST.orig[key] = clone(d); ST.src[key] = 'Live · API'; ST.loaded[key] = true;
+      })
+      .catch(function (err) {
+        if (!isRetry) return new Promise(function (resolve) { setTimeout(resolve, 3000); }).then(function () { return fetchDataset(key, r, true); });
+        console.warn('[content-admin] ' + key + ' fetch failed: ' + err.message);
+        ST.src[key] = 'Could not load current data — do not publish until this loads correctly';
+        if (ST.key === key) { renderHead(); renderForm(); }
+      });
   }
 
   function onEdit(e) {

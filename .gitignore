@@ -16,3 +16,7 @@ server.err.log
 uvicorn.out.log
 uvicorn.err.log
 server.pid
+
+maintainance-app
+OneDrive_2026-08-25
+scm-vibecode
