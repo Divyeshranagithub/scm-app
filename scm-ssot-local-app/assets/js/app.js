@@ -1123,6 +1123,11 @@ const TITLES = {
   strategy:['Advisory','Strategy Recommendation']
 };
 let lmeBooted=false;
+window.scExport=function(){
+  const f=document.getElementById('shouldCostFrame');
+  try{ f && f.contentWindow && f.contentWindow.downloadReport && f.contentWindow.downloadReport(); }
+  catch(e){ console.warn('[SCM] should-cost export:',e); }
+};
 var openSide = function(o){
   const s=document.getElementById('side'), c=document.getElementById('scrim');
   if(s) s.classList.toggle('is-open',o);
