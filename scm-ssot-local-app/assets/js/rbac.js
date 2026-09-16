@@ -93,8 +93,8 @@
     // Content Administration is role-gated (editor+admin), not part of the module list
     var contentAdminAllowed = data.roleKey === 'editor' || data.roleKey === 'administrator';
     if(contentAdminAllowed) allowed.add('content-admin');
-    // cfp-power-transformers is a drill-down card inside categoryfactpacks, not its own nav item
-    if(allowed.has('categoryfactpacks')) allowed.add('cfp-power-transformers');
+    // cfp-detail is the shared drill-down page for every categoryfactpacks card, not its own nav item
+    if(allowed.has('categoryfactpacks')) allowed.add('cfp-detail');
 
     window.SCM_USER = Object.assign(window.SCM_USER||{}, data);
     window.SCM_RBAC = { modules: data.modules||[], roleKey: data.roleKey };

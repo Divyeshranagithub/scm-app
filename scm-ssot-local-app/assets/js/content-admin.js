@@ -72,15 +72,10 @@
       editor: 'embed'
     },
     {
-      key: 'embed-cfpPt', label: 'Power Transformers Fact Pack — SharePoint link', moduleKey: 'categoryfactpacks',
-      file: 'scm-embed-cfp-powertransformers.json', apiKey: 'embed-cfpPt',
-      desc: 'The SharePoint document embedded on the Power Transformers fact pack page.',
-      editor: 'embed'
-    },
-    {
-      key: 'categoryfactpacks-other', label: 'Category Fact Packs — other categories', moduleKey: 'categoryfactpacks',
-      desc: 'Of the 15 category cards on this page, only Power Transformers has a fact pack built. The other 14 (Switchgears, Reactors, Cables, Insulators, etc.) are marked "Coming soon" with no content yet.',
-      editor: 'soon'
+      key: 'categoryfactpacks', label: 'Category Fact Packs', moduleKey: 'categoryfactpacks',
+      file: 'scm-categoryfactpacks.json', apiKey: 'categoryfactpacks',
+      desc: 'All 15 category cards on the Category Fact Packs page. Enable a card to show its fact pack; disabled cards show "Coming soon".',
+      editor: 'cfp'
     },
     {
       key: 'l0projects', label: 'L0 Projects', moduleKey: 'l0projects',
@@ -88,8 +83,8 @@
       editor: 'soon'
     },
     {
-      key: 'shouldcost', label: 'Demo Should Cost Model', moduleKey: 'shouldcost',
-      desc: 'A demo/sample page, not real production content — nothing to manage here yet.',
+      key: 'shouldcost', label: 'Should Cost Modeller', moduleKey: 'shouldcost',
+      desc: 'A self-contained calculator tool (assets/embeds/should-cost-modeller.html) — no backend dataset to manage here; edit the tool file directly to change it.',
       editor: 'soon'
     },
     {
@@ -138,6 +133,8 @@
       }).join('') + '</select>';
     } else if (opts.type === 'number') {
       control = '<input type="number" ' + attrs + ' value="' + E(v) + '"' + (opts.step ? ' step="' + E(opts.step) + '"' : ' step="any"') + '>';
+    } else if (opts.type === 'checkbox') {
+      control = '<span class="admtoggle"><input type="checkbox" ' + attrs + (v ? ' checked' : '') + '><span class="admtoggle__track"></span></span>';
     } else {
       control = '<input type="text" ' + attrs + ' value="' + E(v) + '">';
     }
@@ -302,6 +299,45 @@
     return out;
   }
 
+  var CFP_CATEGORIES = [
+    { id: 'gis-hgis', no: '01', title: '(GIS) Gas Insulated Switchgears + (HGIS) Hybrid Gas-Insulated Switchgear' },
+    { id: 'power-transformers', no: '02', title: 'Power Transformers' },
+    { id: 'reactors', no: '03', title: 'Reactors' },
+    { id: 'sas-control-protection', no: '04', title: 'SAS, Control & Protection' },
+    { id: 'telecom', no: '05', title: 'Telecom' },
+    { id: 'mv-switchgear', no: '06', title: 'MV Switchgear' },
+    { id: 'grounding-transformer', no: '07', title: 'Grounding Transformer' },
+    { id: 'steel-towers', no: '08', title: 'Steel Towers' },
+    { id: 'acsr-conductor', no: '09', title: 'Aluminium Conductor Steel Reinforced (ACSR) Conductor' },
+    { id: 'dampers-spacers', no: '10', title: 'Dampers / Spacers' },
+    { id: 'line-hardware', no: '11', title: 'Line Hardware' },
+    { id: 'insulators', no: '12', title: 'Insulators' },
+    { id: 'opgw', no: '13', title: '(OPGW) Optical Ground Wire' },
+    { id: 'power-cables', no: '14', title: 'Power Cables (HV, MV, LV)' },
+    { id: 'terminations-joints', no: '15', title: 'Terminations & Joints' }
+  ];
+
+  function formCfp() {
+    var d = ST.data[ST.key];
+    if (!Array.isArray(d.categories)) d.categories = [];
+    var byId = {}; d.categories.forEach(function (c) { if (c && c.id) byId[c.id] = c; });
+    d.categories = CFP_CATEGORIES.map(function (meta) {
+      return byId[meta.id] || { id: meta.id, enabled: false, src: '', openUrl: '' };
+    });
+    var rows = CFP_CATEGORIES.map(function (meta, i) {
+      var p = 'categories.' + i;
+      return '<div class="admitem"><div class="admitem__h"><span class="admitem__n">#' + meta.no + '</span>' +
+        '<span class="admitem__t">' + E(meta.title) + '</span></div>' +
+        '<div class="admitem__b"><div class="admrow">' +
+        field(p + '.enabled', 'Enabled', { type: 'checkbox', hint: 'off = shows "Coming soon" — needs at least the Open link below' }) +
+        field(p + '.src', 'Embed URL', { wide: true, hint: 'optional — Power BI embed links work inline; SharePoint links do not (Microsoft blocks it) and fall back to the Open link' }) +
+        field(p + '.openUrl', 'Open link', { wide: true, hint: 'opens in a new tab — shown as a button when there is no working embed' }) +
+        '</div></div></div>';
+    }).join('');
+    return group('Category cards', '15 fixed categories — enable one to show its fact pack instead of "Coming soon"',
+      '<div class="admlist">' + rows + '</div>');
+  }
+
   function formSoon() {
     var r = cur();
     return '<div class="admgrp"><div class="admgrp__b">' +
@@ -311,7 +347,7 @@
       'the other pages.</p></div></div>';
   }
 
-  var FORMS = { overview: formOverview, masterdata: formMasterdata, monthly: formMonthly, embed: formEmbed, json: formJson, soon: formSoon };
+  var FORMS = { overview: formOverview, masterdata: formMasterdata, monthly: formMonthly, embed: formEmbed, cfp: formCfp, json: formJson, soon: formSoon };
 
   function msg(kind, title, body) {
     var m = el('admMsg'); if (!m) return;
@@ -487,7 +523,7 @@
     var node = e.target;
     if (!node || !node.dataset || node.dataset.path === undefined || !ST.key) return;
     if (!node.closest || !node.closest('#admForm')) return;
-    var v = node.value;
+    var v = node.dataset.kind === 'checkbox' ? node.checked : node.value;
     if (node.dataset.kind === 'number') v = (v === '' ? '' : Number(v));
     setPath(ST.data[ST.key], node.dataset.path, v);
     markDirty();

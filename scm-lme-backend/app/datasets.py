@@ -21,7 +21,7 @@ DATASET_MODULE = {
     'embed-scmkpi': 'scmkpi',
     'embed-secavl': 'secavl',
     'embed-riskregister': 'riskregister',
-    'embed-cfpPt': 'categoryfactpacks',
+    'categoryfactpacks': 'categoryfactpacks',
 }
 
 
