@@ -1,0 +1,42 @@
+{
+  "swagger": "2.0",
+  "info": {
+    "title": "SCM LME Latest Snapshot API",
+    "description": "Returns the most recently published LME market snapshot.",
+    "version": "1.0.0"
+  },
+  "host": "orion.algihaz.com",
+  "basePath": "/scm",
+  "schemes": ["https"],
+  "consumes": ["application/json"],
+  "produces": ["application/json"],
+  "securityDefinitions": {
+    "apiKeyHeader": {
+      "type": "apiKey",
+      "name": "X-API-Key",
+      "in": "header"
+    }
+  },
+  "security": [{ "apiKeyHeader": [] }],
+  "paths": {
+    "/api/lme/latest": {
+      "get": {
+        "operationId": "GetLatestLmeSnapshot",
+        "summary": "Get latest LME snapshot",
+        "description": "Returns the most recently published LME market snapshot (the highest report date currently stored). Used to fetch the previous committed row for Composer's structural drift check.",
+        "parameters": [],
+        "responses": {
+          "200": {
+            "description": "The latest snapshot, in Golden Schema shape.",
+            "schema": {
+              "type": "object"
+            }
+          },
+          "404": {
+            "description": "No snapshots have been published yet."
+          }
+        }
+      }
+    }
+  }
+}

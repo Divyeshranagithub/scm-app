@@ -35,7 +35,7 @@ app = FastAPI(title="SCM LME API", lifespan=lifespan)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=ALLOWED_ORIGINS,
-    allow_methods=["GET", "POST", "PUT", "DELETE"],
+    allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE"],
     allow_headers=["*"],
 )
 
@@ -165,3 +165,75 @@ def put_snapshot(report_date: str, body: dict = Body(...), api_key: str = Depend
         "reportDate": report_date,
         "id": str(row_id),
     }
+
+
+UPDATABLE_SNAPSHOT_COLUMNS = {"report_date_label", "payload_json", "name", "status_code", "state_code", "version_number"}
+
+
+def _update_snapshot_by_id(cur, record_id: str, item: dict) -> dict:
+    if not isinstance(item, dict) or not item:
+        return {"recordId": record_id, "status": "error", "error": "item must be a non-empty object"}
+    unknown = set(item) - UPDATABLE_SNAPSHOT_COLUMNS
+    if unknown:
+        return {
+            "recordId": record_id,
+            "status": "error",
+            "error": f"unsupported field(s): {', '.join(sorted(unknown))}",
+        }
+
+    set_parts, values = [], []
+    for col, val in item.items():
+        set_parts.append(f"{col} = %s")
+        values.append(json.dumps(val) if col == "payload_json" else val)
+    values.append(record_id)
+
+    cur.execute(
+        f"UPDATE lme_snapshots SET {', '.join(set_parts)} WHERE id = %s RETURNING id, report_date",
+        values,
+    )
+    row = cur.fetchone()
+    if row is None:
+        return {"recordId": record_id, "status": "error", "error": "not found"}
+    return {"recordId": record_id, "status": "ok", "reportDate": row[1].isoformat()}
+
+
+@app.patch("/api/lme/snapshot/id")
+def update_snapshot_by_id(body: dict = Body(...), api_key: str = Depends(get_api_key)):
+    """Update one or more LME snapshot rows by id. Mirrors the Dataverse 'update row(s)' tool:
+    pass 'recordId'+'item' for one row, or 'records' (array of {recordId, item}) for several."""
+    if not isinstance(body, dict):
+        raise HTTPException(status_code=400, detail="Body must be a JSON object")
+
+    conn = db.get_conn()
+    try:
+        with conn.cursor() as cur:
+            if "records" in body:
+                records = body["records"]
+                if not isinstance(records, list) or not records:
+                    raise HTTPException(status_code=400, detail="'records' must be a non-empty array")
+                results = []
+                for rec in records:
+                    if not isinstance(rec, dict) or "recordId" not in rec or "item" not in rec:
+                        results.append({"status": "error", "error": "each record needs 'recordId' and 'item'"})
+                        continue
+                    results.append(_update_snapshot_by_id(cur, rec["recordId"], rec["item"]))
+                conn.commit()
+                return {"status": "ok", "results": results}
+
+            if "recordId" in body and "item" in body:
+                result = _update_snapshot_by_id(cur, body["recordId"], body["item"])
+                conn.commit()
+                if result["status"] == "error":
+                    code = 404 if result.get("error") == "not found" else 400
+                    raise HTTPException(status_code=code, detail=result["error"])
+                return result
+
+            raise HTTPException(status_code=400, detail="Provide either ('recordId' and 'item') or 'records'")
+    except HTTPException:
+        conn.rollback()
+        raise
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        db.put_conn(conn)

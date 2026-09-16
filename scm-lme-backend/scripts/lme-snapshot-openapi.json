@@ -1,0 +1,63 @@
+{
+  "swagger": "2.0",
+  "info": {
+    "title": "SCM LME Snapshot API",
+    "description": "Upserts an LME market snapshot for a given report date.",
+    "version": "1.0.0"
+  },
+  "host": "orion.algihaz.com",
+  "basePath": "/scm",
+  "schemes": ["https"],
+  "consumes": ["application/json"],
+  "produces": ["application/json"],
+  "securityDefinitions": {
+    "apiKeyHeader": {
+      "type": "apiKey",
+      "name": "X-API-Key",
+      "in": "header"
+    }
+  },
+  "security": [{ "apiKeyHeader": [] }],
+  "paths": {
+    "/api/lme/snapshot/{reportDate}": {
+      "put": {
+        "operationId": "UpsertLmeSnapshot",
+        "summary": "Upsert LME snapshot",
+        "description": "Creates or updates the LME market snapshot for the given report date. Upserts by reportDate: if a snapshot for this date already exists it is updated in place, otherwise a new one is inserted.",
+        "parameters": [
+          {
+            "name": "reportDate",
+            "in": "path",
+            "required": true,
+            "type": "string",
+            "format": "date",
+            "description": "The snapshot's report date, in YYYY-MM-DD format."
+          },
+          {
+            "name": "body",
+            "in": "body",
+            "required": true,
+            "description": "The full Golden Schema payload object for this snapshot (built in the agent's step 9).",
+            "schema": {
+              "type": "object"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Upsert succeeded.",
+            "schema": {
+              "type": "object",
+              "properties": {
+                "status": { "type": "string" },
+                "action": { "type": "string", "description": "Either \"insert\" or \"update\"." },
+                "reportDate": { "type": "string" },
+                "id": { "type": "string" }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}
