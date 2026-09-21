@@ -1,0 +1,11741 @@
+/* Real frontend for the L0/L1 pilot. Every render here comes from an actual
+   fetch() to the FastAPI backend — no hardcoded data arrays anywhere in this
+   file. Role-based button gating is client-side only for now (no per-user
+   login exists yet in the pilot) — before this goes company-wide, the same
+   checks need to be enforced server-side too, not just hidden in the UI. */
+(function () {
+  "use strict";
+
+  var CURRENT_ROLE = "Admin";
+  function actingEmail() {
+    // Real DronaHQ SSO identity (see dronahq-sso.js) takes priority over the
+    // manual "acting as email" field once it's available -- that field stays
+    // as the fallback for local/non-DronaHQ use where no SSO session exists.
+    if (window.L0L1_USER && window.L0L1_USER.email) return window.L0L1_USER.email.trim();
+    var f = document.getElementById("actingEmail");
+    return f ? f.value.trim() : "";
+  }
+  function can(action) {
+    if (CURRENT_ROLE === "Admin") return true;
+    if (action === "upload") return CURRENT_ROLE === "Owner";
+    if (action === "review") return CURRENT_ROLE === "SME";
+    if (action === "remind" || action === "create") return false;
+    return true;
+  }
+  function isAssigned(d) {
+    if (CURRENT_ROLE === "Admin") return true;
+    var email = actingEmail().trim().toLowerCase();
+    if (!email) return false;
+    var owners = (d.owner_emails || []).map(function (e) { return (e || "").trim().toLowerCase(); });
+    var smes = (d.sme_emails || []).map(function (e) { return (e || "").trim().toLowerCase(); });
+    return owners.indexOf(email) !== -1 || smes.indexOf(email) !== -1;
+  }
+
+  function el(tag, cls, html) {
+    var e = document.createElement(tag);
+    if (cls) e.className = cls;
+    if (html !== undefined) e.innerHTML = html;
+    return e;
+  }
+  // Shared pager (items 2/19/26): "‹ Page X of Y ›" controls in `pagerEl`,
+  // re-invoking `render(pageSlice)` with just the current page's items
+  // every time the page changes (including the very first draw) --
+  // `render` only ever needs to know how to paint one page's worth of
+  // items into its own content container, not manage pagination itself.
+  // A page count of 1 (or 0 items) hides the controls entirely rather
+  // than showing a useless single "Page 1 of 1".
+  // Doc redline on item 2: the ‹/› text glyphs never sat centered inside
+  // the circle (font-metric-dependent, not something a CSS nudge fixes
+  // reliably) -- real SVG chevrons instead, same "build the icon as SVG"
+  // approach poIcon() already uses elsewhere, so centering is exact
+  // regardless of font/OS.
+  var PAGER_CHEVRON_LEFT = '<svg width="10" height="10" viewBox="0 0 16 16"><path d="M10 3L6 8L10 13" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>';
+  var PAGER_CHEVRON_RIGHT = '<svg width="10" height="10" viewBox="0 0 16 16"><path d="M6 3L10 8L6 13" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>';
+  function renderPager(pagerEl, items, pageSize, render) {
+    var page = 0;
+    var totalPages = Math.max(1, Math.ceil(items.length / pageSize));
+    function draw() {
+      render(items.slice(page * pageSize, page * pageSize + pageSize));
+      pagerEl.innerHTML = "";
+      if (totalPages <= 1) return;
+      var prev = el("button", "pager-btn", PAGER_CHEVRON_LEFT);
+      prev.type = "button";
+      prev.disabled = page === 0;
+      prev.addEventListener("click", function () { page--; draw(); });
+      var next = el("button", "pager-btn", PAGER_CHEVRON_RIGHT);
+      next.type = "button";
+      next.disabled = page === totalPages - 1;
+      next.addEventListener("click", function () { page++; draw(); });
+      pagerEl.appendChild(prev);
+      pagerEl.appendChild(el("span", "pager-label", "Page " + (page + 1) + " of " + totalPages));
+      pagerEl.appendChild(next);
+    }
+    draw();
+  }
+  // Items 4/36: a reusable "Excel header" -- click a column label to sort by
+  // it (cycles asc/desc), click its funnel icon for an Excel-style
+  // multi-select filter dropdown (checkbox list of every distinct value in
+  // that column, search-within-list, Select All/Clear). One controller per
+  // table; `process(list)` applies the current sort+filter state and
+  // returns the list to render -- callers just render whatever comes back,
+  // same "give it data, get back what to draw" shape as renderPager.
+  var XH_FILTER_ICON = '<svg width="10" height="10" viewBox="0 0 16 16"><path d="M1 2h14l-5.5 6.5v4.5l-3 2v-6.5z" fill="currentColor"/></svg>';
+  // Redlined: the old 9x9 icon at .35 opacity read as "too small to see" --
+  // bigger (14x14), bolder triangles with real spacing between them, and a
+  // visible resting opacity instead of near-invisible until hovered.
+  var XH_SORT_ICON = '<svg width="14" height="14" viewBox="0 0 16 20" class="xh-sort-svg"><path class="xh-sort-up" d="M8 0L14 7H2z" fill="currentColor"/><path class="xh-sort-down" d="M8 20L14 13H2z" fill="currentColor"/></svg>';
+  var _xhOpenPanel = null; // only one filter dropdown open at a time, across every table
+  function _xhClosePanel() {
+    if (_xhOpenPanel) { _xhOpenPanel.remove(); _xhOpenPanel = null; }
+  }
+  document.addEventListener("click", function (e) {
+    if (_xhOpenPanel && !_xhOpenPanel.contains(e.target) && !e.target.closest(".xh-filter-btn")) _xhClosePanel();
+  });
+  // Item 18: user-customizable column widths/visibility, for any <table>
+  // built on a <colgroup> (table.data/.fp-table's own fixed-layout
+  // convention -- every column's width already lives on one <col>
+  // element per column, in order, so this needs no changes to any row-
+  // render function at all: hiding a column is just display:none on its
+  // <col> (removes that whole column from the table natively, HTML
+  // handles it), widening/narrowing is just that <col>'s own width.
+  // One shared modal (#colCustomOverlay) reused across every table that
+  // opts in -- _colCustomActive tracks which table's controller the
+  // modal is currently open for for Save/Reset to act on.
+  var _colCustomActive = null;
+  function _colCustomLoad(storageKey) {
+    try {
+      var raw = localStorage.getItem("colCustom:" + storageKey);
+      return raw ? JSON.parse(raw) : null;
+    } catch (e) { return null; } // corrupted/blocked storage -- falls back to defaults below
+  }
+  function _colCustomSave(storageKey, state) {
+    try { localStorage.setItem("colCustom:" + storageKey, JSON.stringify(state)); } catch (e) { /* private window / storage blocked -- just won't persist */ }
+  }
+  function installColumnCustomizer(opts) {
+    // opts: { storageKey, title, colgroupEl, columns: [{key,label,defaultWidth}] }
+    // defaultWidth is a plain number (% of the table) -- matches how
+    // every colgroup on these tables is already hand-tuned to sum to 100.
+    function currentState() {
+      var saved = _colCustomLoad(opts.storageKey);
+      var widths = {}, hidden = {};
+      opts.columns.forEach(function (c) {
+        widths[c.key] = (saved && saved.widths && typeof saved.widths[c.key] === "number") ? saved.widths[c.key] : c.defaultWidth;
+        hidden[c.key] = !!(saved && saved.hidden && saved.hidden[c.key]);
+      });
+      return { widths: widths, hidden: hidden };
+    }
+    function apply() {
+      var state = currentState();
+      var cols = Array.prototype.slice.call(opts.colgroupEl.children);
+      opts.columns.forEach(function (c, i) {
+        var col = cols[i];
+        if (!col) return;
+        col.style.width = state.widths[c.key] + "%";
+        // [Column hiding]: display:none on a <col> is silently ignored by
+        // real browsers (a <col> isn't a normal rendered box) -- the
+        // header/data cells stayed visible at their old width, undoing
+        // nothing. visibility:collapse is the mechanism actually defined
+        // for hiding a whole table column, verified to collapse the real
+        // cells to 0 width.
+        col.style.visibility = state.hidden[c.key] ? "collapse" : "";
+      });
+    }
+    apply(); // restore any saved customization immediately on page load
+    var controller = {
+      open: function () { _openColCustomModal(controller, opts, currentState()); },
+      apply: apply,
+    };
+    return controller;
+  }
+  function _openColCustomModal(controller, opts, state) {
+    _colCustomActive = { controller: controller, opts: opts };
+    document.getElementById("colCustomTitle").textContent = "Customize " + opts.title + " Columns";
+    var list = document.getElementById("colCustomList");
+    list.innerHTML = "";
+    function updateTotal() {
+      var total = 0;
+      list.querySelectorAll(".colcustom-width").forEach(function (inp) { total += Number(inp.value) || 0; });
+      document.getElementById("colCustomTotal").textContent = "Total: " + Math.round(total * 10) / 10 + "%" +
+        (Math.round(total) === 100 ? "" : " (doesn't need to be exactly 100)");
+    }
+    opts.columns.forEach(function (c) {
+      var row = el("div", "colcustom-row");
+      var cb = document.createElement("input");
+      cb.type = "checkbox"; cb.checked = !state.hidden[c.key]; cb.className = "colcustom-visible"; cb.dataset.key = c.key;
+      var label = el("label", "colcustom-label");
+      label.appendChild(cb);
+      label.appendChild(el("span", "", c.label));
+      row.appendChild(label);
+      var widthWrap = el("div", "colcustom-width-wrap");
+      var inp = document.createElement("input");
+      inp.type = "number"; inp.min = "2"; inp.max = "100"; inp.step = "1";
+      inp.className = "colcustom-width"; inp.dataset.key = c.key;
+      inp.value = Math.round(state.widths[c.key] * 10) / 10;
+      inp.addEventListener("input", updateTotal);
+      widthWrap.appendChild(inp);
+      widthWrap.appendChild(el("span", "colcustom-pct", "%"));
+      row.appendChild(widthWrap);
+      list.appendChild(row);
+    });
+    updateTotal();
+    document.getElementById("colCustomOverlay").hidden = false;
+  }
+  function _closeColCustomModal() { document.getElementById("colCustomOverlay").hidden = true; _colCustomActive = null; }
+  document.getElementById("colCustomClose").addEventListener("click", _closeColCustomModal);
+  document.getElementById("colCustomOverlay").addEventListener("click", function (e) { if (e.target === this) _closeColCustomModal(); });
+  document.getElementById("colCustomSave").addEventListener("click", function () {
+    if (!_colCustomActive) return;
+    var opts = _colCustomActive.opts;
+    var widths = {}, hidden = {};
+    document.querySelectorAll("#colCustomList .colcustom-width").forEach(function (inp) {
+      widths[inp.dataset.key] = Math.max(2, Number(inp.value) || opts.columns.filter(function (c) { return c.key === inp.dataset.key; })[0].defaultWidth);
+    });
+    document.querySelectorAll("#colCustomList .colcustom-visible").forEach(function (cb) { hidden[cb.dataset.key] = !cb.checked; });
+    _colCustomSave(opts.storageKey, { widths: widths, hidden: hidden });
+    _colCustomActive.controller.apply();
+    showToast(opts.title + " columns updated");
+    _closeColCustomModal();
+  });
+  document.getElementById("colCustomReset").addEventListener("click", async function () {
+    if (!_colCustomActive) return;
+    var opts = _colCustomActive.opts;
+    if (!(await customConfirm("This clears any column widths/visibility you've set for " + opts.title + ", back to the default layout.",
+      { title: "Restore default columns?", okLabel: "Restore", danger: true }))) return;
+    try { localStorage.removeItem("colCustom:" + opts.storageKey); } catch (e) {}
+    _colCustomActive.controller.apply();
+    showToast(opts.title + " columns restored to default");
+    _closeColCustomModal();
+  });
+  function installExcelHeader(theadRowEl, columns) {
+    var state = { sortKey: null, sortDir: "asc", filters: {} }; // filters[key] = Set of allowed values, absent = no filter
+    var changeCb = null;
+    var clearBar = _xhInstallClearBar(theadRowEl, function () {
+      Array.prototype.slice.call(theadRowEl.children).forEach(function (th) { th.removeAttribute("data-xh-filtered"); });
+      state.filters = {};
+      notify();
+    });
+    function notify() {
+      _xhUpdateClearBar(clearBar, state);
+      if (changeCb) changeCb();
+    }
+    var thByKey = {};
+    var ths = Array.prototype.slice.call(theadRowEl.children);
+    ths.forEach(function (th, i) {
+      var col = columns[i];
+      if (!col) return;
+      thByKey[col.key] = th;
+      var label = th.textContent.trim();
+      th.innerHTML = "";
+      th.classList.add("xh-th");
+      var wrap = el("div", "xh-th-wrap");
+      if (col.sortable !== false) {
+        var sortBtn = el("span", "xh-sort-btn", '<span class="xh-label">' + label + "</span>" + XH_SORT_ICON);
+        sortBtn.addEventListener("click", function () {
+          if (state.sortKey === col.key) state.sortDir = state.sortDir === "asc" ? "desc" : "asc";
+          else { state.sortKey = col.key; state.sortDir = "asc"; }
+          _xhUpdateSortIndicators(theadRowEl, columns, state);
+          notify();
+        });
+        wrap.appendChild(sortBtn);
+      } else {
+        wrap.appendChild(el("span", "xh-label", label));
+      }
+      if (col.filterable !== false) {
+        var filterBtn = el("button", "xh-filter-btn", XH_FILTER_ICON);
+        filterBtn.type = "button";
+        filterBtn.addEventListener("click", function (e) {
+          e.stopPropagation();
+          if (_xhOpenPanel && _xhOpenPanel.dataset.forKey === col.key && _xhOpenPanel.dataset.forTh === String(i)) { _xhClosePanel(); return; }
+          _xhOpenFilterPanel(filterBtn, col, state, th, notify, i);
+        });
+        wrap.appendChild(filterBtn);
+      }
+      th.appendChild(wrap);
+    });
+    _xhUpdateClearBar(clearBar, state);
+    return {
+      onChange: function (cb) { changeCb = cb; },
+      state: state,
+      // [Request 3]: carried on every controller so exportTableToExcel()
+      // can reuse this exact table's own columns/header without every
+      // call site having to thread them through separately.
+      columns: columns, theadRowEl: theadRowEl,
+      // Lets an external control (e.g. a summary card acting as a
+      // shortcut filter) drive a column filter the same way picking it
+      // from that column's own dropdown would -- values: array of allowed
+      // strings, or null/undefined to clear that column's filter.
+      setFilter: function (key, values) {
+        if (values && values.length) state.filters[key] = new Set(values);
+        else delete state.filters[key];
+        var th = thByKey[key];
+        if (th) { if (values && values.length) th.setAttribute("data-xh-filtered", "1"); else th.removeAttribute("data-xh-filtered"); }
+        notify();
+      },
+      process: function (list) {
+        var out = list;
+        Object.keys(state.filters).forEach(function (key) {
+          var allowed = state.filters[key];
+          if (!allowed) return;
+          var col = columns.filter(function (c) { return c && c.key === key; })[0];
+          if (!col) return;
+          out = out.filter(function (row) { return allowed.has(String(col.get(row) == null ? "" : col.get(row))); });
+        });
+        if (state.sortKey) {
+          var col2 = columns.filter(function (c) { return c && c.key === state.sortKey; })[0];
+          if (col2) {
+            var getSort = col2.sortValue || col2.get;
+            out = out.slice().sort(function (a, b) {
+              var av = getSort(a), bv = getSort(b);
+              if (av == null) av = "";
+              if (bv == null) bv = "";
+              var cmp = (typeof av === "number" && typeof bv === "number") ? (av - bv) : String(av).localeCompare(String(bv), undefined, { numeric: true, sensitivity: "base" });
+              return state.sortDir === "asc" ? cmp : -cmp;
+            });
+          }
+        }
+        return out;
+      },
+    };
+  }
+  // A "Clear filters" bar sits above the table, right-aligned, and only
+  // shows once at least one column filter is active -- one per table,
+  // inserted as the table's previous sibling so it never needs its own
+  // spot carved out of each view's markup.
+  function _xhInstallClearBar(theadRowEl, onClear) {
+    // Every other table this installs on is a real <table>; Assigned
+    // Deliverables' .aqt is a div-based grid (see loadAssigned) with no
+    // <table> ancestor at all, so it falls back to that wrapper instead.
+    var table = theadRowEl.closest("table") || theadRowEl.closest(".aqt");
+    if (!table || !table.parentNode) return null;
+    var bar = el("div", "xh-clearbar");
+    var btn = el("button", "xh-clearbar-btn", "&#10005; Clear filters");
+    btn.type = "button";
+    btn.addEventListener("click", onClear);
+    bar.appendChild(btn);
+    bar.hidden = true;
+    table.parentNode.insertBefore(bar, table);
+    return bar;
+  }
+  function _xhUpdateClearBar(bar, state) {
+    if (!bar) return;
+    var count = Object.keys(state.filters).length;
+    bar.hidden = count === 0;
+    bar.querySelector(".xh-clearbar-btn").innerHTML = "&#10005; Clear " + count + " filter" + (count === 1 ? "" : "s");
+  }
+  function _xhUpdateSortIndicators(theadRowEl, columns, state) {
+    Array.prototype.slice.call(theadRowEl.children).forEach(function (th, i) {
+      var col = columns[i];
+      if (!col) return;
+      th.classList.remove("xh-sort-asc", "xh-sort-desc");
+      if (state.sortKey === col.key) th.classList.add(state.sortDir === "asc" ? "xh-sort-asc" : "xh-sort-desc");
+    });
+  }
+  function _xhOpenFilterPanel(anchorBtn, col, state, thEl, onApply, thIndex) {
+    _xhClosePanel();
+    var rect = anchorBtn.getBoundingClientRect();
+    var panel = el("div", "xh-panel");
+    panel.dataset.forKey = col.key;
+    panel.dataset.forTh = String(thIndex);
+    var searchInput = el("input", "xh-panel-search");
+    searchInput.type = "text";
+    // .placeholder is a plain attribute, not innerHTML -- it never decodes
+    // HTML entities, so "&#8230;" rendered as that literal text instead of
+    // an ellipsis. Real character instead, same as every other plain-
+    // attribute string in this file.
+    searchInput.placeholder = "Search values…";
+    panel.appendChild(searchInput);
+    var listWrap = el("div", "xh-panel-list");
+    panel.appendChild(listWrap);
+    var allValues = col.uniqueValues();
+    var current = state.filters[col.key]; // Set or undefined (= all selected)
+    function drawList(term) {
+      listWrap.innerHTML = "";
+      var selectAllRow = el("label", "xh-panel-row xh-panel-selectall");
+      var selectAllCb = document.createElement("input");
+      selectAllCb.type = "checkbox";
+      selectAllCb.checked = !current;
+      selectAllRow.appendChild(selectAllCb);
+      selectAllRow.appendChild(el("span", "", "(Select All)"));
+      selectAllCb.addEventListener("change", function () {
+        checkboxes.forEach(function (c) { c.checked = selectAllCb.checked; });
+      });
+      listWrap.appendChild(selectAllRow);
+      var checkboxes = [];
+      allValues.filter(function (v) { return !term || v.toLowerCase().indexOf(term) !== -1; }).forEach(function (v) {
+        var row = el("label", "xh-panel-row");
+        var cb = document.createElement("input");
+        cb.type = "checkbox";
+        cb.checked = !current || current.has(v);
+        cb.value = v;
+        checkboxes.push(cb);
+        row.appendChild(cb);
+        row.appendChild(el("span", "", v || "(blank)"));
+        listWrap.appendChild(row);
+      });
+      panel._checkboxes = checkboxes;
+    }
+    drawList("");
+    searchInput.addEventListener("input", function () { drawList(searchInput.value.trim().toLowerCase()); });
+    var actions = el("div", "xh-panel-actions");
+    var clearBtn = el("button", "btn", "Clear");
+    clearBtn.type = "button";
+    clearBtn.addEventListener("click", function () {
+      delete state.filters[col.key];
+      thEl.removeAttribute("data-xh-filtered");
+      _xhClosePanel();
+      onApply();
+    });
+    var applyBtn = el("button", "btn primary", "Apply");
+    applyBtn.type = "button";
+    applyBtn.addEventListener("click", function () {
+      var checked = panel._checkboxes.filter(function (c) { return c.checked; }).map(function (c) { return c.value; });
+      if (checked.length === allValues.length) { delete state.filters[col.key]; thEl.removeAttribute("data-xh-filtered"); }
+      else { state.filters[col.key] = new Set(checked); thEl.setAttribute("data-xh-filtered", "1"); }
+      _xhClosePanel();
+      onApply();
+    });
+    actions.appendChild(clearBtn);
+    actions.appendChild(applyBtn);
+    panel.appendChild(actions);
+    document.body.appendChild(panel);
+    var top = rect.bottom + window.scrollY + 4;
+    var left = rect.left + window.scrollX;
+    if (left + 220 > window.scrollX + document.documentElement.clientWidth) left = rect.right + window.scrollX - 220;
+    panel.style.top = top + "px";
+    panel.style.left = left + "px";
+    _xhOpenPanel = panel;
+  }
+  // Item 170: DD-Mon-YYYY everywhere a date renders (e.g. "16-Sep-2026")
+  // -- toLocaleDateString has no hyphen-separator preset, and en-GB's own
+  // "short" month for September is the 4-letter "Sept", so this is a
+  // fixed 3-letter table instead of relying on locale formatting.
+  var MONTH_ABBR = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+  function fmtDate(iso) {
+    if (!iso) return "&#8213;";
+    var d = new Date(iso + "T00:00:00");
+    var day = String(d.getDate()).padStart(2, "0");
+    return day + "-" + MONTH_ABBR[d.getMonth()] + "-" + d.getFullYear();
+  }
+  function fmtCurrency(n) {
+    return "SAR " + Number(n).toLocaleString("en-US", { maximumFractionDigits: 0 });
+  }
+  // Item 169: a predecessor-gated deliverable's due_date/awaiting_note pair
+  // covers two cases -- no date at all yet (awaiting_note replaces the
+  // date entirely) and a date that's already computed but still only
+  // tentative (awaiting_note appends alongside it, in parens). Shared by
+  // every place a deliverable's due date is rendered so the wording/shape
+  // never drifts between them.
+  function dueDateHtml(d) {
+    if (!d.due_date) return d.awaiting_note || fmtDate(d.due_date);
+    return fmtDate(d.due_date) + (d.awaiting_note ? ' <span class="pending-note">(' + d.awaiting_note + ")</span>" : "");
+  }
+  // Item [early bonus]: human label for a Completed deliverable's earned
+  // point value, matching rules.kpi_points' exact tiers on the backend.
+  function pointsEarnedLabel(pts) {
+    var why = pts >= 1.1 ? "Early &#8211; 10% bonus"
+      : pts === 1.0 ? "On Time"
+      : pts === 0.9 ? "1&#8211;7 days late"
+      : pts === 0.8 ? "8&#8211;14 days late"
+      : pts === 0.7 ? "15&#8211;21 days late"
+      : pts === 0.6 ? "22&#8211;28 days late"
+      : "Not submitted in time";
+    return pts.toFixed(1) + " pts <span class=\"pending-note\">(" + why + ")</span>";
+  }
+  // Item 143 (2nd revision): a deliverable now carries two independent
+  // status pills -- Deadline (Not Due / Due / On Time / Early / Late, with
+  // a day count) and Progress (No Progress Yet / In Progress / Pending SME
+  // Review / Completed / Rejected). Not Required and Pending Triage sit
+  // outside both axes, so they render as a single pill on their own.
+  // Item [due-date pending pill]: an outstanding extension/hold request
+  // takes over the Deadline pill (instead of showing the normal Due/Not Due
+  // it would otherwise read) so it's visible while just browsing a list,
+  // not only inside the deliverable's own modal. on_hold still wins if both
+  // are somehow true, since deadline_status() already checks that first.
+  function pendingDueDateRequestKind(d) {
+    return d.pending_due_date_request_kind || (d.pending_due_date_request && d.pending_due_date_request.kind) || null;
+  }
+  function deadlinePillHtml(d) {
+    var pendingKind = pendingDueDateRequestKind(d);
+    if (pendingKind && d.deadline_status !== "on_hold") {
+      var label = pendingKind === "extension" ? "Pending Extension Approval" : "Pending On Hold Approval";
+      return '<span class="pill warn"><span class="dot"></span>' + label + "</span>";
+    }
+    var meta = DEADLINE_META[d.deadline_status] || ["neutral", d.deadline_status];
+    var text = meta[1];
+    if (d.deadline_days !== null && d.deadline_days !== undefined) {
+      text += " (" + (d.deadline_days > 0 ? "+" : "") + d.deadline_days + " days)";
+    }
+    return '<span class="pill ' + meta[0] + '"><span class="dot"></span>' + text + "</span>";
+  }
+  function progressPillHtml(d) {
+    // Auto-completed items (1.1-1.5, milestones) get a distinct label
+    // rather than folding into plain "Completed" -- they were never a real
+    // SME sign-off, just data already known from the project's own form.
+    if (d.status === "approved" && d.auto_completed) {
+      return '<span class="pill good"><span class="dot"></span>Auto-Completed</span>';
+    }
+    var meta = STATUS_META[d.status] || ["neutral", d.status];
+    return '<span class="pill ' + meta[0] + '"><span class="dot"></span>' + meta[1] + "</span>";
+  }
+  function statusPillsHtml(d) {
+    if (d.status === "not_required" || d.status === "pending_triage") return progressPillHtml(d);
+    return deadlinePillHtml(d) + progressPillHtml(d);
+  }
+  // Item 144: same two axes as the pills above, rendered as plain
+  // dot+text for the Assigned Deliverables table (no pill background).
+  function deadlineStatusCellHtml(d) {
+    if (d.status === "not_required" || d.status === "pending_triage") {
+      return '<span class="aqt-status neutral">&#8213;</span>';
+    }
+    var pendingKind = pendingDueDateRequestKind(d);
+    if (pendingKind && d.deadline_status !== "on_hold") {
+      var label = pendingKind === "extension" ? "Pending Extension Approval" : "Pending On Hold Approval";
+      return '<span class="aqt-status warn"><span class="dot"></span>' + label + "</span>";
+    }
+    var meta = DEADLINE_META[d.deadline_status] || ["neutral", d.deadline_status];
+    var text = meta[1];
+    if (d.deadline_days !== null && d.deadline_days !== undefined) {
+      text += " (" + (d.deadline_days > 0 ? "+" : "") + d.deadline_days + " days)";
+    }
+    return '<span class="aqt-status ' + meta[0] + '"><span class="dot"></span>' + text + "</span>";
+  }
+  function progressStatusCellHtml(d) {
+    if (d.status === "approved" && d.auto_completed) {
+      return '<span class="aqt-status good"><span class="dot"></span>Auto-Completed</span>';
+    }
+    var meta = STATUS_META[d.status] || ["neutral", d.status];
+    return '<span class="aqt-status ' + meta[0] + '"><span class="dot"></span>' + meta[1] + "</span>";
+  }
+  // Item 91: a centered loading popup for every in-flight API call, so a
+  // slow reminder/creation/etc. reads as "working" instead of "stuck".
+  // Delayed briefly so a normal fast request never even flickers it.
+  var _loadingCount = 0, _loadingShowTimer = null, _loadingHideTimer = null;
+  function _loadingStart() {
+    _loadingCount++;
+    clearTimeout(_loadingHideTimer);
+    if (_loadingCount === 1) {
+      _loadingShowTimer = setTimeout(function () {
+        if (_loadingCount > 0) document.getElementById("globalLoadingOverlay").hidden = false;
+      }, 200);
+    }
+  }
+  function _loadingEnd() {
+    _loadingCount = Math.max(0, _loadingCount - 1);
+    if (_loadingCount === 0) {
+      clearTimeout(_loadingShowTimer);
+      // Item 16: most load*() functions await several endpoints one after
+      // another (not all in parallel) -- ending, then immediately
+      // restarting, made the overlay flash on/off between each one. A
+      // short grace window absorbs that normal gap so a whole page load
+      // reads as one steady loading state instead of a strobe; cancelled
+      // above the instant another call starts within it.
+      _loadingHideTimer = setTimeout(function () {
+        if (_loadingCount === 0) document.getElementById("globalLoadingOverlay").hidden = true;
+      }, 150);
+    }
+  }
+  // Set by index.html when the frontend is hosted separately from the
+  // backend (S3/CloudFront, same split scm-ssot uses) -- e.g.
+  // window.L0L1_API_BASE = 'https://orion.algihaz.com/l0l1'. Left unset
+  // for local dev / Render, where the frontend is same-origin with the API
+  // and a relative path is correct as-is.
+  var API_BASE = window.L0L1_API_BASE || "";
+  var API_KEY = window.L0L1_API_KEY || "";
+
+  async function api(path, opts) {
+    // Item 100: force a real network round-trip on every call — GET requests
+    // otherwise had no explicit Cache-Control, letting the browser occasionally
+    // serve a stale response (e.g. the deliverable popup opened right after
+    // an upload from a different entry point, showing the pre-upload state
+    // until something forced a genuinely fresh request).
+    opts = Object.assign({ cache: "no-store" }, opts || {});
+    if (API_KEY) opts.headers = Object.assign({ "X-API-Key": API_KEY }, opts.headers || {});
+    _loadingStart();
+    try {
+      var r = await fetch(API_BASE + path, opts);
+      if (!r.ok) {
+        var bodyText = await r.text();
+        var err = new Error(path + " -> " + r.status + ": " + bodyText);
+        try { err.detail = JSON.parse(bodyText).detail; } catch (e) { err.detail = bodyText; }
+        throw err;
+      }
+      return r.status === 204 ? null : r.json();
+    } finally {
+      _loadingEnd();
+    }
+  }
+  function apiErrorDetail(err) { return err.detail || err.message; }
+
+  // Item [request 3]: generic "Export to Excel" for any installExcelHeader
+  // table -- reuses that same table's own columns[].get() (already plain,
+  // human-readable text: it's exactly what feeds each column's filter-
+  // dropdown checkbox labels, never raw HTML) and its xh controller's
+  // process() so the export always matches whatever's currently filtered/
+  // sorted on screen, not the full unfiltered dataset. `columns` may
+  // contain null entries (a button-only column like Actions) -- skipped
+  // automatically. theadRowEl supplies the real header label text
+  // (installExcelHeader wraps the original <th> text in .xh-label, so
+  // it's still there to read even after the header's been rebuilt with
+  // sort/filter controls).
+  async function exportTableToExcel(title, xh, rawRows, sheetName) {
+    var ths = Array.prototype.slice.call(xh.theadRowEl.children);
+    var exportCols = [];
+    xh.columns.forEach(function (col, i) {
+      if (!col) return;
+      var labelEl = ths[i] && ths[i].querySelector(".xh-label");
+      exportCols.push({ key: col.key, label: labelEl ? labelEl.textContent.trim() : col.key });
+    });
+    var rows = xh.process(rawRows);
+    var exportRows = rows.map(function (r) {
+      var out = {};
+      xh.columns.forEach(function (col) { if (!col) return; var v = col.get ? col.get(r) : ""; out[col.key] = v == null ? "" : String(v); });
+      return out;
+    });
+    return _postXlsxExport(title, exportCols, exportRows, sheetName);
+  }
+  // Lower-level half of exportTableToExcel, for a table that isn't
+  // installExcelHeader-driven (e.g. Overview PO Report's own dropdown-
+  // filtered view) -- caller builds {key,label} columns and plain-text
+  // rows itself instead of reusing an xh controller.
+  async function _postXlsxExport(title, exportCols, exportRows, sheetName) {
+    var payload = {
+      title: title, sheet_name: (sheetName || title).slice(0, 31),
+      columns: exportCols.map(function (c) { return { key: c.key, label: c.label }; }),
+      rows: exportRows,
+    };
+    try {
+      var headers = { "Content-Type": "application/json" };
+      if (API_KEY) headers["X-API-Key"] = API_KEY;
+      var resp = await fetch(API_BASE + "/api/export/xlsx", {
+        method: "POST", headers: headers, body: JSON.stringify(payload),
+      });
+      if (!resp.ok) throw new Error("Export failed (" + resp.status + ")");
+      var blob = await resp.blob();
+      var url = URL.createObjectURL(blob);
+      var a = document.createElement("a");
+      a.href = url; a.download = title.replace(/[^A-Za-z0-9 _-]/g, "").trim().replace(/\s+/g, "_") + ".xlsx";
+      document.body.appendChild(a); a.click(); a.remove();
+      setTimeout(function () { URL.revokeObjectURL(url); }, 4000);
+      showToast("Exported " + exportRows.length + " row" + (exportRows.length === 1 ? "" : "s"));
+    } catch (err) {
+      showToast("Couldn't export &#8211; " + (err.message || "unknown error"), true);
+    }
+  }
+  // Small "⬇ Export" button, ready to insert next to a table's search bar
+  // or Print button -- every call site just supplies the click handler.
+  function exportButton(onClick) {
+    var btn = el("button", "btn", "&#11015;&#65039; Export");
+    btn.type = "button";
+    btn.addEventListener("click", onClick);
+    return btn;
+  }
+  function showToast(msg, isError) {
+    var t = document.getElementById("toast");
+    t.classList.toggle("error", !!isError);
+    document.getElementById("toastIc").textContent = isError ? "❌" : "✅";
+    document.getElementById("toastMsg").innerHTML = msg;
+    t.classList.add("show");
+    clearTimeout(window.__toastTimer);
+    var duration = isError ? Math.max(3200, msg.split("<br>").length * 1600) : 3200;
+    window.__toastTimer = setTimeout(function () { t.classList.remove("show"); }, duration);
+  }
+
+  // Item 143 (2nd revision): Progress status -- how far the work itself
+  // has gotten. Independent of Deadline status (DEADLINE_META below).
+  var STATUS_META = {
+    no_progress: ["neutral", "No Progress Yet"],
+    in_progress: ["warn", "In Progress"],
+    pending_review: ["warn", "Pending SME Review"],
+    approved: ["good", "Completed"], rejected: ["crit", "Rejected"],
+    pending_triage: ["neutral", "Pending BM Triage"], not_required: ["neutral", "Not Required"],
+  };
+  // Deadline status -- where a deliverable stands against its due date,
+  // live while open (Due's day count grows daily) and frozen the moment it
+  // resolves (Early/On Time/Late read off the actual completion date).
+  var DEADLINE_META = {
+    not_due: ["neutral", "Not Due"], due: ["crit", "Due"],
+    on_time: ["good", "On Time"], early: ["good", "Early"], late: ["crit", "Late"],
+    on_hold: ["warn", "On Hold"],
+  };
+  // Item 143 (2nd revision): the Dashboard matrix collapses everything down
+  // to just these three buckets (rules.deadline_bucket() on the backend).
+  var MATRIX_BUCKET_META = { not_due: ["neutral", "Not Due"], due: ["crit", "Due"], completed: ["good", "Completed"] };
+  var PROJECT_STATUS_CLASS = { "Completed": "good", "Cancelled": "crit", "Submitted": "good", "In Progress": "warn" };
+  var L1_MILESTONE_LABELS = {
+    M1: "Announcement", M2: "Early Plan", M3: "Handing Over",
+    M4: "Post Bid Clarifications", M5: "LOA", M6: "Contract",
+  };
+  function joinList(v) { return (v && v.length) ? v.join(", ") : "&#8213;"; }
+  var ANN_ICON = {
+    broadcast: ["&#128276;", "broadcast"], owner: ["&#128100;", "owner"], sme_request: ["&#128269;", "sme-request"],
+    sme_decision: ["&#9989;", "sme-decision"], unlock: ["&#128275;", "unlock"], deadline: ["&#8987;", "deadline"], closed: ["&#127937;", "closed"],
+    milestone: ["&#127919;", "milestone"], bsd_extended: ["&#128197;", "bsd-extended"],
+    doc_added: ["&#128206;", "doc-added"], deliverable_approved: ["&#9989;", "deliverable-approved"],
+    extension_request: ["&#8987;", "extension-request"], extension_decision: ["&#128197;", "extension-decision"],
+    hold_request: ["&#9208;", "hold-request"], hold_decision: ["&#9208;", "hold-decision"],
+    reassignment_decision: ["&#128101;", "reassignment-decision"], sme_nomination_decision: ["&#127891;", "sme-nomination-decision"],
+    bid_value_access_decision: ["&#128176;", "bid-value-access-decision"], group_add_decision: ["&#128101;", "group-add-decision"],
+    comm_offer_access_decision: ["&#128188;", "comm-offer-access-decision"],
+    // Item 4: a reopen's own notice, and the retraction of whatever
+    // milestone/unlock announcement it invalidates.
+    reverted: ["&#8630;", "reverted"],
+  };
+  // Item 165: single source of truth for the Announcements type filter and
+  // its legend -- audience: "all" means every role sees it as a filter
+  // choice (matches the types every role can actually receive, per the
+  // backend's _ALWAYS_VISIBLE_TYPES); a role array restricts it to roles
+  // that could ever actually see that type. Admin always gets every option
+  // regardless, since Admin sees every announcement.
+  var ANN_TYPE_META = [
+    { value: "broadcast", label: "Broadcast", sw: "var(--purple-1)", audience: "all" },
+    { value: "milestone", label: "Milestone Reached", sw: "var(--purple-2)", audience: "all" },
+    { value: "bsd_extended", label: "BSD Extended", sw: "var(--warn)", audience: "all" },
+    { value: "doc_added", label: "Document Added", sw: "var(--purple-1)", audience: "all" },
+    { value: "deliverable_approved", label: "Deliverable Approved", sw: "var(--good)", audience: "all" },
+    { value: "unlock", label: "Cross-department Unlock", sw: "var(--purple-2)", audience: "all" },
+    { value: "reverted", label: "Reverted", sw: "var(--crit)", audience: "all" },
+    { value: "closed", label: "Closed", sw: "var(--neutral-bg);border:1px solid var(--line)", audience: "all" },
+    { value: "owner", label: "To Owner", sw: "var(--good)", audience: ["Owner"] },
+    { value: "sme_request", label: "SME Review Request", sw: "var(--warn)", audience: ["Owner", "SME"] },
+    { value: "sme_decision", label: "SME Decision &#8211; Rejected", sw: "var(--good)", audience: ["Owner"] },
+    { value: "deadline", label: "Deadline / Reminder", sw: "var(--warn)", audience: ["Owner", "SME"] },
+    { value: "extension_request", label: "Extension Requested", sw: "var(--warn)", audience: ["Owner", "SME"] },
+    { value: "extension_decision", label: "Extension Decision", sw: "var(--good)", audience: ["Owner"] },
+    { value: "hold_request", label: "Hold Requested", sw: "var(--warn)", audience: ["Owner", "SME"] },
+    { value: "hold_decision", label: "Hold Decision", sw: "var(--good)", audience: ["Owner"] },
+    { value: "reassignment_decision", label: "Reassignment Decision", sw: "var(--good)", audience: ["Owner"] },
+    { value: "sme_nomination_decision", label: "SME Nomination Decision", sw: "var(--good)", audience: "all" },
+    { value: "bid_value_access_decision", label: "Bid Value Access Decision", sw: "var(--good)", audience: "all" },
+    { value: "group_add_decision", label: "L0-L1 Group Request Decision", sw: "var(--good)", audience: "all" },
+    { value: "comm_offer_access_decision", label: "Commercial Offers Access Decision", sw: "var(--good)", audience: "all" },
+  ];
+  // Item [announcement recipients]: the "To:" line used to list every
+  // recipient email verbatim -- fine at a handful of test users, unreadable
+  // once the roster is hundreds of real people. Show the audience group
+  // instead of the literal address list.
+  var _ROLE_PLURAL = { Owner: "Owners", SME: "SMEs", Admin: "Admins" };
+  // Item [audience tag bug]: this used to read the per-*type* static list
+  // in ANN_TYPE_META (e.g. "deadline" -> ["Owner", "SME"]) regardless of who
+  // actually got the email -- accurate back when each type had one fixed
+  // audience, but DEADLINE is now a shared bucket for several flows with
+  // different real audiences (the due-soon/overdue batch is Owner-only, BM
+  // Triage is the Bid Manager, reassignment-requested is Admin-only...), so
+  // a single static per-type guess started mislabeling most of them (an
+  // Owner-only overdue reminder showing "To: Owners & SMEs"). This now
+  // derives the tag from the announcement's actual `recipients` emails via
+  // a real email->role lookup, falling back to the static per-type label
+  // only when recipients is empty/unresolvable.
+  // Item [bid value / SME nomination "To: All Users" bug]: audience:"all"
+  // on a type means two different things that got conflated -- "show this
+  // type in the filter dropdown for every role" (legitimate for
+  // sme_nomination_decision/bid_value_access_decision, since the nominee/
+  // requester could hold any role) vs. "this announcement's real recipients
+  // list IS everyone" (only true for genuine portal-wide broadcasts). The
+  // fast-path below used the same flag for both, so a private, single-
+  // recipient decision notice was mislabeled "All Users" in its own To:
+  // line. Only the types the backend's _ALWAYS_VISIBLE_TYPES actually
+  // broadcasts to everyone get the shortcut; everything else always
+  // resolves from the real `recipients` list.
+  var _BROADCAST_ANN_TYPES = { broadcast: true, milestone: true, bsd_extended: true, doc_added: true,
+                                deliverable_approved: true, unlock: true, closed: true };
+  function annAudienceTag(a, roleMap) {
+    var meta = ANN_TYPE_META.find(function (t) { return t.value === a.type; });
+    if (_BROADCAST_ANN_TYPES[a.type]) return "All Users";
+    var emails = (a.recipients || "").split(",").map(function (s) { return s.trim().toLowerCase(); }).filter(Boolean);
+    if (emails.length && roleMap) {
+      var roles = {};
+      emails.forEach(function (e) { var r = roleMap[e]; if (r) roles[r] = true; });
+      var roleNames = Object.keys(roles);
+      if (roleNames.length) return roleNames.map(function (r) { return _ROLE_PLURAL[r] || r; }).join(" &amp; ");
+    }
+    if (emails.length) return emails.length + " recipient" + (emails.length === 1 ? "" : "s");
+    if (!meta) return "&#8213;";
+    if (meta.audience === "all") return "All Users";
+    return meta.audience.map(function (r) { return _ROLE_PLURAL[r] || r; }).join(" &amp; ");
+  }
+  var _emailRoleMap = null;
+  async function _getEmailRoleMap() {
+    if (_emailRoleMap) return _emailRoleMap;
+    var users = await _getRoster();
+    _emailRoleMap = {};
+    users.forEach(function (u) { if (u.email) _emailRoleMap[u.email.trim().toLowerCase()] = u.role; });
+    return _emailRoleMap;
+  }
+  function buildAnnouncementFilterUI() {
+    var visible = ANN_TYPE_META.filter(function (t) {
+      return CURRENT_ROLE === "Admin" || t.audience === "all" || t.audience.indexOf(CURRENT_ROLE) !== -1;
+    });
+    // Item 5: the color-swatch legend that used to render here was removed --
+    // the Type dropdown below covers the same ground without the extra box.
+    var select = document.getElementById("annTypeFilter");
+    var current = select.value;
+    select.innerHTML = '<option value="">All Types</option>';
+    visible.forEach(function (t) {
+      var o = el("option", "", t.label); o.value = t.value; select.appendChild(o);
+    });
+    if (visible.some(function (t) { return t.value === current; })) select.value = current;
+  }
+  function annIcon(a) {
+    var meta = ANN_ICON[a.type] || ["&#128276;", "broadcast"];
+    if (a.type === "sme_decision" && a.title.indexOf("Rejected") !== -1) {
+      return ["&#10060;", "sme-decision rejected"];
+    }
+    return meta;
+  }
+
+  /* ================= VIEW SWITCHING ================= */
+  var LOADERS = {
+    dashboard: loadDashboard, assigned: loadAssigned, announcements: loadAnnouncements, reminders: loadReminders,
+    l0: function () { loadProjectsTable("L0"); }, l1: function () { loadProjectsTable("L1"); },
+    performance: loadPerformance, create: loadCreateOptions, gantt: loadGantt,
+    journey: loadJourney, scores: loadScores, focalpoints: loadFocalPoints, followup: loadFollowUp, requests: loadRequests,
+    support: loadSupport, bmtriage: loadBmTriageStatus, tickets: loadTickets,
+    deliverableformulas: loadDeliverableFormulas, deliverablesconfig: loadDeliverablesConfig,
+    archivedprojects: loadArchivedProjects, myrequests: loadMyRequests, masterpo: loadMasterPo,
+    "report-performance": loadReportPerformance, "report-masterpo": loadReportMasterPo,
+    "report-overviewpo": loadReportOverviewPo, "report-budgetstatus": loadReportBudgetStatus,
+    "report-custom": loadReportCustom,
+  };
+  var ADMIN_ONLY_VIEWS = [
+    "create", "reports", "scores", "focalpoints", "followup", "tickets", "deliverablesconfig", "archivedprojects",
+    "report-performance", "report-masterpo", "report-overviewpo", "report-budgetstatus", "report-custom",
+  ];
+  // Item 110: BM Triage Status isn't strictly admin-only — a Bid Manager
+  // acting as themselves (Owner role, since that's the role they'd pick to
+  // represent themselves elsewhere in the app) can see it too, scoped
+  // server-side to just their own tenders.
+  // Item 164: back to showing it for Owner, but only when the acting email
+  // is actually an active Bid Manager -- every other Owner, and SME/Viewer
+  // entirely, have no use for it. The BM roster is fetched once and cached,
+  // same pattern as _getRoster()/_rosterCache for the SME/Owner picker.
+  var _bmEmailSet = null;
+  async function _getBmEmailSet() {
+    if (_bmEmailSet) return _bmEmailSet;
+    try {
+      var bms = await api("/api/departments/bid-managers");
+      _bmEmailSet = new Set(bms.filter(function (b) { return b.active; })
+        .map(function (b) { return b.email.trim().toLowerCase(); }));
+    } catch (e) { _bmEmailSet = new Set(); }
+    return _bmEmailSet;
+  }
+  var _canSeeBmTriageCached = true; // matches the default CURRENT_ROLE of "Admin"
+  async function _refreshCanSeeBmTriage() {
+    if (CURRENT_ROLE === "Admin") { _canSeeBmTriageCached = true; return true; }
+    if (CURRENT_ROLE !== "Owner") { _canSeeBmTriageCached = false; return false; }
+    var email = actingEmail().trim().toLowerCase();
+    if (!email) { _canSeeBmTriageCached = false; return false; }
+    var set = await _getBmEmailSet();
+    _canSeeBmTriageCached = set.has(email);
+    return _canSeeBmTriageCached;
+  }
+  // switchView needs a synchronous answer (no flash of content while an
+  // async roster fetch resolves), so it reads this cache -- kept current by
+  // _refreshCanSeeBmTriage() on every role/acting-email change below.
+  function canSeeBmTriage() { return _canSeeBmTriageCached; }
+  // Item 158: Viewer has no upload/review/create actions at all, so a work
+  // queue of assigned items has nothing for them to do with it.
+  function canSeeAssigned() { return CURRENT_ROLE !== "Viewer"; }
+  // Item [reminders tab]: same reasoning as Assigned Deliverables -- a
+  // Viewer has no deliverable of their own to be reminded about, so a due-
+  // soon/overdue nudge queue is meaningless for that role.
+  function canSeeReminders() { return CURRENT_ROLE !== "Viewer"; }
+  function switchView(name) {
+    if (ADMIN_ONLY_VIEWS.indexOf(name) !== -1 && !can("create")) name = "dashboard";
+    if (name === "bmtriage" && !canSeeBmTriage()) name = "dashboard";
+    if (name === "assigned" && !canSeeAssigned()) name = "dashboard";
+    if (name === "reminders" && !canSeeReminders()) name = "dashboard";
+    document.querySelectorAll(".view").forEach(function (v) { v.hidden = true; });
+    document.getElementById("view-" + name).hidden = false;
+    // Item 35: every nav switch starts at the top of the new page --
+    // previously it kept whatever scroll position the last page was left
+    // at, so e.g. Reports could open already scrolled past its own
+    // sections if the user had scrolled down before navigating away.
+    window.scrollTo(0, 0);
+    document.querySelectorAll(".nav-item").forEach(function (n) { n.classList.toggle("active", n.dataset.view === name); });
+    // Item 99: a plain nav view is remembered in the URL so a refresh comes
+    // back here instead of bouncing to the Dashboard. "detail" and "triage"
+    // aren't nav views — they get their own hash from openDetail/openTriage.
+    if (name !== "detail" && name !== "triage") location.hash = "view=" + name;
+    if (LOADERS[name]) LOADERS[name]();
+    // Item 145: re-check on every navigation except into the triage flow
+    // itself, so completing it doesn't get instantly re-blocked mid-flow.
+    if (name !== "triage") checkBmTriageDeadline();
+  }
+  // [Red Dark Design] Lucide-style nav icons, replacing the emoji glyphs --
+  // hand-drawn inline SVGs (24x24, stroke 1.8) rather than pulling the
+  // actual lucide-react package, since this app has no build step. Applied
+  // by data-view instead of hand-editing 23 <span class="ic"> spots in
+  // index.html, so the markup itself stays untouched (icons aren't a
+  // "section" per se, but this keeps the change reviewable as one table).
+  function _navIcon(inner) {
+    return '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">' + inner + "</svg>";
+  }
+  var NAV_ICONS = {
+    journey: _navIcon('<circle cx="12" cy="12" r="9"/><path d="M15 9l-2 6-4-2-2 6" transform="rotate(20 12 12)"/><circle cx="12" cy="12" r="1.4" fill="currentColor" stroke="none"/>'),
+    dashboard: _navIcon('<rect x="3.5" y="3.5" width="7.5" height="9" rx="1.5"/><rect x="13" y="3.5" width="7.5" height="5.5" rx="1.5"/><rect x="13" y="11" width="7.5" height="9.5" rx="1.5"/><rect x="3.5" y="14.5" width="7.5" height="6" rx="1.5"/>'),
+    l0: _navIcon('<path d="M6 3.5h8l4 4v13a1 1 0 0 1-1 1H6a1 1 0 0 1-1-1v-16a1 1 0 0 1 1-1z"/><path d="M14 3.5V8h4"/><path d="M8.5 12.5h7M8.5 15.5h7M8.5 18.5h4"/>'),
+    l1: _navIcon('<path d="M3.5 6.5A1.5 1.5 0 0 1 5 5h4.5l2 2.5h8A1.5 1.5 0 0 1 21 9v9A1.5 1.5 0 0 1 19.5 19.5H5A1.5 1.5 0 0 1 3.5 18z"/><path d="M8.5 13.5h3M8.5 16h5.5"/>'),
+    gantt: _navIcon('<rect x="3.5" y="4.5" width="17" height="16" rx="2"/><path d="M3.5 9.5h17M8 3v3M16 3v3"/><rect x="12.5" y="12.5" width="4.5" height="4" rx=".6" fill="currentColor" stroke="none"/>'),
+    assigned: _navIcon('<rect x="5.5" y="3.5" width="13" height="17" rx="2"/><rect x="9" y="2.5" width="6" height="3" rx="1"/><path d="M9 12.5l2 2 4-4.5"/>'),
+    announcements: _navIcon('<path d="M6 9a6 6 0 1 1 12 0c0 4.5 1.5 6 1.5 6h-15S6 13.5 6 9z"/><path d="M10 19a2 2 0 0 0 4 0"/>'),
+    reminders: _navIcon('<circle cx="12" cy="13" r="7.5"/><path d="M12 9v4l2.5 1.5"/><path d="M5 4.5L2.5 7M19 4.5L21.5 7"/>'),
+    bmtriage: _navIcon('<rect x="5.5" y="3.5" width="13" height="17" rx="2"/><rect x="9" y="2.5" width="6" height="3" rx="1"/><path d="M8.5 11.5h7M8.5 14.5h7M8.5 17.5h4"/>'),
+    performance: _navIcon('<path d="M4 20V10M10 20V4M16 20v-7M21 20H3"/>'),
+    deliverableformulas: _navIcon('<path d="M5 4.5a1.5 1.5 0 0 1 1.5-1.5H9a1.5 1.5 0 0 1 1.5 1.5v15A1.5 1.5 0 0 1 9 21H6.5A1.5 1.5 0 0 1 5 19.5z"/><path d="M13 6.3l2.4-.9a1.5 1.5 0 0 1 1.93.88l4.86 13.35a1.5 1.5 0 0 1-.9 1.92l-2.35.85a1.5 1.5 0 0 1-1.92-.9L12.16 8.1"/>'),
+    masterpo: _navIcon('<path d="M6 3.5h9l4 4v13a1 1 0 0 1-1 1H6a1 1 0 0 1-1-1v-16a1 1 0 0 1 1-1z"/><path d="M15 3.5V8h4M8.5 12h7M8.5 15h7M8.5 18h4" opacity=".55"/><path d="M4 6.5h1.6M4 10h1.6M4 13.5h1.6" opacity=".55"/>'),
+    myrequests: _navIcon('<path d="M21.5 3.5L2.5 10.5l7 3 3 7z"/><path d="M21.5 3.5L12.5 13.5"/>'),
+    support: _navIcon('<path d="M4 5.5h16A1.5 1.5 0 0 1 21.5 7v9a1.5 1.5 0 0 1-1.5 1.5H9l-4.5 4V17H4A1.5 1.5 0 0 1 2.5 15.5V7A1.5 1.5 0 0 1 4 5.5z"/><path d="M10 10.2a2 2 0 1 1 2.7 1.87c-.7.28-1.2.9-1.2 1.63v.1" /><circle cx="11.7" cy="16.2" r=".9" fill="currentColor" stroke="none"/>'),
+    create: _navIcon('<path d="M12 5v14M5 12h14"/>'),
+    reports: _navIcon('<rect x="3.5" y="3.5" width="17" height="17" rx="2"/><path d="M8 17V11M12 17V7M16 17v-5"/>'),
+    scores: _navIcon('<path d="M8 4.5h8v4a4 4 0 0 1-8 0z"/><path d="M8 5.5H4.5v1a3.5 3.5 0 0 0 3.5 3.5M16 5.5h3.5v1a3.5 3.5 0 0 1-3.5 3.5"/><path d="M12 12.5V16M9 20h6M12 16a4 4 0 0 0 0 4"/>'),
+    focalpoints: _navIcon('<path d="M6.5 3.5c.5 2 1.4 3.9 2.7 5.6.4.5.3 1.2-.1 1.6l-1.6 1.6a13.5 13.5 0 0 0 6.2 6.2l1.6-1.6c.4-.4 1.1-.5 1.6-.1 1.7 1.3 3.6 2.2 5.6 2.7v3.5c-8.8 0-17-8.2-17-17z"/>'),
+    deliverablesconfig: _navIcon('<circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.7 1.7 0 0 0 .34 1.87l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.7 1.7 0 0 0-1.87-.34 1.7 1.7 0 0 0-1.04 1.56V21a2 2 0 1 1-4 0v-.09A1.7 1.7 0 0 0 8.96 19a1.7 1.7 0 0 0-1.87.34l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06A1.7 1.7 0 0 0 4.6 15a1.7 1.7 0 0 0-1.56-1.04H3a2 2 0 1 1 0-4h.09A1.7 1.7 0 0 0 4.6 8.96a1.7 1.7 0 0 0-.34-1.87l-.06-.06A2 2 0 1 1 7.03 4.2l.06.06A1.7 1.7 0 0 0 8.96 4.6a1.7 1.7 0 0 0 1.04-1.56V3a2 2 0 1 1 4 0v.09c0 .69.4 1.31 1.04 1.56.62.25 1.33.12 1.87-.34l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.7 1.7 0 0 0-.34 1.87c.25.62.87 1.04 1.56 1.04H21a2 2 0 1 1 0 4h-.09c-.69 0-1.31.42-1.56 1.04z"/>'),
+    requests: _navIcon('<path d="M3.5 12.5h5l1.5 3h4l1.5-3h5"/><path d="M6 12.5L4.2 6.2A1.5 1.5 0 0 1 5.65 4.5h12.7a1.5 1.5 0 0 1 1.45 1.7L18 12.5"/><rect x="3.5" y="12.5" width="17" height="6.5" rx="1.5"/>'),
+    followup: _navIcon('<path d="M3 10.5v3a1.5 1.5 0 0 0 1.5 1.5H7l4.5 4V5l-4.5 4H4.5A1.5 1.5 0 0 0 3 10.5z"/><path d="M15.5 8.5a5 5 0 0 1 0 7M18.5 5.5a9 9 0 0 1 0 13"/>'),
+    tickets: _navIcon('<circle cx="12" cy="12" r="9"/><path d="M9.3 9.3a2.7 2.7 0 1 1 3.9 2.4c-.8.4-1.5 1.1-1.5 2v.3"/><circle cx="12" cy="16.7" r=".9" fill="currentColor" stroke="none"/>'),
+    archivedprojects: _navIcon('<rect x="3" y="4" width="18" height="4.5" rx="1"/><path d="M4.5 8.5V18a1.5 1.5 0 0 0 1.5 1.5h12a1.5 1.5 0 0 0 1.5-1.5V8.5"/><path d="M10 13h4"/>'),
+  };
+  document.querySelectorAll(".nav-item[data-view]").forEach(function (btn) {
+    var svg = NAV_ICONS[btn.dataset.view];
+    var icEl = btn.querySelector(".ic");
+    if (svg && icEl) icEl.innerHTML = svg;
+  });
+  // [Red Dark Design] "View all X ->" links -- generic wiring off the same
+  // data-view attribute every nav item already uses, so a new one just
+  // needs the attribute + class, no dedicated handler. [queued: Announcements
+  // stage filter] a data-stage attribute on top of that pre-scopes the
+  // Announcements page specifically (goToAnnouncementsFilter) instead of
+  // landing on its unfiltered list -- "Latest L0 Announcements" -> View all
+  // now actually stays on L0.
+  document.querySelectorAll(".section-view-all[data-view]").forEach(function (btn) {
+    btn.addEventListener("click", function (e) {
+      e.stopPropagation();
+      if (btn.dataset.view === "announcements" && btn.dataset.stage) { goToAnnouncementsFilter(btn.dataset.stage); return; }
+      switchView(btn.dataset.view);
+    });
+  });
+  document.querySelectorAll(".nav-item").forEach(function (btn) {
+    btn.addEventListener("click", function () { switchView(btn.dataset.view); closeMobileNav(); });
+  });
+  document.getElementById("backBtn").addEventListener("click", function () { switchView(lastListView); });
+  // Item [Reports redesign]: the landing page's category boxes aren't
+  // .nav-item elements (they don't belong in the rail), so they get their
+  // own click wiring here, once, same switchView() every nav click uses.
+  document.querySelectorAll(".report-category-box").forEach(function (btn) {
+    btn.addEventListener("click", function () { switchView("report-" + btn.dataset.report); });
+  });
+  [["repPerfBack", "reports"], ["repMasterPoBack", "reports"], ["repOverviewPoBack", "reports"], ["repBudgetBack", "reports"], ["repCustomBack", "reports"]]
+    .forEach(function (pair) { document.getElementById(pair[0]).addEventListener("click", function () { switchView(pair[1]); }); });
+  document.getElementById("repPerfPrintBtn").addEventListener("click", function () { window.print(); });
+  document.getElementById("repMasterPoPrintBtn").addEventListener("click", function () { window.print(); });
+  document.getElementById("repMasterPoExportBtn").addEventListener("click", function () {
+    var term = (document.getElementById("repMasterPoSearch").value || "").trim().toLowerCase();
+    var rows = term ? _masterPoAllRows.filter(function (r) { return (r.project_name + " " + r.name + " " + r.category).toLowerCase().indexOf(term) !== -1; }) : _masterPoAllRows;
+    exportTableToExcel("Master PO Report", _masterPoXh(), rows);
+  });
+  document.getElementById("repOverviewPoPrintBtn").addEventListener("click", function () { window.print(); });
+  document.getElementById("repBudgetPrintBtn").addEventListener("click", function () { window.print(); });
+  document.getElementById("repBudgetExportBtn").addEventListener("click", function () {
+    exportTableToExcel("Budget Status Report", _budgetXhController(), _budgetAllRows);
+  });
+  // Item 154: hamburger nav -- the rail is an off-canvas drawer below the
+  // tablet breakpoint (styles.css), opened/closed via these three triggers.
+  function closeMobileNav() {
+    document.getElementById("rail").classList.remove("open");
+    document.getElementById("railBackdrop").classList.remove("open");
+  }
+  document.getElementById("railToggle").addEventListener("click", function () {
+    document.getElementById("rail").classList.add("open");
+    document.getElementById("railBackdrop").classList.add("open");
+  });
+  document.getElementById("railBackdrop").addEventListener("click", closeMobileNav);
+  document.getElementById("dGanttBtn").addEventListener("click", function () { openProjectGantt(currentProjectId); });
+
+  /* ================= DASHBOARD ================= */
+  // Item 183: "My Items" reuses the acting-as-email identity that's already
+  // how the rest of the app tracks "who's doing this" (topbar field /
+  // myIdentity()'s cached prompt) -- no separate email box just for the
+  // Dashboard. Concerns, the Deliverable Matrix, and the announcements feed
+  // all scope down too now, not just the stat cards.
+  // Item [request 12]: per-viewer dashboard layout -- hide any section,
+  // reorder the KPI tiles and the two Top Achievers cards (the only two
+  // groups this allows manual left/right reordering for). Saved to this
+  // browser only (localStorage), like every other per-viewer-only
+  // convenience in this app -- there's no server concept of "this admin's
+  // own dashboard layout" to persist it against. Hiding never crosses an
+  // L0/L1 boundary: every section lives in its own static container
+  // (#stageColL0 / #stageColL1 / the KPI row / the achievers row) and
+  // hiding is plain display:none within that same container, so the
+  // remaining siblings in THAT container reflow -- nothing ever moves
+  // into a different container.
+  var DASH_SECTIONS = [
+    { id: "dashProjectCardL0", label: "Active L0 Tenders" },
+    { id: "dashProjectCardL1", label: "Active L1 Projects" },
+    { id: "dashStatusCardL0", label: "L0 Deliverables Status" },
+    { id: "dashStatusCardL1", label: "L1 Deliverables Status" },
+    { id: "digestL0Card", label: "Latest L0 Announcements" },
+    { id: "milestonesL0Card", label: "Newest L0 Milestones" },
+    { id: "concernsL0Card", label: "L0 Concerns" },
+    { id: "topDeptsL0Card", label: "Top L0 Departments" },
+    { id: "digestL1Card", label: "Latest L1 Announcements" },
+    { id: "milestonesL1Card", label: "Newest L1 Milestones" },
+    { id: "concernsL1Card", label: "L1 Concerns" },
+    { id: "topDeptsL1Card", label: "Top L1 Departments" },
+    { id: "achieversOwnersCard", label: "Top Achievers – Owners" },
+    { id: "achieversSmesCard", label: "Top Achievers – SME" },
+    { id: "matrixCard", label: "Deliverables Matrix" },
+  ];
+  var DASH_KPI_ORDER_DEFAULT = ["briefcase", "folder", "funnel", "clock", "checkCircle"];
+  // [Request: KPI tiles hideable too] real labels for the banner/popup --
+  // state.hidden is one shared list for both DASH_SECTIONS ids and these
+  // KPI keys, since the two namespaces never collide.
+  var DASH_KPI_LABELS = {
+    briefcase: "L0 Tenders – Lifetime", folder: "L1 Projects – Lifetime", funnel: "L0 → L1 Conversion",
+    clock: "Avg. Time to Contract", checkCircle: "Deliverables Completed – This Week",
+  };
+  var DASH_ACHIEVER_ORDER_DEFAULT = ["achieversOwnersCard", "achieversSmesCard"];
+  var dashEditMode = false;
+  function _dashLayoutLoad() {
+    var out = { hidden: [], kpiOrder: DASH_KPI_ORDER_DEFAULT.slice(), achieverOrder: DASH_ACHIEVER_ORDER_DEFAULT.slice() };
+    try {
+      var parsed = JSON.parse(localStorage.getItem("dashboardLayout") || "{}");
+      if (Array.isArray(parsed.hidden)) out.hidden = parsed.hidden;
+      if (Array.isArray(parsed.kpiOrder)) out.kpiOrder = parsed.kpiOrder;
+      if (Array.isArray(parsed.achieverOrder)) out.achieverOrder = parsed.achieverOrder;
+    } catch (e) { /* corrupted/blocked storage -- fall back to defaults */ }
+    return out;
+  }
+  function _dashLayoutSave(state) {
+    try { localStorage.setItem("dashboardLayout", JSON.stringify(state)); } catch (e) { /* private window / storage blocked -- customization just won't persist */ }
+  }
+  function _dashToggleHidden(id) {
+    var state = _dashLayoutLoad();
+    var idx = state.hidden.indexOf(id);
+    if (idx === -1) state.hidden.push(id); else state.hidden.splice(idx, 1);
+    _dashLayoutSave(state);
+    applyDashLayout();
+  }
+  // Item [request 18]: full reset -- back to nothing hidden, both orders
+  // back to source order, in one click. Confirmed first since it discards
+  // every customization the viewer has made, same "ask before wiping
+  // someone's own work" bar as any other destructive local action.
+  async function _dashRestoreDefaults() {
+    var ok = await customConfirm("This clears every section you've hidden and any reordering, back to the default layout.",
+      { title: "Restore dashboard to default?", okLabel: "Restore", danger: true });
+    if (!ok) return;
+    try { localStorage.removeItem("dashboardLayout"); } catch (e) {}
+    applyDashLayout();
+    showToast("Dashboard layout restored to default");
+  }
+  function _dashReorder(listKey, id, dir) {
+    var state = _dashLayoutLoad();
+    var order = state[listKey].slice();
+    var i = order.indexOf(id), j = i + dir;
+    if (i === -1 || j < 0 || j >= order.length) return;
+    var tmp = order[i]; order[i] = order[j]; order[j] = tmp;
+    state[listKey] = order;
+    _dashLayoutSave(state);
+    applyDashLayout();
+  }
+  // A small Hide / (optionally) reorder-arrow strip, inserted at the top
+  // of a section only while edit mode is on -- removed entirely otherwise
+  // so normal viewing is never cluttered by it.
+  function _dashControlsFor(el, sectionId, reorderOpts) {
+    var existing = el.querySelector(".dash-edit-controls");
+    if (existing) existing.remove();
+    if (!dashEditMode) return;
+    var bar = document.createElement("div");
+    bar.className = "dash-edit-controls";
+    if (reorderOpts) {
+      var left = document.createElement("button");
+      left.type = "button"; left.className = "dash-edit-btn"; left.innerHTML = "&#8592;";
+      left.disabled = reorderOpts.isFirst;
+      left.addEventListener("click", function (e) { e.stopPropagation(); reorderOpts.onMove(-1); });
+      var right = document.createElement("button");
+      right.type = "button"; right.className = "dash-edit-btn"; right.innerHTML = "&#8594;";
+      right.disabled = reorderOpts.isLast;
+      right.addEventListener("click", function (e) { e.stopPropagation(); reorderOpts.onMove(1); });
+      bar.appendChild(left); bar.appendChild(right);
+    }
+    if (sectionId) {
+      var hideBtn = document.createElement("button");
+      hideBtn.type = "button"; hideBtn.className = "dash-edit-btn dash-edit-hide";
+      hideBtn.innerHTML = "&#128065;&#65039;&#8203; Hide";
+      hideBtn.addEventListener("click", function (e) { e.stopPropagation(); _dashToggleHidden(sectionId); });
+      bar.appendChild(hideBtn);
+    }
+    el.insertBefore(bar, el.firstChild);
+  }
+  // Re-applies hide state + KPI/achiever order (and, in edit mode, the
+  // controls themselves) -- called after every dashboard render, since
+  // the KPI row's own cards are rebuilt from scratch on every
+  // loadLifetimeKpis() call and would otherwise reset to source order.
+  function applyDashLayout() {
+    var state = _dashLayoutLoad();
+    DASH_SECTIONS.forEach(function (s) {
+      var el = document.getElementById(s.id);
+      if (!el) return;
+      el.classList.toggle("dash-section-hidden", state.hidden.indexOf(s.id) !== -1);
+    });
+    // KPI tiles: reorder + per-tile hide. Falls back gracefully if a
+    // future code change adds/removes a tile: known keys missing from a
+    // stale saved order are appended at the end instead of silently
+    // vanishing.
+    var kpiRow = document.getElementById("dashKpiRow");
+    if (kpiRow && kpiRow.children.length) {
+      var byKey = {};
+      Array.from(kpiRow.children).forEach(function (card) { if (card.dataset.kpi) byKey[card.dataset.kpi] = card; });
+      var kpiOrder = state.kpiOrder.filter(function (k) { return byKey[k]; });
+      DASH_KPI_ORDER_DEFAULT.forEach(function (k) { if (byKey[k] && kpiOrder.indexOf(k) === -1) kpiOrder.push(k); });
+      kpiOrder.forEach(function (key, idx) {
+        var card = byKey[key];
+        kpiRow.appendChild(card);
+        card.classList.toggle("dash-section-hidden", state.hidden.indexOf(key) !== -1);
+        _dashControlsFor(card, key, { isFirst: idx === 0, isLast: idx === kpiOrder.length - 1, onMove: function (dir) { _dashReorder("kpiOrder", key, dir); } });
+      });
+    }
+    var achieversRow = document.getElementById("achieversRow");
+    if (achieversRow) {
+      var achOrder = state.achieverOrder.filter(function (id) { return document.getElementById(id); });
+      DASH_ACHIEVER_ORDER_DEFAULT.forEach(function (id) { if (document.getElementById(id) && achOrder.indexOf(id) === -1) achOrder.push(id); });
+      achOrder.forEach(function (id, idx) {
+        var card = document.getElementById(id);
+        achieversRow.appendChild(card);
+        _dashControlsFor(card, id, { isFirst: idx === 0, isLast: idx === achOrder.length - 1, onMove: function (dir) { _dashReorder("achieverOrder", id, dir); } });
+      });
+    }
+    // Every other (non-reorderable) section just gets the Hide control.
+    DASH_SECTIONS.forEach(function (s) {
+      if (s.id === "achieversOwnersCard" || s.id === "achieversSmesCard") return;
+      var el = document.getElementById(s.id);
+      if (el) _dashControlsFor(el, s.id, null);
+    });
+    var banner = document.getElementById("dashHiddenBanner");
+    if (!state.hidden.length) { banner.hidden = true; banner.innerHTML = ""; return; }
+    banner.hidden = false;
+    banner.innerHTML = "";
+    var label = document.createElement("button");
+    label.type = "button"; label.className = "dash-hidden-banner-btn";
+    label.innerHTML = "&#128065;&#65039;&#8203; " + state.hidden.length + " section" + (state.hidden.length === 1 ? "" : "s") + " hidden &#8211; click to show";
+    var popup = document.createElement("div");
+    popup.className = "dash-hidden-popup"; popup.hidden = true;
+    state.hidden.forEach(function (id) {
+      var meta = DASH_SECTIONS.filter(function (s) { return s.id === id; })[0];
+      var label = meta ? meta.label : (DASH_KPI_LABELS[id] || id);
+      var row = document.createElement("div");
+      row.className = "dash-hidden-popup-row";
+      row.appendChild(el("span", "", label));
+      var showBtn = document.createElement("button");
+      showBtn.type = "button"; showBtn.className = "btn"; showBtn.textContent = "Show";
+      showBtn.addEventListener("click", function () { _dashToggleHidden(id); });
+      row.appendChild(showBtn);
+      popup.appendChild(row);
+    });
+    label.addEventListener("click", function () { popup.hidden = !popup.hidden; });
+    banner.appendChild(label);
+    banner.appendChild(popup);
+  }
+  document.getElementById("dashCustomizeBtn").addEventListener("click", function () {
+    dashEditMode = !dashEditMode;
+    this.classList.toggle("active", dashEditMode);
+    this.innerHTML = dashEditMode ? "&#10003; Done Customizing" : "&#9881; Customize View";
+    document.getElementById("dashRestoreDefaultsBtn").hidden = !dashEditMode;
+    applyDashLayout();
+  });
+  document.getElementById("dashRestoreDefaultsBtn").addEventListener("click", _dashRestoreDefaults);
+
+  var dashFocus = "all";
+  document.querySelectorAll("#dashFocusToggle .chip").forEach(function (btn) {
+    btn.addEventListener("click", function () {
+      document.querySelectorAll("#dashFocusToggle .chip").forEach(function (b) { b.classList.remove("active"); });
+      btn.classList.add("active");
+      dashFocus = btn.dataset.focus;
+      if (dashFocus === "mine") myIdentity();
+      loadDashboard();
+    });
+  });
+
+  // [Red Dark Design] the new top KPI row -- lifetime/performance metrics,
+  // a genuinely different axis from the active-tenders panels below it
+  // (see /api/dashboard/lifetime-kpis, a separate additive endpoint so
+  // this never touches get_dashboard()'s existing shape). Inline SVGs
+  // standing in for the spec's Lucide icon set -- this app has no build
+  // step to pull the actual npm package through.
+  // Item [queued]: swapped for the exact lucide-react icons Yasser named
+  // (BriefcaseBusiness/FolderKanban/Funnel/Clock3/CircleCheckBig) -- real
+  // lucide path data (lucide-static v1.37.0), stroke-width 1.8 same as
+  // his snippet, this app just has no build step to pull the npm package
+  // through so the paths are inlined directly.
+  var DASH_KPI_ICONS = {
+    briefcase: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M12 12h.01"/><path d="M16 6V4a2 2 0 0 0-2-2h-4a2 2 0 0 0-2 2v2"/><path d="M22 13a18.15 18.15 0 0 1-20 0"/><rect width="20" height="14" x="2" y="6" rx="2"/></svg>',
+    folder: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M4 20h16a2 2 0 0 0 2-2V8a2 2 0 0 0-2-2h-7.93a2 2 0 0 1-1.66-.9l-.82-1.2A2 2 0 0 0 7.93 3H4a2 2 0 0 0-2 2v13c0 1.1.9 2 2 2Z"/><path d="M8 10v4"/><path d="M12 10v2"/><path d="M16 10v6"/></svg>',
+    funnel: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M10 20a1 1 0 0 0 .553.895l2 1A1 1 0 0 0 14 21v-7a2 2 0 0 1 .517-1.341L21.74 4.67A1 1 0 0 0 21 3H3a1 1 0 0 0-.742 1.67l7.225 7.989A2 2 0 0 1 10 14z"/></svg>',
+    clock: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><path d="M12 6v6h4"/></svg>',
+    checkCircle: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M21.801 10A10 10 0 1 1 17 3.335"/><path d="m9 11 3 3L22 4"/></svg>',
+  };
+  // The L0/L1 header's decorative corner art (real OHTL photography Yasser
+  // provided, cropped into an orange-toned and a green-toned piece) is
+  // applied via CSS background-image on .dpc-head.l0/.l1 -- no JS
+  // injection needed here anymore (see styles.css).
+  async function loadLifetimeKpis() {
+    var k;
+    try { k = await api("/api/dashboard/lifetime-kpis"); } catch (e) { return; }
+    var row = document.getElementById("dashKpiRow");
+    if (!row) return;
+    row.innerHTML = "";
+    var conversionSub = k.conversion_rate != null ? k.l1_lifetime + " of " + k.l0_lifetime + " tenders" : "&#8213;";
+    var timeSub = k.avg_time_to_contract_days != null ? "" : "Not enough data yet";
+    var completedTrend = k.completed_wow_change_pct == null ? "" :
+      '<span class="dash-kpi-sub ' + (k.completed_wow_change_pct >= 0 ? "up" : "down") + '"> &middot; ' +
+      (k.completed_wow_change_pct >= 0 ? "&#8593; " : "&#8595; ") + Math.abs(k.completed_wow_change_pct) + "% vs last week</span>";
+    var cards = [
+      { icon: "briefcase", cls: "red", value: k.l0_lifetime, label: "L0 Tenders – Lifetime", sub: "Total Tenders" },
+      { icon: "folder", cls: "green", value: k.l1_lifetime, label: "L1 Projects – Lifetime", sub: "Total Projects" },
+      { icon: "funnel", cls: "ai", value: (k.conversion_rate != null ? k.conversion_rate + "%" : "&#8213;"), label: "L0 → L1 Conversion", sub: conversionSub },
+      { icon: "clock", cls: "amber", value: (k.avg_time_to_contract_days != null ? k.avg_time_to_contract_days : "&#8213;"), valueSuffix: k.avg_time_to_contract_days != null ? " Days" : "", label: "Avg. Time to Contract", sub: timeSub },
+      { icon: "checkCircle", cls: "success", value: k.completed_this_week, label: "Deliverables Completed", sub: "This Week" + "<SUBTREND>" },
+    ];
+    cards.forEach(function (c) {
+      var card = el("div", "dash-kpi-card");
+      card.dataset.kpi = c.icon;  // [Request 12]: stable per-tile identity for the saved reorder
+      var subHtml = c.sub.indexOf("<SUBTREND>") !== -1 ? c.sub.replace("<SUBTREND>", "") : c.sub;
+      // Item [request]: icon+body wrapped in their own row (.dash-kpi-
+      // content) so the edit-mode control bar -- inserted as the card's
+      // own first child -- stacks above that whole row instead of
+      // becoming a third item squeezed to its left. .dash-kpi-card
+      // itself is a column flex now; this inner row carries the
+      // side-by-side icon/text layout it always had.
+      card.innerHTML =
+        '<div class="dash-kpi-content">' +
+        '<div class="dash-kpi-icon ' + c.cls + '">' + DASH_KPI_ICONS[c.icon] + "</div>" +
+        '<div class="dash-kpi-body"><div class="dash-kpi-value">' + c.value + (c.valueSuffix ? "<small>" + c.valueSuffix + "</small>" : "") + "</div>" +
+        '<div class="dash-kpi-label">' + c.label + "</div>" +
+        '<div class="dash-kpi-sub">' + subHtml + "</div></div>" +
+        "</div>";
+      // Appended inside .dash-kpi-sub itself (not as a sibling after it) so
+      // "This Week" and the trend share one line -- was landing on its own
+      // line below, making this the only 3-line card and taller than the
+      // other 4.
+      if (c.sub.indexOf("<SUBTREND>") !== -1) card.querySelector(".dash-kpi-sub").insertAdjacentHTML("beforeend", completedTrend);
+      row.appendChild(card);
+    });
+    applyDashLayout();  // [Request 12]: re-apply the saved KPI order -- this row was just rebuilt from scratch
+  }
+  async function loadDashboard() {
+    var focusEmail = dashFocus === "mine" ? myIdentity() : "";
+    var qs = focusEmail ? "?focus_email=" + encodeURIComponent(focusEmail) : "";
+    // [Dashboard perf]: these 4 requests (+ lifetime KPIs) don't actually
+    // depend on each other's responses -- top-achievers, the announcements
+    // digest, and the matrix only ever needed focusEmail, which is known
+    // synchronously right here, not anything /api/dashboard returns. Firing
+    // them all together instead of awaiting one before starting the next
+    // turns 4+ sequential round-trips into one, each only as slow as the
+    // slowest of them.
+    matrixFocusEmail = focusEmail;
+    var achieversPromise = api("/api/dashboard/top-achievers");
+    var announcementsPromise = Promise.all([loadStageAnnouncements("L0"), loadStageAnnouncements("L1")]);
+    var matrixPromise = loadMatrix();
+    loadLifetimeKpis();
+    var d = await api("/api/dashboard" + qs);
+
+    // Item [dashboard stage split]: Concerns is now one card per stage,
+    // living in that stage's own column further down. Item [empty concerns]:
+    // the card always stays visible (title + "No concerns") instead of
+    // disappearing entirely when there's nothing to flag -- a vanished card
+    // on one side while the other stage still has one looked like a layout
+    // bug, and broke the visual rhythm of the column below it.
+    // Item 2: capped to 6 per page with the shared pager, instead of
+    // rendering every concern (department below 80%, overdue count,
+    // missing focal points...) at once -- a department-heavy pilot could
+    // otherwise push this list quite long.
+    [["L0", d.concerns_l0], ["L1", d.concerns_l1]].forEach(function (s) {
+      var list = document.getElementById("concerns" + s[0] + "List");
+      var pager = document.getElementById("concerns" + s[0] + "Pager");
+      var items = s[1] || [];
+      if (!items.length) {
+        list.innerHTML = "";
+        list.appendChild(el("div", "empty-state", "No concerns."));
+        pager.innerHTML = "";
+        return;
+      }
+      renderPager(pager, items, 6, function (pageItems) {
+        list.innerHTML = "";
+        // Item 21: hover movement to match Top Achievers -- was a bare,
+        // classless <li> with no hover feedback at all.
+        pageItems.forEach(function (c) { list.appendChild(el("li", "concern-row", c)); });
+      });
+    });
+
+    var stats = document.getElementById("statRow");
+    stats.innerHTML = "";
+    var mine = !!focusEmail;
+    // Item [dashboard cards redesign]: project counts get their own more
+    // prominent pair of cards (a real headline number, not just another
+    // tile in a flat row), and every deadline/progress status becomes a
+    // child stat inside one of two parent "Status" cards -- clicking a
+    // child still jumps straight to Assigned Deliverables pre-filtered,
+    // same as the old flat tiles did (item 121).
+    // Item [dashboard redesign 2]: only the card's own header stays
+    // colorful (tag + count) -- the body underneath lists the 3 newest
+    // tenders/projects for that stage in the card's plain surface color,
+    // with just the Est No taking the stage's identity color.
+    var projectRow = el("div", "dash-project-row");
+    // Item [Deliverables Status hideable]: this row and statusRowGroup
+    // below used to be two halves of one #statRow container, which meant
+    // #statRow could only ever be hidden as a single "Active L0/L1
+    // Summary" unit -- no way to hide just Deliverables Status on its
+    // own. Each gets its own stable id instead (rebuilt fresh every
+    // loadDashboard() call, same as the row itself), registered as its
+    // own DASH_SECTIONS entry.
+    projectRow.id = "dashProjectRow";
+    [["L0", mine ? "My Active L0 Tenders" : "Active L0 Tenders", d.active_l0, d.recent_l0, "Latest L0 Tenders"],
+     ["L1", mine ? "My Active L1 Projects" : "Active L1 Projects", d.active_l1, d.recent_l1, "Latest L1 Projects"]]
+      .forEach(function (s) {
+        var card = el("div", "card dash-project-card " + s[0].toLowerCase());
+        card.id = "dashProjectCard" + s[0]; // hideable per-stage, not as one combined row
+        var head = el("div", "dpc-head");
+        head.innerHTML = '<div class="dpc-tag">' + s[0] + '</div><div><div class="dpc-value">' + s[2] +
+          '</div><div class="dpc-label">' + s[1] + "</div></div>";
+        card.appendChild(head);
+        var body = el("div", "dpc-body");
+        var titleRow = el("div", "dpc-body-title-row");
+        titleRow.appendChild(el("div", "dpc-body-title", s[4]));
+        var viewAll = el("button", "dpc-view-all", "View all " + (s[0] === "L0" ? "L0 Tenders" : "L1 Projects") + ' <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M5 12h14M13 6l6 6-6 6"/></svg>');
+        viewAll.type = "button";
+        viewAll.addEventListener("click", function () { switchView(s[0].toLowerCase()); });
+        titleRow.appendChild(viewAll);
+        body.appendChild(titleRow);
+        var recent = s[3] || [];
+        if (!recent.length) {
+          body.appendChild(el("div", "dpc-empty", "No " + s[0] + " projects yet."));
+        } else {
+          recent.forEach(function (p) {
+            var row = el("div", "dpc-recent-row");
+            // Item [Intl badge position]: leads the name now, not trails it --
+            // reads as a property of the project ("International — Name")
+            // rather than an afterthought tacked on the end.
+            var intlTag = p.is_international ? '<span class="pill neutral" style="padding:1px 7px;"><span class="dot"></span>International</span> ' : "";
+            row.innerHTML = '<span class="dpc-recent-est">' + p.est_no + '</span>' +
+              '<span class="dpc-recent-name">' + intlTag + p.name + '</span>' +
+              '<span class="dpc-recent-date">' + fmtDate(p.announcement_date) + "</span>";
+            row.addEventListener("click", function () { openDetail(p.id); });
+            body.appendChild(row);
+          });
+        }
+        card.appendChild(body);
+        projectRow.appendChild(card);
+      });
+    stats.appendChild(projectRow);
+
+    // Item 32 (doc redline): reverted the inline "L0 x / L1 y" sub-badges
+    // under each pooled number -- ugly per Yasser's call. Back to the
+    // original card design (plain label/value/click-filter children,
+    // no per-child stage split), just duplicated wholesale into an L0
+    // card and an L1 card, exactly like the Active Tenders pair above,
+    // instead of one pooled card trying to show both stages at once.
+    // Redlined again: Deadline and Progress used to be two entirely
+    // separate cards per stage (4 cards total) -- now one card per stage
+    // ("L0 Deliverables Status"), with DEADLINE/PROGRESS as a row label on
+    // the left of each row instead of each row being its own titled card.
+    function statusRow(rowLabel, stage, children) {
+      var row = el("div", "dsc-row");
+      row.appendChild(el("div", "dsc-row-label", rowLabel));
+      var kids = el("div", "dsc-children");
+      children.forEach(function (c) {
+        var child = el("div", "dsc-child" + (c[3] ? " " + c[3] : ""));
+        child.innerHTML = '<div class="dsc-child-val">' + c[1] + '</div><div class="dsc-child-label">' + c[0] + "</div>";
+        if (c[2]) {
+          child.style.cursor = "pointer";
+          child.addEventListener("click", function () { goToAssignedFilter(c[2][0], c[2][1], stage); });
+        }
+        kids.appendChild(child);
+      });
+      row.appendChild(kids);
+      return row;
+    }
+    var statusRowGroup = el("div", "dash-status-row");
+    statusRowGroup.id = "dashStatusRow";
+    [["L0", d.not_due_l0, d.overdue_l0, d.early_l0, d.on_time_l0, d.late_l0,
+           d.no_progress_l0, d.in_progress_l0, d.pending_review_l0, d.approved_l0, d.rejected_l0],
+     ["L1", d.not_due_l1, d.overdue_l1, d.early_l1, d.on_time_l1, d.late_l1,
+           d.no_progress_l1, d.in_progress_l1, d.pending_review_l1, d.approved_l1, d.rejected_l1]]
+      .forEach(function (s) {
+        var card = el("div", "card dash-status-card " + s[0].toLowerCase());
+        card.id = "dashStatusCard" + s[0]; // hideable per-stage, not as one combined row
+        var dscTitleRow = el("div", "section-title-view-all-row");
+        dscTitleRow.appendChild(el("div", "dsc-head", s[0] + " Deliverables Status"));
+        var dscViewAll = el("button", "section-view-all", "View all " + s[0] + " Assigned Deliverables" +
+          ' <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M5 12h14M13 6l6 6-6 6"/></svg>');
+        dscViewAll.type = "button";
+        // "View all" = this stage's Assigned Deliverables with no
+        // deadline/progress axis filter -- same goToAssignedFilter() every
+        // other stat click uses, just with no axis/value to pre-filter on.
+        dscViewAll.addEventListener("click", function () { goToAssignedFilter(null, null, s[0]); });
+        dscTitleRow.appendChild(dscViewAll);
+        card.appendChild(dscTitleRow);
+        card.appendChild(statusRow("Deadline", s[0], [
+          [mine ? "My Not Due" : "Not Due", s[1], ["deadline", "not_due"], ""],
+          [mine ? "My Due" : "Due", s[2], ["deadline", "due"], "crit"],
+          ["Early", s[3], ["deadline", "early"], "good"],
+          ["On Time", s[4], ["deadline", "on_time"], "good"],
+          ["Late", s[5], ["deadline", "late"], "crit"],
+        ]));
+        card.appendChild(statusRow("Progress", s[0], [
+          ["No Progress Yet", s[6], ["progress", "no_progress"], ""],
+          ["In Progress", s[7], ["progress", "in_progress"], "warn"],
+          [mine ? "My Pending SME Review" : "Pending SME Review", s[8], ["progress", "pending_review"], "warn"],
+          ["Completed", s[9], ["progress", "approved"], "good"],
+          ["Rejected", s[10], ["progress", "rejected"], "crit"],
+        ]));
+        statusRowGroup.appendChild(card);
+      });
+    stats.appendChild(statusRowGroup);
+
+    // Item [dashboard stage split]: Top Departments, Newest Milestones and
+    // Latest Announcements each render twice now, once into L0's column
+    // and once into L1's -- everything about one stage lives together
+    // under that stage's own headline card.
+    function renderStageMilestones(stage, milestones) {
+      var wrap = document.getElementById("milestones" + stage);
+      wrap.innerHTML = "";
+      if (!milestones || !milestones.length) {
+        wrap.appendChild(el("div", "empty-state", "No milestones reached yet."));
+        return;
+      }
+      milestones.forEach(function (m) {
+        var row = el("div", "milestone-row");
+        row.innerHTML = '<span class="milestone-code-badge">' + (m.milestone_code || "M") + '</span>' +
+          '<span class="milestone-body"><span class="milestone-name">' + m.name + '</span>' +
+          '<div class="milestone-meta">' + m.est_no + " &#8211; " + m.project_name + "</div></span>" +
+          '<span class="milestone-date">' + fmtDate(m.reviewed_at ? m.reviewed_at.slice(0, 10) : null) + "</span>";
+        row.addEventListener("click", function () { openDetail(m.project_id); });
+        wrap.appendChild(row);
+      });
+    }
+    renderStageMilestones("L0", d.recent_milestones_l0);
+    renderStageMilestones("L1", d.recent_milestones_l1);
+
+    function renderStageDepts(stage, rows) {
+      var wrap = document.getElementById("topDepts" + stage);
+      wrap.innerHTML = "";
+      if (!rows || !rows.length) {
+        wrap.appendChild(el("div", "empty-state", "No data yet."));
+        return;
+      }
+      rows.forEach(function (r, i) {
+        var row = el("div", "top-dept-row");
+        row.innerHTML = '<span class="top-dept-rank">#' + (i + 1) + '</span>' +
+          '<span class="top-dept-name">' + deptLabel(r.department, r.department_number) + '</span>' +
+          '<span class="top-dept-pct">' + r.pct.toFixed(1) + "%</span>";
+        wrap.appendChild(row);
+      });
+    }
+    renderStageDepts("L0", d.top_depts_l0);
+    renderStageDepts("L1", d.top_depts_l1);
+
+    var achievers = await achieversPromise;
+    renderAchievers("topOwners", achievers.owners.slice(0, 3), "owner");
+    renderAchievers("topSmes", achievers.smes.slice(0, 3), "sme");
+
+    // Item [dashboard announcements scoping]: this feed used to be called
+    // with no actor_role/actor_email at all, which the backend treats as
+    // "show everything" -- the same private SME/Owner-only announcements
+    // the full Announcements page correctly hides from the wrong role were
+    // leaking onto every Dashboard regardless of who's looking. Same
+    // actor_role/actor_email pattern as loadAnnouncements(), now also
+    // split per stage (item [dashboard stage split]).
+    async function loadStageAnnouncements(stage) {
+      var qs = "?limit=6&stage=" + stage;
+      if (CURRENT_ROLE !== "Admin") {
+        qs += "&actor_role=" + encodeURIComponent(CURRENT_ROLE) + "&actor_email=" + encodeURIComponent(passiveIdentity());
+      }
+      // Item 183: "My Items" narrows the feed to only announcements
+      // actually addressed to the focus email, on top of whatever
+      // role-visibility filtering already applied above -- an Admin
+      // toggling My Items gets this for the first time too, since the
+      // role branch above never runs for them.
+      if (focusEmail) qs += "&mine=true&actor_email=" + encodeURIComponent(focusEmail);
+      var anns = await api("/api/announcements" + qs);
+      var digest = document.getElementById("digest" + stage + "List");
+      digest.innerHTML = "";
+      if (!anns.length) digest.appendChild(el("div", "empty-state", "No announcements yet."));
+      anns.forEach(function (a) {
+        var meta = annIcon(a);
+        var row = el("div", "digest-row");
+        row.appendChild(el("div", "digest-ic", meta[0]));
+        var body = el("div", "digest-body");
+        body.appendChild(el("b", "", a.title + (a.project_international ? " (International)" : "")));
+        body.appendChild(el("div", "sub", a.body.replace(/<[^>]+>/g, "")));
+        digest.appendChild(row);
+        row.appendChild(body);
+        if (a.submission_id || a.project_id) {
+          row.style.cursor = "pointer";
+          // Item 92: opens straight to the deliverable popup, like Assigned
+          // Deliverables does — no more redirecting to project detail first.
+          row.addEventListener("click", function () {
+            if (a.submission_id) openDelivModal(a.submission_id);
+            else openDetail(a.project_id);
+          });
+        }
+      });
+    }
+    await announcementsPromise;
+    await matrixPromise;
+    applyDashLayout();  // [Request 12]: hide-state on every static card + initial achievers/matrix positioning
+  }
+
+  /* ================= DELIVERABLES MATRIX ================= */
+  var matrixStage = "L0";
+  // Item 183: set by loadDashboard() to the current "My Items" focus email
+  // (empty when "All" is selected) -- the L0/L1 toggle inside the matrix
+  // widget re-fetches independently of a full dashboard reload, so it needs
+  // its own remembered copy rather than reading dashFocus/focusEmail directly.
+  var matrixFocusEmail = "";
+  document.querySelectorAll(".matrix-toggle .chip").forEach(function (btn) {
+    btn.addEventListener("click", function () {
+      document.querySelectorAll(".matrix-toggle .chip").forEach(function (b) { b.classList.remove("active"); });
+      btn.classList.add("active");
+      matrixStage = btn.dataset.stage;
+      // L0 and L1 are entirely different deliverable catalogs -- a
+      // Deliverable-column filter picked under one would just silently
+      // match nothing under the other, reading as a bug rather than a
+      // stage switch.
+      _matrixXhState.filters = {};
+      loadMatrix();
+    });
+  });
+  var _matrixCache = null;
+  async function loadMatrix() {
+    var qs = "?stage=" + matrixStage;
+    if (matrixFocusEmail) qs += "&focus_email=" + encodeURIComponent(matrixFocusEmail);
+    _matrixCache = await api("/api/dashboard/matrix" + qs);
+    _renderMatrix();
+  }
+  // Item [Matrix Deliverable filter]: the Deliverable column reuses the
+  // same Excel-style dropdown panel (_xhOpenFilterPanel) every other table
+  // in the app uses -- but not installExcelHeader itself, since that
+  // assumes one static <thead> reused across renders (see _masterPoXh).
+  // The Matrix's own <thead> is rebuilt from scratch on every render (its
+  // project columns change with the stage/Est filter), so the filter state
+  // lives in this module-level object instead, surviving each rebuild, and
+  // the header's filter button is re-wired after every innerHTML replace.
+  var _matrixXhState = { filters: {} };
+  function _matrixDeliverableValue(row) { return row.item_no + " · " + row.short_name; }
+  function _renderMatrix() {
+    var data = _matrixCache;
+    var wrap = document.getElementById("matrixWrap");
+    if (!data || !data.projects.length) {
+      wrap.innerHTML = '<div class="empty-state">No active ' + matrixStage + ' projects right now.</div>';
+      return;
+    }
+    var term = document.getElementById("matrixSearch").value.trim().toLowerCase();
+    var rows = !term ? data.rows : data.rows.filter(function (row) {
+      return (row.item_no + " " + row.short_name + " " + row.name).toLowerCase().indexOf(term) !== -1;
+    });
+    var deliverableFilter = _matrixXhState.filters.deliverable;
+    if (deliverableFilter) rows = rows.filter(function (row) { return deliverableFilter.has(_matrixDeliverableValue(row)); });
+    // Item 4 (queued): a second header-inline filter, narrowing which
+    // project *columns* show instead of which deliverable rows do --
+    // Est No. isn't a row field, it's each column's own header.
+    var estTerm = document.getElementById("matrixEstFilter").value.trim().toLowerCase();
+    var projects = !estTerm ? data.projects : data.projects.filter(function (p) {
+      return p.est_no.toLowerCase().indexOf(estTerm) !== -1;
+    });
+    if (!projects.length) {
+      wrap.innerHTML = '<div class="empty-state">No projects match Est No. &#8220;' + estTerm + '&#8221;.</div>';
+      return;
+    }
+    // Item [Matrix Deliverable filter, empty-result fix]: this used to
+    // replace the WHOLE table (header included) with a plain empty-state
+    // div whenever no rows matched -- which meant deselecting everything in
+    // the Deliverable filter made its own filter button vanish along with
+    // the table, with no way left in the UI to reopen the panel and fix it.
+    // The header (and its filter button) now always renders; only the body
+    // becomes the empty-state message.
+    var html = '<table class="matrix-table"><thead><tr><th class="xh-th"' + (deliverableFilter ? ' data-xh-filtered="1"' : "") + '><div class="xh-th-wrap">' +
+      '<span class="xh-label">Deliverable</span><button type="button" class="xh-filter-btn" id="matrixDeliverableFilterBtn">' + XH_FILTER_ICON + "</button></div></th>";
+    projects.forEach(function (p) {
+      html += '<th title="' + p.name.replace(/"/g, "&quot;") + '">' + p.est_no + "</th>";
+    });
+    html += "</tr></thead><tbody>";
+    if (!rows.length) {
+      var emptyMsg = deliverableFilter && !term ? "No deliverables match the current Deliverable filter."
+        : "No deliverables match &#8220;" + term + "&#8221;" + (deliverableFilter ? " within the current Deliverable filter." : ".");
+      html += '<tr><td colspan="' + (projects.length + 1) + '"><div class="empty-state">' + emptyMsg + "</div></td></tr>";
+    }
+    var lastDept = null;
+    rows.forEach(function (row) {
+      if (row.department !== lastDept) {
+        html += '<tr><td class="matrix-dept-row" colspan="' + (projects.length + 1) + '">' +
+          deptLabel(row.department, row.department_number) + "</td></tr>";
+        lastDept = row.department;
+      }
+      html += '<tr><td class="matrix-row-label" title="' + row.name.replace(/"/g, "&quot;") + '">' + row.item_no + " &middot; " + row.short_name +
+        (row.is_milestone ? ' <span class="matrix-milestone-tag">' + row.milestone_code + "</span>" : "") + "</td>";
+      projects.forEach(function (p) {
+        var cell = row.cells[p.id];
+        if (!cell) { html += '<td class="matrix-empty-cell">&#8213;</td>'; return; }
+        // Item 143 (2nd revision): the matrix shows the 3-state Deadline
+        // collapse (Not Due / Due / Completed), not the raw Progress status.
+        var meta = MATRIX_BUCKET_META[cell.bucket] || ["neutral", cell.bucket];
+        var tip = meta[1] + (cell.due_date ? " &middot; due " + fmtDate(cell.due_date) : "");
+        html += '<td><span class="matrix-dot ' + meta[0] + '" title="' + tip.replace(/"/g, "&quot;") +
+          '" data-sid="' + cell.submission_id + '" data-pid="' + p.id + '"></span></td>';
+      });
+      html += "</tr>";
+    });
+    html += "</tbody></table>";
+    wrap.innerHTML = html;
+    wrap.querySelectorAll(".matrix-dot").forEach(function (dot) {
+      dot.addEventListener("click", function () { openDetail(Number(dot.dataset.pid)); });
+    });
+    var deliverableBtn = document.getElementById("matrixDeliverableFilterBtn");
+    deliverableBtn.addEventListener("click", function (e) {
+      e.stopPropagation();
+      // uniqueValues comes from data.rows (the full, unfiltered catalog for
+      // this stage), not the currently-visible `rows` -- so the panel's own
+      // checklist always offers everything, regardless of what the search
+      // box or an already-active filter has narrowed the table down to.
+      var col = {
+        key: "deliverable",
+        uniqueValues: function () {
+          var seen = {}, out = [];
+          data.rows.forEach(function (r) {
+            var v = _matrixDeliverableValue(r);
+            if (!seen[v]) { seen[v] = true; out.push(v); }
+          });
+          return out.sort(function (a, b) { return a.localeCompare(b, undefined, { numeric: true, sensitivity: "base" }); });
+        },
+      };
+      _xhOpenFilterPanel(deliverableBtn, col, _matrixXhState, deliverableBtn.closest("th"), _renderMatrix, 0);
+    });
+  }
+
+  function renderAchievers(containerId, rows, kind) {
+    var wrap = document.getElementById(containerId);
+    wrap.innerHTML = "";
+    if (!rows.length) { wrap.appendChild(el("div", "empty-state", "Not enough data yet.")); return; }
+    var medals = ["&#129351;", "&#129352;", "&#129353;"];
+    rows.forEach(function (r, i) {
+      var row = el("div", "achiever-row");
+      row.appendChild(el("div", "achiever-rank", medals[i] || String(i + 1)));
+      var main = el("div", "achiever-main");
+      var label = (r.name ? r.name + " &middot; " : "") + r.email;
+      var emailLine = label + (r.sample ? ' <span class="sample-tag">Sample</span>' : "");
+      main.appendChild(el("div", "achiever-email", emailLine));
+      // Item 5 follow-up: the score title lives once in the card header
+      // now (index.html), not repeated on every row -- this is back to a
+      // plain number, same shape as .top-dept-pct right above it.
+      if (kind === "sme") {
+        var smeSub = r.reviewed + " review" + (r.reviewed === 1 ? "" : "s") + (r.department ? " &middot; " + r.department : "");
+        main.appendChild(el("div", "achiever-sub", smeSub));
+        row.appendChild(main);
+        row.appendChild(el("div", "achiever-pct num", r.avg_label));
+      } else {
+        var ownerSub = r.approved + " / " + r.total + " approved on time" + (r.department ? " &middot; " + r.department : "");
+        main.appendChild(el("div", "achiever-sub", ownerSub));
+        row.appendChild(main);
+        row.appendChild(el("div", "achiever-pct num", r.pct + "%"));
+      }
+      wrap.appendChild(row);
+    });
+  }
+  function deptLabel(name, number) {
+    return (number ? number + ". " : "") + name;
+  }
+  var _BU_ORDER = ["TBU", "PBU", "DBU", "BBU", "IBU"];
+  function sortBusinessUnits(bus) {
+    return bus.slice().sort(function (a, b) {
+      var ai = _BU_ORDER.indexOf(a), bi = _BU_ORDER.indexOf(b);
+      return (ai === -1 ? _BU_ORDER.length : ai) - (bi === -1 ? _BU_ORDER.length : bi);
+    });
+  }
+  function evalFromPct(pct) {
+    if (pct === null) return { cls: "neutral", label: "No Data" };
+    if (pct >= 95) return { cls: "good", label: "Excellent" };
+    if (pct >= 80) return { cls: "warn", label: "Acceptable" };
+    return { cls: "crit", label: "Needs Action" };
+  }
+  function renderDeptGrid(container, rows, big) {
+    container.innerHTML = "";
+    rows.forEach(function (row) {
+      var ev = evalFromPct(row.pct);
+      var card = el("div", "card dept-card");
+      var head = el("div", "dept-head");
+      head.appendChild(el("div", "dname", deptLabel(row.department, row.department_number)));
+      head.appendChild(el("span", "pill " + ev.cls, '<span class="dot"></span>' + ev.label));
+      card.appendChild(head);
+      var metrics = el("div", "dept-metrics");
+      var m0 = el("div", "dept-metric");
+      m0.appendChild(el("div", "mlabel", "Approved"));
+      m0.appendChild(el("div", "mval num", String(row.approved) + " / " + row.total));
+      var m1 = el("div", "dept-metric");
+      m1.appendChild(el("div", "mlabel", "Live Score"));
+      m1.appendChild(el("div", "mval num", row.pct === null ? "&#8213;" : row.pct + "%"));
+      metrics.appendChild(m0); metrics.appendChild(m1);
+      card.appendChild(metrics);
+      if (row.overdue || row.pending_review) {
+        var flags = el("div", "spark-wrap", "");
+        var bits = [];
+        if (row.overdue) bits.push('<span class="pill crit"><span class="dot"></span>' + row.overdue + ' overdue</span>');
+        if (row.pending_review) bits.push('<span class="pill warn"><span class="dot"></span>' + row.pending_review + ' in review</span>');
+        flags.innerHTML = bits.join(" ");
+        card.appendChild(flags);
+      }
+      container.appendChild(card);
+    });
+  }
+
+  /* ================= ASSIGNED DELIVERABLES ================= */
+  // Item 143 (2nd revision): Deadline and Progress are independent filters
+  // now, each its own chip row, combined with AND logic.
+  var assignedDeadlineFilter = "";
+  var assignedProgressFilter = "";
+  var assignedStage = "";
+  var DEADLINE_FILTERS = [
+    ["", "All"], ["not_due", "Not Due"], ["due", "Due"],
+    ["early", "Early"], ["on_time", "On Time"], ["late", "Late"],
+  ];
+  var PROGRESS_FILTERS = [
+    ["", "All"], ["no_progress", "No Progress Yet"], ["in_progress", "In Progress"],
+    ["pending_review", "Pending SME Review"], ["approved", "Completed"], ["rejected", "Rejected"],
+  ];
+  // Item [SME scope]: an SME's Assigned cohort is now only pending_review
+  // (his own) or rejected (his own) -- every other status is permanently
+  // absent from his list, so those chips would always read 0 and are hidden.
+  var SME_PROGRESS_FILTERS = [
+    ["", "All"], ["pending_review", "Pending My Review"], ["rejected", "Rejected by Me"],
+    ["approved", "Approved by Me"],
+  ];
+  // Item 3: a segmented bar + clickable legend (same .psc2-bar/.psb-seg/
+  // .psc2-legend pattern the Performance tab's own summary cards use, see
+  // renderPerfSummaryCards) instead of a row of plain filter pills.
+  // `filters` is a DEADLINE_FILTERS/PROGRESS_FILTERS-shaped array (its
+  // leading ["", "All"] entry is dropped -- that's a reset, not a real
+  // segment); `classMap` maps each real value to good/warn/crit/"" (empty
+  // = neutral, matching item 32's Dashboard cards); clicking the active
+  // segment/legend item again clears the filter.
+  // [Status bar legibility]: `base` includes every row regardless of
+  // status, but `filters` only ever tracks a handful of them (deadline:
+  // not_due/due/early/on_time/late; progress: no_progress/in_progress/
+  // pending_review/approved/rejected -- Not Required/Pending Triage rows
+  // fall into neither, yet used to count toward `total` below, so a big
+  // Not-Required/Pending-Triage cohort quietly ate most of the bar as dead,
+  // undrawn space). Trimming the denominator to just the tracked counts
+  // means the bar is always fully accounted for. On top of that, a real
+  // but rare category (e.g. a handful of "Completed" among hundreds of
+  // "Not Due") still rendered as a sub-pixel sliver -- a ~4% floor on
+  // every nonzero segment, redistributed proportionally so the bar still
+  // sums to 100%, keeps every real category visible without pretending
+  // the underlying counts are anything other than skewed.
+  function _renderAssignedFilterBar(containerId, filters, base, statusGetter, currentFilter, classMap, onSelect) {
+    var container = document.getElementById(containerId);
+    var real = filters.filter(function (f) { return f[0]; });
+    var counts = {};
+    real.forEach(function (f) { counts[f[0]] = base.filter(function (d) { return statusGetter(d) === f[0]; }).length; });
+    var tracked = real.reduce(function (sum, f) { return sum + counts[f[0]]; }, 0);
+    var MIN_SEG_PCT = 4;
+    var rawWidths = real.map(function (f) { return tracked ? (counts[f[0]] / tracked * 100) : 0; });
+    var flooredWidths = rawWidths.map(function (w, i) { return counts[real[i][0]] > 0 ? Math.max(w, MIN_SEG_PCT) : 0; });
+    var flooredTotal = flooredWidths.reduce(function (sum, w) { return sum + w; }, 0);
+    var widths = flooredTotal ? flooredWidths.map(function (w) { return w / flooredTotal * 100; }) : flooredWidths;
+    var segsHtml = real.map(function (f, i) {
+      var cls = classMap[f[0]] || "neutral";
+      return '<div class="psb-seg ' + cls + '" style="width:' + widths[i] + '%;" title="' + f[1] + ': ' + counts[f[0]] + '"></div>';
+    }).join("");
+    var legendHtml = real.map(function (f) {
+      var active = currentFilter === f[0];
+      var dim = currentFilter && !active;
+      var cls = classMap[f[0]] || "neutral";
+      return '<span class="psc2-legend-item ' + cls + (active ? " active" : "") + (dim ? " dim" : "") + '" data-val="' + f[0] + '">' +
+        '<span class="dot"></span>' + f[1] + " (" + counts[f[0]] + ")</span>";
+    }).join("");
+    container.innerHTML = '<div class="psc2-bar">' + segsHtml + '</div><div class="psc2-legend">' + legendHtml + "</div>";
+    container.querySelectorAll("[data-val]").forEach(function (item) {
+      item.addEventListener("click", function () { onSelect(currentFilter === item.dataset.val ? "" : item.dataset.val); });
+    });
+  }
+  function deliverableMatchesFilters(d) {
+    if (assignedDeadlineFilter && d.deadline_status !== assignedDeadlineFilter) return false;
+    if (assignedProgressFilter && d.status !== assignedProgressFilter) return false;
+    return true;
+  }
+  // Item 121: jump to Assigned Deliverables pre-filtered, from a Dashboard
+  // stat card. axis is "deadline" or "progress" -- resets the OTHER axis
+  // and the L0/L1 stage toggle back to "All" since the card being clicked
+  // is single-dimension and stage-agnostic.
+  function goToAssignedFilter(axis, value, stage) {
+    assignedDeadlineFilter = axis === "deadline" ? value : "";
+    assignedProgressFilter = axis === "progress" ? value : "";
+    // Item 32: an L0/L1 subtotal click on the Dashboard pre-filters to that
+    // one stage too, not just the deadline/progress axis.
+    assignedStage = stage || "";
+    document.querySelectorAll("#assignedStageToggle .chip").forEach(function (b) { b.classList.toggle("active", b.dataset.stage === assignedStage); });
+    switchView("assigned");
+  }
+  document.querySelectorAll("#assignedStageToggle .chip").forEach(function (btn) {
+    btn.addEventListener("click", function () {
+      document.querySelectorAll("#assignedStageToggle .chip").forEach(function (b) { b.classList.remove("active"); });
+      btn.classList.add("active");
+      assignedStage = btn.dataset.stage;
+      loadAssigned();
+    });
+  });
+  // Items 4/36: Est No. filter + Sort By dropdown replaced with the same
+  // Excel-style header sort/filter as L0 Tenders/L1 Projects/Open
+  // Questions -- one controller, built once against the static header row
+  // (#assignedTableHead, index.html) and reused on every re-render.
+  var _assignedXh = null;
+  function _getAssignedXh() {
+    if (_assignedXh) return _assignedXh;
+    function uniq(getter) {
+      return function () {
+        var seen = {}, out = [];
+        _assignedAll.forEach(function (d) {
+          var v = getter(d); v = v == null || v === "" ? "" : String(v);
+          if (!seen[v]) { seen[v] = true; out.push(v); }
+        });
+        return out.sort(function (a, b) { return a.localeCompare(b, undefined, { numeric: true, sensitivity: "base" }); });
+      };
+    }
+    var deptOf = function (d) { return deptLabel(d.department, d.department_number); };
+    var dueTs = function (d) { return d.due_date ? new Date(d.due_date).getTime() : null; };
+    var nameOf = function (d) { return d.name; };
+    var dueLabelOf = function (d) { return fmtDate(d.due_date); };
+    var columns = [
+      { key: "est_no", get: function (d) { return d.est_no; }, uniqueValues: uniq(function (d) { return d.est_no; }) },
+      { key: "name", get: nameOf, uniqueValues: uniq(nameOf) },
+      { key: "department", get: deptOf, uniqueValues: uniq(deptOf) },
+      { key: "owner", get: function (d) { return d.owner || ""; }, uniqueValues: uniq(function (d) { return d.owner || ""; }) },
+      { key: "deadline", get: ASSIGNED_DEADLINE_LABEL, uniqueValues: uniq(ASSIGNED_DEADLINE_LABEL) },
+      { key: "progress", get: ASSIGNED_PROGRESS_LABEL, uniqueValues: uniq(ASSIGNED_PROGRESS_LABEL) },
+      // Filter values match the displayed dd-Mon-yyyy label (same idiom as
+      // L0 Tenders' BSD column), sort still uses the real timestamp.
+      { key: "due_date", get: dueLabelOf, sortValue: dueTs, uniqueValues: uniq(dueLabelOf) },
+      null, // Actions -- buttons, not a plain sortable/filterable value
+    ];
+    var theadRow = document.getElementById("assignedTableHead");
+    _assignedXh = installExcelHeader(theadRow, columns);
+    // Item 2: also refresh the bars, not just the table rows, whenever a
+    // column filter/sort changes -- _renderAssignedBars reads _assignedXh
+    // right back out via _getAssignedXh(), which is safe to call here
+    // since _assignedXh is assigned above before this callback can ever
+    // actually fire.
+    _assignedXh.onChange(function () { _renderAssignedBars(); _renderAssignedList(); });
+    return _assignedXh;
+  }
+  document.getElementById("assignedExportBtn").addEventListener("click", function () {
+    exportTableToExcel("Assigned Deliverables", _getAssignedXh(), _assignedAll.filter(deliverableMatchesFilters));
+  });
+  function ASSIGNED_DEADLINE_LABEL(d) {
+    if (d.status === "not_required" || d.status === "pending_triage") return "–";
+    var meta = DEADLINE_META[d.deadline_status] || ["neutral", d.deadline_status];
+    return meta[1];
+  }
+  function ASSIGNED_PROGRESS_LABEL(d) {
+    if (d.status === "approved" && d.auto_completed) return "Auto-Completed";
+    var meta = STATUS_META[d.status] || ["neutral", d.status];
+    return meta[1];
+  }
+  // Populated by loadAssigned() on every fetch; read by _getAssignedXh()'s
+  // uniqueValues() closures and re-rendered (filter/sort only, no refetch)
+  // by _renderAssignedList() -- same split as every other Excel-header
+  // table (fetch once, re-render locally as sort/filter state changes).
+  var _assignedAll = [];
+  async function loadAssigned() {
+    // Item 166: a non-admin only sees their own assigned deliverables
+    // (owner or SME on that item) -- previously every role saw the
+    // entire cross-project list.
+    var qs = "?actor_role=" + encodeURIComponent(CURRENT_ROLE);
+    if (passiveIdentity()) qs += "&actor_email=" + encodeURIComponent(passiveIdentity());
+    var everything = await api("/api/deliverables" + qs);
+    var all = assignedStage ? everything.filter(function (d) { return d.stage === assignedStage; }) : everything;
+    _assignedAll = all;
+    document.getElementById("assignedBadge").textContent = everything.filter(function (d) { return d.deadline_status === "due"; }).length || "";
+
+    _renderAssignedBars();
+    _renderAssignedList();
+  }
+  // Item 2: split out of loadAssigned so the Excel-header table filters
+  // (Est No, Name, Department, Owner, Due Date) can refresh the bars too,
+  // not just a fresh fetch -- _getAssignedXh's own onChange used to only
+  // call _renderAssignedList, so filtering the table left the bars still
+  // describing the whole (stage-toggle-only) queue above it. Reads
+  // straight from the already-cached _assignedAll, no refetch needed.
+  function _renderAssignedBars() {
+    var all = _assignedAll;
+    // .process() applies the Excel-header filters (sorting too, harmless
+    // here) the same way _renderAssignedList already does for the table
+    // itself, so the bars now describe exactly what's showing below them.
+    var xhFiltered = _getAssignedXh().process(all);
+    var deadlineBase = assignedProgressFilter ? xhFiltered.filter(function (d) { return d.status === assignedProgressFilter; }) : xhFiltered;
+    var progressBase = assignedDeadlineFilter ? xhFiltered.filter(function (d) { return d.deadline_status === assignedDeadlineFilter; }) : xhFiltered;
+    var progressFilterSet = CURRENT_ROLE === "SME" ? SME_PROGRESS_FILTERS : PROGRESS_FILTERS;
+    // Item 3: two clickable segmented bars (same .psc2-bar/.psb-seg/
+    // .psc2-legend pattern the Performance tab's own summary cards use)
+    // instead of a row of plain filter pills -- same semantic colors the
+    // Dashboard's own Deadline/Progress Status cards use (item 32): not_due
+    // neutral, due crit, early/on_time good; no_progress neutral,
+    // in_progress/pending_review warn, approved good, rejected crit.
+    // [Late/Due differentiation]: late used to share plain "crit" with due
+    // too, reading as the exact same red on both the bar segment and the
+    // legend dot even though they mean different things (still-open and
+    // overdue, vs already completed but after its due date) -- "late-hatch"
+    // is its own class, a green/red diagonal hatch (see styles.css), so
+    // it's still unmistakably a red/negative outcome without being
+    // indistinguishable from Due.
+    _renderAssignedFilterBar("assignedDeadlineBar", DEADLINE_FILTERS, deadlineBase,
+      function (d) { return d.deadline_status; }, assignedDeadlineFilter,
+      { not_due: "", due: "crit", early: "good", on_time: "good", late: "late-hatch" },
+      function (v) { assignedDeadlineFilter = v; loadAssigned(); });
+    _renderAssignedFilterBar("assignedProgressBar", progressFilterSet, progressBase,
+      function (d) { return d.status; }, assignedProgressFilter,
+      { no_progress: "", in_progress: "warn", pending_review: "warn", approved: "good", rejected: "crit" },
+      function (v) { assignedProgressFilter = v; loadAssigned(); });
+  }
+  // Item [Assigned Deliverables pager]: the full cross-project queue can
+  // run into the hundreds of rows -- paginated (renderPager, same widget
+  // Dashboard's Concerns cards use) at 10/page, instead of rendering the
+  // entire filtered set at once every time a filter/sort/page reload runs.
+  function _renderAssignedList() {
+    var items = _assignedAll.filter(deliverableMatchesFilters);
+    items = _getAssignedXh().process(items);
+    var wrap = document.getElementById("assignedList");
+    var pager = document.getElementById("assignedListPager");
+    renderPager(pager, items, 20, function (pageItems) { _renderAssignedPage(wrap, pageItems); });
+  }
+  function _renderAssignedPage(wrap, items) {
+    wrap.innerHTML = "";
+    if (!items.length) { wrap.appendChild(el("div", "empty-state", "Nothing here right now.")); return; }
+    // Item 144: a real table -- one column per field, plain buttons off to
+    // the side, no status pills. Grid-based (see .aqt-row in styles.css) so
+    // it always fits the card width instead of ever needing horizontal
+    // scroll -- text columns ellipsize under pressure rather than overflow.
+    // Header row is static markup (#assignedTableHead, index.html) so the
+    // Excel-header controller's state survives this rebuild -- only body
+    // rows get replaced here.
+    items.forEach(function (d) {
+      var row = el("div", "aqt-row aqt-body-row");
+      row.dataset.sid = String(d.id);
+      row.addEventListener("click", function () { openDelivModal(d.id); });
+
+      row.appendChild(el("div", "aqt-cell aqt-ellipsis aqt-est " + (d.stage || "").toLowerCase(), d.est_no));
+
+      // Item [Assigned Deliverables short names]: short_name (same curated
+      // label Matrix/Timeline already use), full name as the hover title
+      // since this cell ellipsizes under pressure (.aqt-ellipsis).
+      // [No project name in Deliverable cell]: the Est No. column already
+      // identifies the project -- repeating it here was redundant.
+      var nameCell = el("div", "aqt-cell aqt-ellipsis aqt-name", d.item_no + " &middot; " + d.short_name);
+      nameCell.title = d.name;
+      row.appendChild(nameCell);
+
+      row.appendChild(el("div", "aqt-cell aqt-ellipsis aqt-dept", deptLabel(d.department, d.department_number)));
+      row.appendChild(el("div", "aqt-cell aqt-ellipsis aqt-focal", d.owner));
+      row.appendChild(el("div", "aqt-cell", deadlineStatusCellHtml(d)));
+      row.appendChild(el("div", "aqt-cell", progressStatusCellHtml(d)));
+      // Item 169: same predecessor-wait note as the project detail list,
+      // instead of a bare "—" for an item with no due date yet -- or,
+      // alongside an already-computed date that's still only tentative.
+      var aqtDueCell = el("div", "aqt-cell aqt-ellipsis aqt-due", dueDateHtml(d));
+      if (d.awaiting_note) aqtDueCell.title = d.awaiting_note;
+      row.appendChild(aqtDueCell);
+
+      var authorized = isAssigned(d);
+      var actionsCell = el("div", "aqt-cell aqt-actions");
+      // Stop the row's own click (which opens the modal) from also firing
+      // when a button inside the actions cell is clicked.
+      actionsCell.addEventListener("click", function (ev) { ev.stopPropagation(); });
+      // [Small-screen actions]: same set of buttons rendered into two
+      // containers -- .aqt-actions-inline (desktop: one line, see
+      // .aqt-actions/nowrap) and a hamburger-triggered .aqt-actions-menu
+      // dropdown (small screens, ~640px and under, see the media query in
+      // styles.css) with them stacked instead. Only one is ever visible at
+      // a time via CSS; _buildAssignedActionsInto builds fresh buttons/
+      // listeners into whichever container it's given, since a DOM node
+      // can't be reused in two places without cloning away its listeners.
+      var inlineWrap = el("div", "aqt-actions-inline");
+      var dropdown = el("div", "aqt-actions-dropdown");
+      dropdown.hidden = true;
+      var toggle = el("button", "aqt-actions-toggle", "&#9776;");
+      toggle.type = "button";
+      toggle.setAttribute("aria-label", "Actions");
+      toggle.addEventListener("click", function (ev) {
+        ev.stopPropagation();
+        var willOpen = dropdown.hidden;
+        document.querySelectorAll(".aqt-actions-dropdown").forEach(function (dd) { dd.hidden = true; });
+        dropdown.hidden = !willOpen;
+      });
+      var menuWrap = el("div", "aqt-actions-menu");
+      menuWrap.appendChild(toggle);
+      menuWrap.appendChild(dropdown);
+      _buildAssignedActionsInto(inlineWrap, d, authorized);
+      _buildAssignedActionsInto(dropdown, d, authorized);
+      // [Row actions trimmed]: Approve/Reject/Send reminder used to live
+      // right here -- moved into the deliverable's own modal (openDelivModal,
+      // reached by clicking the row) so the row only ever carries its two
+      // constant actions. This dot is the resulting discoverability gap's
+      // fix: it appears only when the modal actually has one of those three
+      // waiting behind it (pending review and/or overdue), so it's a real
+      // signal, not decoration on every row. Inline-only -- the small-screen
+      // dropdown's own hamburger toggle already says "more" on its own.
+      if (authorized && (d.status === "pending_review" || d.deadline_status === "due")) {
+        inlineWrap.appendChild(moreActionsIndicator(d));
+      }
+      actionsCell.appendChild(inlineWrap);
+      actionsCell.appendChild(menuWrap);
+      row.appendChild(actionsCell);
+      wrap.appendChild(row);
+    });
+  }
+  // One outstanding dropdown at a time, and closes on any outside click --
+  // same convention the app's other popover menus (Excel-header filter
+  // panels) already follow.
+  document.addEventListener("click", function () {
+    document.querySelectorAll(".aqt-actions-dropdown").forEach(function (dd) { dd.hidden = true; });
+  });
+  function _buildAssignedActionsInto(container, d, authorized) {
+    if (authorized && d.file_url) container.appendChild(fileLink(d));
+    container.appendChild(followButton(d));
+    if (!authorized) container.appendChild(el("span", "aqt-locked", "Owner/SME only"));
+  }
+  // [Row actions trimmed]: a small round "more waiting" hint -- Approve/
+  // Reject (pending review) and Send reminder (overdue) now only live in
+  // the deliverable modal; this just opens the same modal the row itself
+  // opens, so it needs no logic of its own beyond that click and a title
+  // naming which of the two reasons applies.
+  function moreActionsIndicator(d) {
+    var reasons = [];
+    if (d.status === "pending_review") reasons.push("awaiting your review");
+    if (d.deadline_status === "due") reasons.push("overdue – reminder available");
+    var dot = el("button", "aqt-more-actions", "&#8230;");
+    dot.type = "button";
+    dot.title = "More actions: " + reasons.join(", ");
+    dot.setAttribute("aria-label", "More actions available");
+    dot.addEventListener("click", function () { openDelivModal(d.id); });
+    return dot;
+  }
+  function followButton(d) {
+    var btn = el("button", "btn" + (d.following ? " primary" : ""), d.following ? "&#9733; Following" : "&#9734; Follow");
+    btn.addEventListener("click", async function () {
+      // No separate prompt (item 87) — uses the same signed-in identity
+      // Ask the Team relies on: acting-email field, else the cached/
+      // one-time-prompted email, never asked twice for the same person.
+      var email = myIdentity();
+      if (!email) return;
+      try {
+        var res = await api("/api/deliverables/" + d.id + "/follow", {
+          method: "POST", headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ email: email }),
+        });
+        d.following = res.following;
+        btn.className = "btn" + (d.following ? " primary" : "");
+        btn.innerHTML = d.following ? "&#9733; Following" : "&#9734; Follow";
+        showToast(d.following ? "Following " + d.item_no : "Unfollowed " + d.item_no);
+      } catch (err) {
+        showToast("Could not update follow &#8211; " + apiErrorDetail(err), true);
+      }
+    });
+    return btn;
+  }
+
+  /* ================= L0 / L1 TABLES ================= */
+  var lastListView = "l0";
+  var _projectsCache = { L0: [], L1: [] };
+  async function loadProjectsTable(stage) {
+    lastListView = stage.toLowerCase();
+    var list = await api("/api/projects?stage=" + stage);
+    _projectsCache[stage] = list;
+    _renderProjectsTable(stage);
+  }
+  // Item 4: header-inline filter -- matches the same fields the table
+  // shows, so it's never surprising which rows a search term catches.
+  function _projectMatchesSearch(p, stage, term) {
+    if (!term) return true;
+    var fields = [p.est_no, p.name, p.bid_manager];
+    if (stage === "L0") fields.push(p.rfx_number, joinList(p.region), joinList(p.scope));
+    else fields.push(p.project_manager);
+    return fields.filter(Boolean).join(" ").toLowerCase().indexOf(term) !== -1;
+  }
+  // Items 4/36: Excel-style header sort + multi-select filter, built once
+  // per table and reused on every re-render -- its unique-value lists read
+  // straight from the live cache, so they stay current without rebuilding
+  // the controller.
+  var _xhProjects = {};
+  function _projectsXh(stage) {
+    if (_xhProjects[stage]) return _xhProjects[stage];
+    function uniq(getter) {
+      return function () {
+        var seen = {}, out = [];
+        (_projectsCache[stage] || []).forEach(function (p) {
+          var v = getter(p); v = v == null || v === "" ? "" : String(v);
+          if (!seen[v]) { seen[v] = true; out.push(v); }
+        });
+        return out.sort(function (a, b) { return a.localeCompare(b, undefined, { numeric: true, sensitivity: "base" }); });
+      };
+    }
+    var columns;
+    if (stage === "L0") {
+      var regionOf = function (p) { return p.is_international ? (p.country || "International") : joinList(p.region); };
+      // [L0 column rebalance]: order mirrors the <thead> in index.html
+      // (RFX/Region between Tender and Scope, the original order) --
+      // installExcelHeader binds columns[i] to the i-th <th> positionally,
+      // so these two must always move together.
+      columns = [
+        { key: "est_no", get: function (p) { return p.est_no; }, uniqueValues: uniq(function (p) { return p.est_no; }) },
+        { key: "name", get: function (p) { return p.name; }, uniqueValues: uniq(function (p) { return p.name; }) },
+        { key: "rfx", get: function (p) { return p.rfx_number || ""; }, uniqueValues: uniq(function (p) { return p.rfx_number || ""; }) },
+        { key: "region", get: regionOf, uniqueValues: uniq(regionOf) },
+        { key: "scope", get: function (p) { return joinList(p.scope); }, uniqueValues: uniq(function (p) { return joinList(p.scope); }) },
+        { key: "bm", get: function (p) { return p.bid_manager || ""; }, uniqueValues: uniq(function (p) { return p.bid_manager || ""; }) },
+        { key: "bsd", get: function (p) { return fmtDate(p.bsd); }, sortValue: function (p) { return p.bsd || ""; }, uniqueValues: uniq(function (p) { return fmtDate(p.bsd); }) },
+        { key: "status", get: function (p) { return p.status; }, uniqueValues: uniq(function (p) { return p.status; }) },
+      ];
+    } else {
+      // [queued: milestones filterable] p.current_milestone is the highest-
+      // reached milestone code ("M3"), batched into the /api/projects list
+      // response itself (see list_projects) so this needs no per-row
+      // fetch -- the mini-stepper cell still does its own per-row
+      // /milestones call for the dot-by-dot detail, this column is just
+      // "where is it overall" as one filterable/sortable value.
+      var milestoneLabelOf = function (p) {
+        return p.current_milestone && L1_MILESTONE_LABELS[p.current_milestone]
+          ? p.current_milestone + " – " + L1_MILESTONE_LABELS[p.current_milestone] : "Not Started";
+      };
+      var milestoneRankOf = function (p) {
+        return p.current_milestone ? Number(p.current_milestone.slice(1)) || 0 : 0;
+      };
+      columns = [
+        { key: "est_no", get: function (p) { return p.est_no; }, uniqueValues: uniq(function (p) { return p.est_no; }) },
+        { key: "name", get: function (p) { return p.name; }, uniqueValues: uniq(function (p) { return p.name; }) },
+        // Item 17: Scope, before Milestones -- inherited from the L0
+        // source at L1 creation, same field/joinList L0's own table uses.
+        { key: "scope", get: function (p) { return joinList(p.scope); }, uniqueValues: uniq(function (p) { return joinList(p.scope); }) },
+        { key: "milestone", get: milestoneLabelOf, sortValue: milestoneRankOf, uniqueValues: uniq(milestoneLabelOf) },
+        { key: "bm", get: function (p) { return p.bid_manager || ""; }, uniqueValues: uniq(function (p) { return p.bid_manager || ""; }) },
+        { key: "pm", get: function (p) { return p.project_manager || ""; }, uniqueValues: uniq(function (p) { return p.project_manager || ""; }) },
+        { key: "status", get: function (p) { return p.status; }, uniqueValues: uniq(function (p) { return p.status; }) },
+        // Item 11: Contract Status column.
+        { key: "contract_status", get: function (p) { return p.contract_status || ""; }, uniqueValues: uniq(function (p) { return p.contract_status || ""; }) },
+      ];
+    }
+    var theadRow = document.querySelector((stage === "L0" ? "#l0Table" : "#l1Table") + " thead tr");
+    var xh = installExcelHeader(theadRow, columns);
+    xh.onChange(function () { _renderProjectsTable(stage); });
+    _xhProjects[stage] = xh;
+    return xh;
+  }
+  function _exportProjectsTable(stage) {
+    var searchEl = document.getElementById(stage === "L0" ? "l0Search" : "l1Search");
+    var term = (searchEl ? searchEl.value : "").trim().toLowerCase();
+    var full = (_projectsCache[stage] || []).filter(function (p) { return _projectMatchesSearch(p, stage, term); });
+    exportTableToExcel(stage === "L0" ? "L0 Tenders" : "L1 Projects", _projectsXh(stage), full);
+  }
+  document.getElementById("l0ExportBtn").addEventListener("click", function () { _exportProjectsTable("L0"); });
+  document.getElementById("l1ExportBtn").addEventListener("click", function () { _exportProjectsTable("L1"); });
+  // Item 18: column widths/visibility. Widths below are each table's own
+  // current hand-tuned colgroup (order must match the <colgroup> in
+  // index.html exactly) -- restoring defaults gets a viewer back to
+  // exactly what shipped, not just "some" default.
+  var _l0ColCustom = installColumnCustomizer({
+    storageKey: "l0table", title: "L0 Tenders",
+    colgroupEl: document.querySelector("#l0Table colgroup"),
+    columns: [
+      { key: "est_no", label: "Est No.", defaultWidth: 9 }, { key: "tender", label: "Tender", defaultWidth: 32 },
+      { key: "rfx", label: "RFX", defaultWidth: 9 }, { key: "region", label: "Region", defaultWidth: 9 },
+      { key: "scope", label: "Scope", defaultWidth: 12 }, { key: "bm", label: "Bid Manager", defaultWidth: 12 },
+      { key: "bsd", label: "BSD", defaultWidth: 9 }, { key: "status", label: "Status", defaultWidth: 8 },
+    ],
+  });
+  document.getElementById("l0ColCustomBtn").addEventListener("click", _l0ColCustom.open);
+  var _l1ColCustom = installColumnCustomizer({
+    storageKey: "l1table", title: "L1 Projects",
+    colgroupEl: document.querySelector("#l1Table colgroup"),
+    columns: [
+      { key: "est_no", label: "Est No.", defaultWidth: 12 }, { key: "project", label: "Project", defaultWidth: 24 },
+      { key: "scope", label: "Scope", defaultWidth: 13 }, { key: "milestones", label: "Milestones (M1–M6)", defaultWidth: 16 },
+      { key: "bm", label: "Bid Manager", defaultWidth: 12 }, { key: "pm", label: "Project Manager", defaultWidth: 12 },
+      { key: "status", label: "Status", defaultWidth: 6 }, { key: "contract", label: "Contract", defaultWidth: 5 },
+    ],
+  });
+  document.getElementById("l1ColCustomBtn").addEventListener("click", _l1ColCustom.open);
+  function _renderProjectsTable(stage) {
+    var searchEl = document.getElementById(stage === "L0" ? "l0Search" : "l1Search");
+    var term = (searchEl ? searchEl.value : "").trim().toLowerCase();
+    var full = _projectsCache[stage] || [];
+    var list = full.filter(function (p) { return _projectMatchesSearch(p, stage, term); });
+    list = _projectsXh(stage).process(list);
+    var table = stage === "L0" ? "#l0Table" : "#l1Table";
+    var tbody = document.querySelector(table + " tbody");
+    tbody.innerHTML = "";
+    if (!list.length) {
+      var tr = el("tr");
+      var hasFilters = Object.keys(_projectsXh(stage).state.filters).length > 0;
+      var msg = term ? "No " + stage + " projects match &#8220;" + term + "&#8221;."
+        : hasFilters ? "No " + stage + " projects match the current column filters."
+        : "No " + stage + " projects yet.";
+      tr.innerHTML = '<td colspan="' + (stage === "L0" ? 8 : 7) + '" style="text-align:center;color:var(--ink-500);padding:30px;">' + msg + '</td>';
+      tbody.appendChild(tr);
+      return;
+    }
+    for (var i = 0; i < list.length; i++) {
+      var p = list[i];
+      var tr2 = el("tr");
+      var statusPill = '<span class="pill ' + (PROJECT_STATUS_CLASS[p.status] || "neutral") + '"><span class="dot"></span>' + p.status + '</span>';
+      var estClass = "est-no " + stage.toLowerCase();
+      // [L0 International]: reused everywhere a badge is called for --
+      // same small pill style as statusPill above.
+      var intlPill = p.is_international ? '<span class="pill neutral"><span class="dot"></span>International</span>' : "";
+      if (stage === "L0") {
+        var regionCell = p.is_international ? (p.country || "International") : joinList(p.region);
+        // [L0 column rebalance]: original column order (RFX/Region stay
+        // between Tender and Scope, matching the <thead> in index.html
+        // and _projectsXh's L0 columns[]) -- only the widths changed.
+        tr2.innerHTML = '<td class="' + estClass + '">' + p.est_no + ' ' + intlPill + '</td><td><span class="proj-name">' + p.name + '</span></td>' +
+          '<td>' + (p.rfx_number || "&#8213;") + '</td><td>' + regionCell + '</td><td>' + joinList(p.scope) + '</td><td>' + (p.bid_manager || "&#8213;") + '</td>' +
+          '<td class="num">' + fmtDate(p.bsd) + '</td><td>' + statusPill + '</td>';
+      } else {
+        var mini = '<div class="mini-stepper" data-pid="' + p.id + '">&#8230;</div>';
+        // Item 11: Contract Status column, same good/neutral pill the
+        // Master PO report and Reports > Projects table already use.
+        var contractPill = p.contract_status
+          ? '<span class="pill ' + (p.contract_status === "Signed" ? "good" : "neutral") + '"><span class="dot"></span>' + p.contract_status + "</span>"
+          : "&#8213;";
+        // [L1 International badge]: was missing entirely -- L0's own Est
+        // cell already shows it (is_international carries through from
+        // the L0 source per project creation), this just matches that.
+        // Item 17: Scope, same inherited-from-the-L0-source field L0's own
+        // table already reads.
+        tr2.innerHTML = '<td class="' + estClass + '">' + p.est_no + ' ' + intlPill + '</td><td><span class="proj-name">' + p.name + '</span></td>' +
+          '<td>' + joinList(p.scope) + '</td><td>' + mini + '</td><td>' + (p.bid_manager || "&#8213;") + '</td><td>' + (p.project_manager || "&#8213;") + '</td><td>' + statusPill + '</td>' +
+          '<td>' + contractPill + '</td>';
+      }
+      tr2.addEventListener("click", function (pid) { return function () { openDetail(pid); }; }(p.id));
+      tbody.appendChild(tr2);
+    }
+    if (stage === "L1") {
+      for (var j = 0; j < list.length; j++) {
+        loadMiniStepper(list[j].id);
+      }
+    }
+  }
+  document.getElementById("l0Search").addEventListener("input", function () { _renderProjectsTable("L0"); });
+  document.getElementById("l1Search").addEventListener("input", function () { _renderProjectsTable("L1"); });
+  async function loadMiniStepper(projectId) {
+    var ms = await api("/api/projects/" + projectId + "/milestones");
+    var target = document.querySelector('.mini-stepper[data-pid="' + projectId + '"]');
+    if (!target) return;
+    target.innerHTML = ms.map(function (m) { return '<span class="mini-dot' + (m.reached ? " on" : "") + '"></span>'; }).join("");
+  }
+
+  /* ================= BM TRIAGE ================= */
+  async function openTriage(projectId) {
+    var p = await api("/api/projects/" + projectId);
+    document.getElementById("triageTitle").textContent = "Confirm Applicable Deliverables – " + p.est_no.toUpperCase();
+    var items = await api("/api/projects/" + projectId + "/deliverables");
+    var pending = items.filter(function (d) { return d.status === "pending_triage"; });
+    var defaults = {};
+    try { defaults = await api("/api/projects/" + projectId + "/triage-defaults"); } catch (e) { /* no BM history yet */ }
+    var card = document.getElementById("triageCard");
+    card.innerHTML = "";
+    var state = {};
+    var toggleButtons = []; // {id, appBtn, notBtn} — item 86's bulk action flips all of these
+    // These items default to Not Required unless the BM explicitly flips
+    // them -- everything else still defaults to Applicable. A remembered
+    // pick (item 79) from this BM's own past triages always wins over
+    // either default. Item 171 originally hardcoded just 5.4/8.4; the rest
+    // come from "Default BM Triage.xlsx" (mapped from that sheet's old
+    // pre-department-split item numbering to each item's current item_no
+    // by matching description text, the same technique used for the L1
+    // Excel-formula work -- see seed.py's item 127 renumber comments for
+    // the department splits this crosses).
+    var NOT_REQUIRED_BY_DEFAULT = {
+      "1.1": true, "1.2": true, "1.3": true, "1.4": true, "1.5": true, "1.7": true,
+      "1.13": true, "1.14": true, "1.15": true, "1.18": true, "1.19": true, "1.20": true,
+      "3.4": true, "3.7": true, "3.8": true, "3.9": true,
+      "4.5": true,
+      "5.4": true, "5.5": true, "6.3": true,
+      "7.3": true, "7.4": true,
+      "8.2": true, "8.3": true, "8.4": true,
+      "10.3": true, "10.4": true,
+      "15.1": true, "15.2": true, "16.1": true,
+    };
+    if (!pending.length) {
+      card.appendChild(el("div", "deliv-row", '<span style="color:var(--ink-500);font-size:12.5px;">Nothing left to triage.</span>'));
+    } else {
+      // Item 118: one header per Operation Units BU sub-department
+      // (TBU/PBU/DBU/BBU), each listing its own 2.1-2.6 run — not one
+      // header per row (the original bug, items interleave by item_no
+      // since they share department number 2) and not one shared
+      // "Operation Units" header for every BU either (item 97, superseded
+      // here). Grouped explicitly by full department name so each BU's
+      // items land together under their own header regardless of the
+      // interleaved item_no order they arrive in.
+      var groupLabel = function (dept) { return dept; };
+      var groups = {}, groupOrder = [];
+      pending.forEach(function (d) {
+        var label = groupLabel(d.department);
+        if (!groups[label]) { groups[label] = []; groupOrder.push(label); }
+        groups[label].push(d);
+      });
+      groupOrder.forEach(function (label) {
+        card.appendChild(el("div", "deliv-subheader", label));
+        groups[label].forEach(function (d) { renderTriageRow(d); });
+      });
+    }
+    function renderTriageRow(d) {
+        // A remembered pick (item 79) from this BM's past triages pre-selects
+        // the toggle — still just a default, they can override it below.
+        var remembered = defaults.hasOwnProperty(d.item_no) ? defaults[d.item_no]
+          : !NOT_REQUIRED_BY_DEFAULT.hasOwnProperty(d.item_no);
+        state[d.id] = remembered;
+        var row = el("div", "deliv-row");
+        row.appendChild(el("div", "deliv-num", d.item_no));
+        var body = el("div", "deliv-body");
+        // Which BU this item belongs to is now conveyed by its group
+        // header (item 118), so the row name itself doesn't need a
+        // "— DBU" suffix tacked on anymore.
+        var nameEl = el("div", "deliv-name", d.name);
+        nameEl.title = d.name;
+        body.appendChild(nameEl);
+        row.appendChild(body);
+        var toggle = el("div", "triage-toggle");
+        var appBtn = el("button", "chip" + (remembered ? " active" : ""), "Applicable");
+        var notBtn = el("button", "chip" + (remembered ? "" : " active"), "Not Required");
+        appBtn.addEventListener("click", function () {
+          state[d.id] = true;
+          appBtn.classList.add("active"); notBtn.classList.remove("active");
+        });
+        notBtn.addEventListener("click", function () {
+          state[d.id] = false;
+          notBtn.classList.add("active"); appBtn.classList.remove("active");
+        });
+        toggle.appendChild(appBtn); toggle.appendChild(notBtn);
+        row.appendChild(toggle);
+        card.appendChild(row);
+        toggleButtons.push({ id: d.id, appBtn: appBtn, notBtn: notBtn });
+    }
+    var markAllBtn = document.getElementById("triageMarkAllNotRequired");
+    markAllBtn.hidden = !(can("create") && pending.length);
+    markAllBtn.onclick = async function () {
+      if (!(await customConfirm("Mark all " + pending.length + " item(s) as Applicable?"))) return;
+      toggleButtons.forEach(function (t) {
+        state[t.id] = true;
+        t.appBtn.classList.add("active"); t.notBtn.classList.remove("active");
+      });
+    };
+    // Off by default (item [BM triage defaults]) -- confirming a triage no
+    // longer silently rewrites this BM's remembered per-item defaults on
+    // its own (a "Mark All Required" shortcut used to do exactly that).
+    // This toggle is the one explicit way to actually update them.
+    var saveAsDefault = false;
+    var saveDefaultBtn = document.getElementById("triageSaveAsDefault");
+    saveDefaultBtn.classList.remove("active");
+    saveDefaultBtn.textContent = "Save as My Default: Off";
+    saveDefaultBtn.onclick = function () {
+      saveAsDefault = !saveAsDefault;
+      saveDefaultBtn.classList.toggle("active", saveAsDefault);
+      saveDefaultBtn.textContent = "Save as My Default: " + (saveAsDefault ? "On" : "Off");
+    };
+    document.getElementById("triageConfirm").onclick = async function () {
+      var payloadItems = Object.keys(state).map(function (sid) {
+        return { submission_id: Number(sid), applicable: state[sid] };
+      });
+      try {
+        await api("/api/projects/" + projectId + "/triage", {
+          method: "POST", headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ items: payloadItems, actor_role: CURRENT_ROLE, actor_email: actingEmail(), save_as_default: saveAsDefault }),
+        });
+      } catch (err) {
+        showToast("Could not save triage &#8211; " + apiErrorDetail(err), true);
+        return;
+      }
+      showToast("Triage confirmed" + (saveAsDefault ? " &#8211; saved as your new default" : ""));
+      refreshNavBadges();
+      openDetail(projectId);
+    };
+    switchView("triage");
+  }
+
+  // Item 145: if triage on one of MY L0 tenders has sat unstarted for 24h+,
+  // block the rest of the app with a non-dismissible modal until it's done.
+  // Scoped to a real personal identity only -- never prompts for one just to
+  // run this background check (a stale acting-email field or empty identity
+  // simply means nothing to check yet, not "block everyone").
+  async function checkBmTriageDeadline() {
+    var email = passiveIdentity();
+    var overlay = document.getElementById("bmTriageBlockOverlay");
+    if (!email) { overlay.hidden = true; return; }
+    var rows;
+    try {
+      // actor_role is deliberately never "Admin" here -- this check is about
+      // a specific person's own tenders, regardless of which role they
+      // currently have selected in the viewer.
+      rows = await api("/api/projects/bm-triage-status?actor_role=Owner&actor_email=" + encodeURIComponent(email));
+    } catch (e) { return; }
+    var now = Date.now();
+    var overdue = rows.filter(function (r) {
+      return r.status !== "done" && r.created_at && (now - new Date(r.created_at).getTime()) >= 24 * 60 * 60 * 1000;
+    });
+    if (!overdue.length) { overlay.hidden = true; return; }
+    var body = document.getElementById("bmTriageBlockBody");
+    body.innerHTML = "";
+    overdue.forEach(function (r) {
+      var row = el("div", "bmtb-row");
+      var main = el("div");
+      main.appendChild(el("div", "bmtb-name", r.est_no + " &#8211; " + r.name));
+      main.appendChild(el("div", "bmtb-sub", r.pending_count + " deliverable(s) still awaiting your call"));
+      row.appendChild(main);
+      var btn = el("button", "btn primary", "Complete Triage");
+      btn.addEventListener("click", function () { overlay.hidden = true; openTriage(r.id); });
+      row.appendChild(btn);
+      body.appendChild(row);
+    });
+    overlay.hidden = false;
+  }
+  setInterval(checkBmTriageDeadline, 5 * 60 * 1000);
+
+  // Item [nav badges]: pending-count badge on 5 sidebar nav items, same
+  // .nav-badge/.textContent pattern assignedBadge already uses (loadAssigned,
+  // above). Unlike that one, these need to populate on a fresh load too, not
+  // just when their own view is visited -- called from INIT below and from
+  // both the role-select and acting-email change handlers.
+  async function refreshNavBadges() {
+    try {
+      var bmQs = "actor_role=" + encodeURIComponent(CURRENT_ROLE);
+      if (CURRENT_ROLE !== "Admin") bmQs += "&actor_email=" + encodeURIComponent(actingEmail());
+      var bmRows = await api("/api/projects/bm-triage-status?" + bmQs);
+      document.getElementById("bmTriageBadge").textContent = bmRows.filter(function (r) { return r.status !== "done"; }).length || "";
+    } catch (e) { /* not scoped to a real BM yet -- leave blank rather than error */ }
+
+    // Open Questions is Admin-only server-side (403 otherwise) and the nav
+    // item itself is hidden for every other role -- skip the fetch entirely.
+    if (CURRENT_ROLE === "Admin") {
+      try {
+        var tickets = await api("/api/support?actor_role=Admin");
+        document.getElementById("ticketsBadge").textContent = tickets.filter(function (t) { return t.status === "open"; }).length || "";
+      } catch (e) {}
+    } else {
+      document.getElementById("ticketsBadge").textContent = "";
+    }
+
+    try {
+      var annQs = "?limit=500";
+      if (CURRENT_ROLE !== "Admin") annQs += "&actor_role=" + encodeURIComponent(CURRENT_ROLE) + "&actor_email=" + encodeURIComponent(passiveIdentity());
+      var anns = await api("/api/announcements" + annQs);
+      var lastSeen = localStorage.getItem("annLastSeenAt");
+      var unread = lastSeen ? anns.filter(function (a) { return new Date(a.created_at) > new Date(lastSeen); }).length : anns.length;
+      document.getElementById("announcementsBadge").textContent = unread || "";
+    } catch (e) {}
+
+    // Reminders badge -- same unseen-since-localStorage-timestamp pattern
+    // as Announcements above, its own key since the two tabs are read
+    // independently. Skipped for Viewer, matching the nav item itself being
+    // hidden for that role (canSeeReminders()).
+    if (canSeeReminders()) {
+      try {
+        var remQs = "?limit=500&category=reminders";
+        if (CURRENT_ROLE !== "Admin") remQs += "&actor_role=" + encodeURIComponent(CURRENT_ROLE) + "&actor_email=" + encodeURIComponent(passiveIdentity());
+        var rems = await api("/api/announcements" + remQs);
+        var remLastSeen = localStorage.getItem("remLastSeenAt");
+        var remUnread = remLastSeen ? rems.filter(function (a) { return new Date(a.created_at) > new Date(remLastSeen); }).length : rems.length;
+        document.getElementById("remindersBadge").textContent = remUnread || "";
+      } catch (e) {}
+    } else {
+      document.getElementById("remindersBadge").textContent = "";
+    }
+
+    // L0/L1 "new" projects -- no per-viewer seen-tracking precedent exists
+    // anywhere in this app for projects (unlike Announcements above), so
+    // this is a global count, same for every viewer: created today (local
+    // calendar day), not a rolling window -- toDateString() compares only
+    // the local Y/M/D, so this naturally resets at local midnight rather
+    // than needing an explicit timer.
+    try {
+      var projects = await api("/api/projects");
+      var todayStr = new Date().toDateString();
+      var isNew = function (p) { return p.created_at && new Date(p.created_at).toDateString() === todayStr; };
+      document.getElementById("l0Badge").textContent = projects.filter(function (p) { return p.stage === "L0" && isNew(p); }).length || "";
+      document.getElementById("l1Badge").textContent = projects.filter(function (p) { return p.stage === "L1" && isNew(p); }).length || "";
+    } catch (e) {}
+
+    // Requests is Admin-only server-side and its nav item is hidden for
+    // every other role -- same skip-the-fetch pattern as Open Questions
+    // above. Badge sums all 6 pending-approval queues that live on that
+    // page (see loadRequests), so a pending extension/hold request an SME
+    // hasn't acted on yet still surfaces to Admin as a fallback.
+    if (CURRENT_ROLE === "Admin") {
+      try {
+        var reassigns = await api("/api/deliverables/reassignment-requests?status=pending");
+        var dueDateReqs = await api("/api/deliverables/due-date-requests?status=pending");
+        var smeNoms = await api("/api/departments/sme-nominations?status=pending");
+        var bvReqs = await api("/api/projects/bid-value-requests?status=pending");
+        var groupReqs = await api("/api/departments/user-add-requests?status=pending");
+        var formulaReqs = await api("/api/deliverables/config/formula-change-requests?status=pending");
+        document.getElementById("requestsBadge").textContent =
+          (reassigns.length + dueDateReqs.length + smeNoms.length + bvReqs.length + groupReqs.length + formulaReqs.length) || "";
+      } catch (e) {}
+    } else {
+      document.getElementById("requestsBadge").textContent = "";
+    }
+  }
+
+  /* ================= DELIVERABLE DETAIL MODAL ================= */
+  document.getElementById("delivModalClose").addEventListener("click", closeDelivModal);
+  document.getElementById("delivModalOverlay").addEventListener("click", function (e) {
+    if (e.target.id === "delivModalOverlay") closeDelivModal();
+  });
+  function closeDelivModal() { document.getElementById("delivModalOverlay").hidden = true; }
+
+  // Item [milestone icon parity]: the milestone timeline's "done" mark now
+  // reuses the exact same circle+checkmark glyph PO Lifecycle's poIcon("done")
+  // draws, instead of the fs-stepper's own separate checkmark design --
+  // same shape/stroke as poIcon, just `currentColor`/`em`-sized (rather than
+  // poIcon's hardcoded var(--good) stroke and fixed 14px) so it still
+  // inherits .fs-step.done .fs-dot's white text color and scales with
+  // .fs-dot's own font-size, which differs between the real 40px stepper
+  // and the tour's 26px mock version. poIcon() itself (defined later in this
+  // file) is left untouched -- it's used elsewhere against a plain
+  // background where its own hardcoded green stroke is exactly right; this
+  // is a matching but independent copy for use inside an already-green
+  // circular badge, where a second green-stroked circle outline would
+  // vanish into the badge's own background.
+  // Declared here, before TOUR_STEPS, because TOUR_STEPS's array literal
+  // calls milestoneMock() immediately at load time -- a plain `var` below
+  // TOUR_STEPS would still be hoisted, but its assignment wouldn't have run
+  // yet, so milestoneMock would see it as undefined the first time.
+  var FS_CHECK_SVG = '<svg width="1em" height="1em" viewBox="0 0 16 16">' +
+    '<circle cx="8" cy="8" r="7" fill="none" stroke="currentColor" stroke-width="1.4"/>' +
+    '<path d="M5 8.2L7 10.2L11 6" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"/></svg>';
+
+  /* ================= ITEM 131: INTERACTIVE SYSTEM INTRODUCTION WALKTHROUGH =================
+     Portal "screens" below are illustrative recreations built from the app's
+     own CSS (pill/fs-step/folder-row/gantt-row look-alikes), not literal
+     screenshots -- there's no reliable way to capture and keep real pixel
+     screenshots current across redesigns, and these read as authentic since
+     they reuse the same visual language as the live UI. */
+  var TOUR_STEPS = [
+    {
+      eyebrow: "Welcome",
+      title: "What L0/L1 Actually Is",
+      body:
+        '<div class="tour-flow-strip">' +
+        '<span class="stage-badge l0">&#128196; L0 &middot; Tendering</span>' +
+        '<span class="tour-flow-arrow">&#8594;</span>' +
+        '<span class="stage-badge l1">&#128294; L1 &middot; Early Execution</span>' +
+        "</div>" +
+        '<p class="tour-step-text">The <b>Project Readiness (L0/L1) Platform</b> is Algihaz\'s control framework for managing the ' +
+        "full tender-to-early-execution lifecycle, from tender announcement at <b>L0</b>, through " +
+        "lowest-price notification, and into the early project execution stage at <b>L1</b>.</p>" +
+        '<p class="tour-step-text">Since its official launch in <b>December 2024</b>, the system has evolved ' +
+        "from a set of Excel-based tracking sheets into a structured, cross-functional framework for " +
+        "deliverable ownership, deadline control, stakeholder coordination, performance monitoring, and " +
+        "management visibility. The system now also supports <b>International</b> L0 tenders — their " +
+        "own catalog and departments, same workflow.</p>" +
+        '<p class="tour-step-text">This walkthrough covers where the system came from, how the two stages ' +
+        "work, and how to actually use this portal day to day. Twenty-three short steps &#8212; use " +
+        "Next/Back or the dots below.</p>",
+    },
+    {
+      eyebrow: "The Story So Far",
+      title: "System Implementation Timeline",
+      body:
+        '<p class="tour-step-text">Rolled out in stages since <b>Aug 2024</b>, official operation launched ' +
+        "<b>Dec 2024</b>, now running <b>343 L0 tenders</b> and <b>45 L1 projects</b> through it. " +
+        "International L0 support has since shipped, and a New L1 Model is still underway.</p>" +
+        '<div class="tt-layout">' +
+        '<div class="tt-steps">' +
+        '<div class="tt-step">Developed new Procedure along with a defined scheme</div>' +
+        '<div class="tt-step">Engaged key departments for input and collaboration</div>' +
+        '<div class="tt-step">Obtained Management Approvals</div>' +
+        '<div class="tt-step pilot">Ran a pilot for testing' +
+        '<div class="tt-step-aside"><span class="tt-aside-dot"></span>NAJRAN BSP L1 Stage</div></div>' +
+        '<div class="tt-step">Conducted Introduction meetings and explained the process and objectives</div>' +
+        '<div class="tt-step">Received and Evaluated Quality of deliverables</div>' +
+        '<div class="tt-step">Tracked departments\' response proposed timeline</div>' +
+        "</div>" +
+        '<div class="tour-timeline">' +
+        '<div class="tt-axis">' +
+        '<span style="left:0%;">Aug 24</span>' +
+        '<span style="left:18%;">Dec 24</span>' +
+        '<span style="left:40%;">May 25</span>' +
+        '<span style="left:55%;">Sep 25</span>' +
+        '<span style="left:75%;">Feb 26</span>' +
+        '<span style="left:88%;">Apr 26</span>' +
+        '<span style="left:100%;" class="today">Today</span>' +
+        "</div>" +
+        '<div class="tt-track">' +
+        '<div class="tt-callout-tag" style="left:9%;" title="Analyzed departments\' willingness to adapt the new system">Analyzed depts.\' willingness</div>' +
+        '<div class="tt-bar row0 orange" style="left:0%;width:18%;" title="Standard L0/L1 Development">Standard L0/L1 Development</div>' +
+        '<div class="tt-bar row1 green" style="left:3%;width:13%;" title="Pilot &#8211; NAJRAN BSP (L1 Stage)">Pilot &#8211; NAJRAN BSP (L1)</div>' +
+        '<div class="tt-marker" style="left:18%;"><div class="tt-dot"></div><div class="tt-lbl">Official Operation Launched</div></div>' +
+        '<div class="tt-bar row0 orange" style="left:40%;width:15%;" title="International L0 Development">International L0 Development</div>' +
+        '<div class="tt-bar row0 green" style="left:75%;width:13%;" title="New L1 Model Development">New L1 Model Development</div>' +
+        "</div>" +
+        '<div class="tt-detail-grid">' +
+        '<div class="tt-detail orange"><b>Standard L0/L1 Development</b><ul>' +
+        "<li>Recurring one-on-one meetings set up with all departments</li>" +
+        "<li>Shared workflow diagram of deliverables for departments</li>" +
+        "<li>Shared folder set up with a tree matching the deliverables</li>" +
+        "<li>Follow-up framework implemented to address delays or lack of response</li>" +
+        "</ul></div>" +
+        '<div class="tt-detail orange"><b>International L0 Development</b><ul>' +
+        "<li>Built the International Projects catalog from AGC Holding's real template</li>" +
+        "<li>Added International-only departments (Business Development, Document &amp; Data " +
+        "Governance, Legal) and a new IBU business unit</li>" +
+        "<li>Conducted workshops with every involved department</li>" +
+        "<li>Live now &#8212; a single checkbox on tender creation, same L0 workflow throughout</li>" +
+        "</ul></div>" +
+        "</div>" +
+        '<div class="tt-stats">' +
+        '<div class="tt-stat">343&times;<span>L0 Projects</span></div>' +
+        '<div class="tt-stat dark">45&times;<span>L1 Projects</span></div>' +
+        "</div>" +
+        "</div>" +
+        "</div>",
+    },
+    {
+      eyebrow: "How It Works",
+      title: "L0/L1 General Concept",
+      body:
+        '<p class="tour-step-text">Every tender moves through the same two stages, each with exactly ' +
+        "one owning department and its own duration profile:</p>" +
+        l0l1FlowDiagram(),
+    },
+    {
+      eyebrow: "How It Works · L0",
+      title: "Tendering Stage",
+      body:
+        '<p class="tour-step-text">When a <b>Go Approval</b> is received from management to bid for a ' +
+        "tender, <b>L0 Stage</b> begins with an <b>Announcement (M1)</b> to every concerned department " +
+        "(Operations, Supply Chain, Engineering, Planning/Cost Control, Contract, HR, Finance, SHEQ, " +
+        "IT, Risk, Fleet/FM) to prepare its own deliverables as per the agreed-upon due dates.</p>" +
+        '<p class="tour-step-text">The <b>Tendering Department</b> is the owner of this stage, and every ' +
+        "other department works as a supporting unit, in order to come up with a comprehensive and " +
+        "competitive proposal.</p>" +
+        '<p class="tour-step-text">Checking <b>International tender</b> on the create form swaps in a ' +
+        "separate catalog and department set built for tenders outside Saudi Arabia (its own new " +
+        "departments, an auto-assigned IBU business unit, a Country field instead of Region) — " +
+        "everything downstream (triage, owner assignment, badges) still works exactly the same way.</p>",
+    },
+    {
+      eyebrow: "How It Works · L1",
+      title: "Early Execution Stage / Post-Bid Stage",
+      body:
+        '<p class="tour-step-text">Once we receive a notification from the client that Algihaz is L1, the ' +
+        "tender enters a new stage called <b>L1 Stage</b>, which goes through several milestones as " +
+        "follows: <b>L1 Announcement (M1)</b>, an <b>Early Mobilization Plan (M2)</b>, then full " +
+        "<b>Commercial &amp; Technical Handover (M3)</b> from the tendering team to the project " +
+        "team. <b>Post-Bid Clarification (M4)</b> runs until the <b>LOA is received (M5)</b>, and " +
+        "the project formally begins execution at <b>Contract Signing (M6)</b> &#8212; the moment " +
+        "the platform marks Contract Status as Signed. From there, Planning, Cost Control, Supply " +
+        "Chain, Engineering, HSSE and the rest carry the project through execution.</p>" +
+        '<div class="mock-fs">' +
+        milestoneMock([
+          ["M1", "Announced", true], ["M2", "Mobilize", true], ["M3", "Handover", false, true],
+          ["M4", "Post-Bid", false], ["M5", "LOA", false], ["M6", "Signed", false],
+        ]) +
+        "</div>",
+    },
+    {
+      eyebrow: "How It Works",
+      title: "Owner & SME — Submit, Review, Approve",
+      body:
+        '<p class="tour-step-text">Every deliverable has an <b>Owner</b> (does the work) and one or more ' +
+        "<b>SME</b>s (reviews it) &#8212; assigned by default from the catalog, or reassigned to " +
+        "someone else via an Admin-approved request. The cycle between them is the same for every " +
+        "single item on the platform:</p>" +
+        '<div class="mock-fs">' +
+        milestoneMock([
+          ["1", "Owner Submits", true], ["2", "SME Reviews", false, true],
+          ["3", "Approved", false],
+        ]) +
+        "</div>" +
+        '<ul class="tour-list">' +
+        "<li>The Owner submits by <b>uploading a file</b>, or by <b>Mark Completed</b> with just a " +
+        "comment when there's genuinely no document to attach</li>" +
+        "<li>That moves it to <b>Pending SME Review</b> &#8212; the assigned SME(s) get notified, with " +
+        "a day to act before it's flagged as slow to review</li>" +
+        "<li>The SME <b>Approves</b> it (Completed, credited under Calculation Criteria) or " +
+        "<b>Rejects</b> it with a comment explaining why</li>" +
+        "<li>A rejection sends it right back to the Owner &#8212; fixing it and resubmitting starts " +
+        "the same review cycle over again</li>" +
+        "</ul>" +
+        '<div class="tour-callout">&#128203; If an SME marks their own item Completed directly, it skips ' +
+        "the review step entirely &#8212; there's no reviewing yourself. Every step, on every item, is " +
+        "recorded in a full activity log, and anyone (not just the Owner/SME) can follow an item to " +
+        "get notified of updates.</div>",
+    },
+    {
+      eyebrow: "Tracking & Scoring",
+      title: "Two Independent Status Axes",
+      body:
+        '<p class="tour-step-text">Every deliverable is tracked on <b>two separate axes</b>, not one merged ' +
+        "status. <b>Progress</b> is how far the work itself has gotten; <b>Deadline</b> is where it " +
+        "stands against its due date &#8212; a deliverable can be In Progress and also Due, or " +
+        "Completed and also Late, at the same time.</p>" +
+        '<div class="modal-section-title" style="margin:0 0 6px;">Progress</div>' +
+        pillLegendMock([
+          ["neutral", "No Progress Yet"], ["warn", "In Progress"], ["warn", "Pending SME Review"],
+          ["good", "Completed"], ["crit", "Rejected"],
+        ]) +
+        '<div class="modal-section-title">Deadline</div>' +
+        pillLegendMock([
+          ["neutral", "Not Due"], ["crit", "Due"], ["good", "On Time"], ["good", "Early"],
+          ["crit", "Late"], ["warn", "On Hold"],
+        ]) +
+        '<div class="tour-callout">&#128161; Not Required and Pending BM Triage sit outside both axes ' +
+        "entirely &#8212; there's nothing to track a deadline against until the item is even confirmed " +
+        "applicable.</div>",
+    },
+    {
+      eyebrow: "Tracking & Scoring",
+      title: "Calculation Criteria",
+      body:
+        '<p class="tour-step-text">Once a deliverable is Completed, it earns a point value based on exactly ' +
+        "how it landed against its due date &#8212; this is what feeds the Performance and Top " +
+        "Achievers rankings.</p>" +
+        '<table class="tour-table"><thead><tr><th>Timing</th><th>Points</th></tr></thead><tbody>' +
+        tourPtsRow("good", "Early", "1.1 pts &#8211; a 10% bonus") +
+        tourPtsRow("good", "On Time", "1.0 pts") +
+        tourPtsRow("warn", "1&#8211;7 days late", "0.9 pts") +
+        tourPtsRow("warn", "8&#8211;14 days late", "0.8 pts") +
+        tourPtsRow("crit", "15&#8211;21 days late", "0.7 pts") +
+        tourPtsRow("crit", "22&#8211;28 days late", "0.6 pts") +
+        tourPtsRow("crit", "Not submitted in time", "0 pts") +
+        "</tbody></table>" +
+        '<div class="tour-callout">&#128202; The exact point value earned shows right on the deliverable ' +
+        "once it's Completed &#8212; in its own row and inside its detail popup, not just buried in a " +
+        "report.</div>",
+    },
+    {
+      eyebrow: "Tracking & Scoring",
+      title: "Performance & Top Achievers",
+      body:
+        '<p class="tour-step-text">Every Calculation Criteria point rolls up into <b>Performance</b> &#8212; ' +
+        "on-time-rate rankings by department and by person, split by L0/L1, with a trend chart of how " +
+        "each has moved over time. <b>Top Achievers</b> highlights the best-performing Owners and " +
+        "SMEs specifically.</p>" +
+        '<div class="mock-window"><div class="mock-titlebar"><div class="mock-dot-3"></div>' +
+        '<div class="mock-dot-3"></div><div class="mock-dot-3"></div><span>Performance</span></div>' +
+        rankRowMock(1, "Tendering Department", 92) +
+        rankRowMock(2, "Engineering Department", 81) +
+        rankRowMock(3, "Planning", 74) +
+        "</div>" +
+        '<div class="tour-callout">&#9881; An Admin can turn individual catalog items on or off for scoring ' +
+        "via <b>Manage Tracking</b> &#8212; not every item should count toward the same on-time-rate " +
+        "(a milestone-linked date, for instance, might not), and can give one item more <b>Scoring " +
+        "Weight</b> than its siblings via <b>Deliverables Configuration</b> so it counts for more " +
+        "toward the department's score (e.g. weighting BOQ higher than a less critical item) &#8212; " +
+        "anyone can suggest a weight change from <b>Deliverables Catalog</b>, same as a formula " +
+        "change, for an Admin to review. " +
+        "International L0 tenders count toward " +
+        "the same department score as standard L0 &#8212; Overview shows one combined L0 number; " +
+        "Manage Tracking still has its own L0 International tab so the two catalogs stay toggleable " +
+        "independently.</div>",
+    },
+    {
+      eyebrow: "Requests & Reminders",
+      title: "Automated Reminders",
+      body:
+        '<p class="tour-step-text">A nightly check runs automatically, no one has to remember to send ' +
+        "anything:</p>" +
+        '<div class="tour-feature-list">' +
+        featureRowMock("&#9200;", "accent", "1 Day Before It's Due", "Owners get a heads-up nudge before the deadline hits.") +
+        featureRowMock("&#128293;", "crit", "Escalating When Overdue", "Reminders repeat at <b>2, 7, and 14 days</b> late.") +
+        featureRowMock("&#128231;", "good", "Batched, Not Spammed", "Several items due the same day become <b>one email per Owner</b>, not one per item.") +
+        featureRowMock("&#129309;", "warn", "Extension or Hold", "Can't hit a date? Request an <b>Extension</b> (move it) or a <b>Hold</b> (pause lateness for missing data/a blocker) &#8212; goes to the SME or an Admin to decide, and nudges again after <b>3 days</b> if nobody has.") +
+        "</div>" +
+        '<p class="tour-step-text">Every reminder links straight to the exact item, and lives in its own ' +
+        '<b>Reminders</b> tab &#8212; kept separate from Announcements so day-to-day news and ' +
+        "\"you need to act on this\" nudges don't get mixed together.</p>",
+    },
+    {
+      eyebrow: "Around the Portal",
+      title: "Announcements",
+      body:
+        '<p class="tour-step-text">The general program news feed, not the action-oriented one covered on ' +
+        "the last slide. Every one of these is logged automatically as it happens:</p>" +
+        '<div class="mock-window"><div class="mock-titlebar"><div class="mock-dot-3"></div>' +
+        '<div class="mock-dot-3"></div><div class="mock-dot-3"></div><span>Announcements</span></div>' +
+        '<div class="mock-ann-list" style="margin:12px;">' +
+        announcementRowMock("&#127942;", "M3 Reached &#8211; Handing Over", "Est-1553 milestone M3 has been reached.") +
+        announcementRowMock("&#9989;", "Deliverable Approved", "6.1 Prepare Temporary Project Budget was reviewed and approved.") +
+        announcementRowMock("&#128276;", "New L1 Stage Commenced", "Est-1553 has entered L1. Deliverables for M1 &amp; M2 attached.") +
+        "</div></div>" +
+        '<ul class="tour-list">' +
+        "<li>A new L0 tender announced, or a project entering L1</li>" +
+        "<li>A milestone reached, or the Bid Submission Date extended</li>" +
+        "<li>A document added, or a deliverable approved</li>" +
+        "<li>A cross-department unlock &#8212; a predecessor being approved just freed up someone " +
+        "else's item</li>" +
+        "</ul>" +
+        '<p class="tour-step-text">Org-wide items like these are visible to <b>everyone</b> regardless of ' +
+        "role; anything addressed to specific people (a rejection, an assignment) stays private to " +
+        "them and Admin. Filter by type or date to find something specific.</p>",
+    },
+    {
+      eyebrow: "Around the Portal",
+      title: "BM Triage",
+      body:
+        '<p class="tour-step-text">Not every catalog item applies to every tender. When a new L0 tender is ' +
+        "created, its <b>Bid Manager</b> gets a short list to mark <b>Applicable</b> or <b>Not " +
+        "Required</b> before real tracking starts &#8212; and has <b>24 hours</b> to do it, or the " +
+        "platform blocks further action with a reminder until it's done.</p>" +
+        '<div class="mock-window"><div class="mock-titlebar"><div class="mock-dot-3"></div>' +
+        '<div class="mock-dot-3"></div><div class="mock-dot-3"></div><span>BM Triage Status</span></div>' +
+        '<div class="mock-deliv-list" style="margin:12px;">' +
+        deliverableMock("Est-1782", "132kV Substation &#8211; Riyadh", "good", "Done") +
+        deliverableMock("Est-1801", "OHTL Corridor &#8211; Jazan", "warn", "Reminded") +
+        deliverableMock("Est-1804", "GIS Package &#8211; Dammam", "crit", "Pending") +
+        "</div></div>" +
+        '<div class="tour-callout">&#9989; Every active tender\'s triage progress shows in one place, so an ' +
+        "Admin can see at a glance who's still holding things up.</div>",
+    },
+    {
+      eyebrow: "Around the Portal",
+      title: "Dashboard",
+      body:
+        '<p class="tour-step-text">Your landing page &#8212; the org-wide snapshot of what needs attention ' +
+        'right now, split cleanly by stage throughout. Toggle <b>All / My Items</b> at the top to ' +
+        "scope everything to just what you own or review.</p>" +
+        '<div class="mock-window"><div class="mock-titlebar"><div class="mock-dot-3"></div>' +
+        '<div class="mock-dot-3"></div><div class="mock-dot-3"></div><span>Dashboard</span></div>' +
+        '<div class="mock-body">' +
+        '<div class="mock-stat-row-label">Lifetime Snapshot</div>' +
+        '<div class="mock-stat-row">' +
+        statMock("L0 Lifetime", "343", "neutral") + statMock("L1 Lifetime", "45", "good") + statMock("Conversion", "13.1%", "accent") +
+        statMock("Avg. to Contract", "62d", "warn") + statMock("This Week", "9", "good") +
+        "</div>" +
+        '<div class="mock-stat-row-label">Deliverables Deadline Status</div>' +
+        '<div class="mock-stat-row">' +
+        statMock("Not Due", "508", "neutral") + statMock("Due", "36", "warn") + statMock("Early", "6", "good") +
+        statMock("On Time", "0", "good") + statMock("Late", "5", "crit") +
+        "</div>" +
+        '<div class="mock-stat-row-label">Deliverables Progress Status</div>' +
+        '<div class="mock-stat-row">' +
+        statMock("No Progress Yet", "285", "neutral") + statMock("In Progress", "0", "warn") + statMock("Pending SME Review", "0", "warn") +
+        statMock("Completed", "11", "good") + statMock("Rejected", "2", "crit") +
+        "</div>" +
+        "</div></div>" +
+        '<ul class="tour-list">' +
+        "<li><b>Lifetime Snapshot</b> up top &#8212; L0/L1 lifetime totals, conversion rate from " +
+        "tender to award, average time to contract, and this week's completed deliverables against " +
+        "last week</li>" +
+        "<li><b>Latest Announcements</b>, <b>Newest Milestones</b>, and &#9888; <b>Concerns</b> &#8212; " +
+        "each split into its own L0 feed and L1 feed, so tendering news never drowns out execution " +
+        "news &#8212; each section header carries a <b>View all &#8594;</b> link straight to the full " +
+        "list</li>" +
+        "<li><b>Top Departments</b> &#8212; who's carrying the most active work right now, per stage</li>" +
+        "<li><b>Top Achievers</b> &#8212; the best-performing Owners and SMEs, right on the landing page</li>" +
+        "<li><b>Deliverables Matrix</b> &#8212; every active project &times; every deliverable, live, " +
+        "colored Not Due / Due / Completed &#8212; the fastest way to spot a pattern across the whole " +
+        "portfolio at a glance</li>" +
+        "</ul>" +
+        '<div class="tour-callout">&#128072; Click any stat tile, feed item, or matrix cell to jump ' +
+        "straight to that filtered slice or the exact deliverable.</div>",
+    },
+    {
+      eyebrow: "Around the Portal",
+      title: "Assigned Deliverables",
+      body:
+        '<p class="tour-step-text">Every deliverable currently assigned to you as <b>Owner</b> or ' +
+        "<b>SME</b>, across every active L0 and L1 project, in one filterable table &#8212; instead of " +
+        "hunting through each project's own folders one at a time.</p>" +
+        '<div class="mock-window"><div class="mock-titlebar"><div class="mock-dot-3"></div>' +
+        '<div class="mock-dot-3"></div><div class="mock-dot-3"></div><span>Assigned Deliverables</span></div>' +
+        '<div class="mock-deliv-list" style="margin:12px;">' +
+        deliverableMock("2.6", "Topography Survey (GIS Package)", "crit", "Due") +
+        deliverableMock("4.5", "Value Engineering Studies (Towers)", "warn", "In Progress") +
+        deliverableMock("1.3", "Announce Pre-bid Meeting", "good", "Completed") +
+        "</div></div>" +
+        '<ul class="tour-list">' +
+        "<li>Filter by <b>L0 / L1</b>, Deadline status, or Progress status</li>" +
+        "<li>A per-item PO Lifecycle deliverable shows which named line item it's actually for &#8212; " +
+        "\"2.6 &#8212; Topography Survey\" and \"2.6 &#8212; Route Survey\" read as two separate, " +
+        "independently actionable rows, not one confusing duplicate</li>" +
+        "<li>Click any row to open the exact same detail popup you'd get from inside the project itself</li>" +
+        "</ul>",
+    },
+    {
+      eyebrow: "Around the Portal",
+      title: "Project Detail — Folders & Deliverables",
+      body:
+        '<p class="tour-step-text">Open any tender or project and you get its department folders on the ' +
+        "left (numbered, same order as the catalog) and that folder's deliverables on the right. " +
+        "Click a deliverable row to open its full detail popup &#8212; owner, SME, due date, " +
+        "documents, and a complete activity log.</p>" +
+        '<div class="mock-window"><div class="mock-titlebar"><div class="mock-dot-3"></div>' +
+        '<div class="mock-dot-3"></div><div class="mock-dot-3"></div><span>Est-1800 &middot; Project Detail</span></div>' +
+        '<div class="mock-body" style="display:grid;grid-template-columns:1fr 1.4fr;gap:12px;">' +
+        '<div class="mock-folder-list">' +
+        '<div class="mock-folder-row active"><span>&#128193; 1. Tendering</span><span>60%</span></div>' +
+        '<div class="mock-folder-row"><span>&#128193; 2. Operation Units</span><span>20%</span></div>' +
+        '<div class="mock-folder-row"><span>&#128193; 5. Planning</span><span>0%</span></div>' +
+        '<div class="mock-folder-row"><span>&#128193; 6. Cost Control</span><span>0%</span></div>' +
+        "</div>" +
+        '<div class="mock-deliv-list">' +
+        deliverableMock("1.3", "Announce Pre-bid Meeting", "good", "Completed") +
+        deliverableMock("1.7", "Develop Estimate Program", "crit", "Due") +
+        deliverableMock("1.9", "Float Materials RFQ", "neutral", "Not Due") +
+        deliverableMock("1.5", "Assign Bid Manager", "warn", "Pending Review") +
+        "</div></div></div>" +
+        '<p class="tour-step-text">Every project also has an <b>Activity Trail</b> tab (its full history) ' +
+        "and, for L1, a <b>PO Lifecycle</b> tab (per-item procurement tracking) &#8212; both covered " +
+        "next.</p>",
+    },
+    {
+      eyebrow: "Around the Portal",
+      title: "Activity Trail",
+      body:
+        '<p class="tour-step-text">Every project has its own <b>Activity Trail</b> tab &#8212; a full ' +
+        "chronological log of every action taken on every one of its deliverables, in one place.</p>" +
+        '<div class="mock-window"><div class="mock-titlebar"><div class="mock-dot-3"></div>' +
+        '<div class="mock-dot-3"></div><div class="mock-dot-3"></div><span>Activity Trail</span></div>' +
+        '<div class="mock-deliv-list" style="margin:12px;">' +
+        deliverableMock("4.5 — GIS Unit", "Approved by S.Alotaibi", "good", "Approved") +
+        deliverableMock("3.2 — GIS Unit", "Submitted by A.Rahman", "warn", "Submitted") +
+        deliverableMock("1.5", "Auto-completed", "neutral", "Auto-Done") +
+        "</div></div>" +
+        '<ul class="tour-list">' +
+        "<li>Submitted, sent for review, approved, rejected, reopened, reassigned, extended, put on " +
+        "or resumed from hold, marked Not Required &#8212; every one of these is its own timestamped " +
+        "entry</li>" +
+        "<li>For a per-item PO Lifecycle deliverable, the entry names the specific line item (e.g. " +
+        "\"4.5 &#8212; GIS Unit\"), not just the bare item number</li>" +
+        "<li>Nothing here can ever be edited or deleted &#8212; it's the permanent record of who did " +
+        "what, and when</li>" +
+        "</ul>",
+    },
+    {
+      eyebrow: "Around the Portal · L1",
+      title: "PO Lifecycle",
+      body:
+        '<p class="tour-step-text">Long-lead items, early activities, MEP, subcontractor agreements, and ' +
+        "the Consultancy PO don't move as one blanket deliverable &#8212; each <b>named item</b> (e.g. " +
+        "\"GIS Unit\", \"Topography Survey\") walks its own copy of the same step chain independently, " +
+        "so one item can be at PO signature while another hasn't even started.</p>" +
+        '<div class="mock-window"><div class="mock-titlebar"><div class="mock-dot-3"></div>' +
+        '<div class="mock-dot-3"></div><div class="mock-dot-3"></div><span>PO Lifecycle &#8211; Long Lead Items</span></div>' +
+        '<div class="mock-deliv-list" style="margin:12px;">' +
+        deliverableMock("GIS Unit", "Skipped 4.5, 2.2 / Next 3.2", "warn", "82%") +
+        deliverableMock("Transformer", "3.5 Electronic PO Signature", "good", "100%") +
+        deliverableMock("Towers", "4.5 Value Engineering Studies", "crit", "Rejected") +
+        "</div></div>" +
+        '<ul class="tour-list">' +
+        "<li>Read-only here &#8212; every upload and review still happens on the item's own row in the " +
+        "normal Deliverables tab; this tab just shows the whole chain at a glance</li>" +
+        "<li>Steps can complete out of order (some real predecessors are parallel, not sequential) " +
+        "&#8212; shown honestly as <b>Skipped</b>, never silently marked done</li>" +
+        "<li>3.2 (Supply Chain negotiating terms) and 4.6 (Engineering's technical review) are linked " +
+        "&#8212; once 3.2 has real progress, 4.6 flips to In Progress with a direct link to whatever's " +
+        "been uploaded so far, so its owner can start reviewing right away</li>" +
+        "<li>Each named item earns its own pro-rata score, feeding the exact same Performance numbers " +
+        "as every other deliverable</li>" +
+        "</ul>",
+    },
+    {
+      eyebrow: "Around the Portal",
+      title: "Timeline / Gantt",
+      body:
+        '<p class="tour-step-text">A Gantt view across every active deliverable &#8212; pooled across all ' +
+        "projects, or scoped to just one. Filter by department and status; click a bar to open " +
+        "that deliverable directly. Milestones get a highlighted outline so they stand out from " +
+        "regular deliverables, and a live <b>Today</b> line shows exactly where the project stands " +
+        "right now.</p>" +
+        '<div class="mock-window"><div class="mock-titlebar"><div class="mock-dot-3"></div>' +
+        '<div class="mock-dot-3"></div><div class="mock-dot-3"></div><span>Timeline</span></div>' +
+        '<div class="mock-body mock-gantt-wrap" style="padding:10px 14px;">' +
+        '<div class="mock-gantt-today" style="left:calc(96px + 8px + (100% - 104px) * .5);"></div>' +
+        ganttRowMock("1.1 Announcement", 4, 10, "neutral", true) +
+        ganttRowMock("1.7 Estimate Program", 8, 34, "crit", false) +
+        ganttRowMock("2.4 Risk Register", 22, 26, "warn", false) +
+        ganttRowMock("3.5 PO Approval", 34, 20, "warn", false) +
+        ganttRowMock("5.3 Project Schedule", 30, 40, "good", true) +
+        ganttRowMock("6.1 Temp. Budget", 48, 18, "neutral", false) +
+        "</div></div>",
+    },
+    {
+      eyebrow: "Around the Portal · Admin",
+      title: "Requests",
+      body:
+        '<p class="tour-step-text">Every pending request waiting on an Admin decision, in one place:</p>' +
+        '<ul class="tour-list">' +
+        "<li><b>Due-Date Requests</b> (Extensions &amp; Holds)</li>" +
+        "<li><b>Reassignment Requests</b></li>" +
+        "<li><b>SME Nominations</b> (someone self-nominating to be an item's SME)</li>" +
+        "<li><b>Bid Value Access Requests</b></li>" +
+        "<li><b>Group Add Requests</b> (anyone in the L0-L1 Group requesting a new email be added to it)</li>" +
+        "<li><b>Formula Change Requests</b> (someone suggesting a different due-date formula and/or " +
+        "scoring weight for a deliverable)</li>" +
+        "</ul>" +
+        '<div class="tour-callout">&#128203; Click any pending request for its full details before deciding ' +
+        "&#8212; a formula request shows exactly what it'd change the formula to (and the weight change " +
+        "as a %), not just what it is today.</div>",
+    },
+    {
+      eyebrow: "Around the Portal · Admin",
+      title: "Follow Up",
+      body:
+        '<p class="tour-step-text">Every overdue deliverable across the whole portal, with bulk ' +
+        "reminders:</p>" +
+        '<div class="mock-window"><div class="mock-titlebar"><div class="mock-dot-3"></div>' +
+        '<div class="mock-dot-3"></div><div class="mock-dot-3"></div><span>Follow Up</span></div>' +
+        '<div class="fu-stats" style="padding:12px 14px;">' +
+        '<div class="fu-stat critical"><span class="fu-stat-num">12</span><span class="fu-stat-lbl">Critical</span></div>' +
+        '<div class="fu-stat"><span class="fu-stat-num">36</span><span class="fu-stat-lbl">Overdue Total</span></div>' +
+        '<div class="fu-stat"><span class="fu-stat-num">4</span><span class="fu-stat-lbl">Depts Affected</span></div>' +
+        "</div>" +
+        '<details class="fu-dept-group" open><summary><span class="fu-dept-name">Engineering Department</span>' +
+        '<span class="fu-dept-tags"><span class="fu-dept-count has-critical">5 overdue</span></span></summary>' +
+        '<div class="fu-row"><div class="fu-row-main"><div class="fu-row-title">4.3 &middot; Site Investigation Requirements</div>' +
+        '<div class="fu-row-sub"><span>Est-1553</span><span class="sep">&middot;</span><span>Owner: A.Rahman</span></div></div>' +
+        '<div class="fu-row-side"><span class="fu-overdue-badge critical">18 days overdue</span></div></div>' +
+        "</details>" +
+        '<details class="fu-dept-group"><summary><span class="fu-dept-name">Supply Chain</span>' +
+        '<span class="fu-dept-tags"><span class="fu-dept-count">3 overdue</span></span></summary></details>' +
+        "</div>" +
+        '<div class="tour-callout">&#128227; Grouped by department, most overdue first, with a Critical ' +
+        "(15+ days) severity filter. Remind one stubborn item, or send to everyone currently shown " +
+        "&#8212; either opens a window to pick who's included (Owner, SME, Owner's Manager, or anyone " +
+        "else you type in), write a custom message, and attach files, and each department's group " +
+        "stays collapsed until you open it so the page isn't a wall of rows.</div>",
+    },
+    {
+      eyebrow: "Around the Portal",
+      title: "Meet GAHIZ – Your AI Support Agent!",
+      gahiz: true, // toggles #tourGahizFloat -- see renderTourStep()
+      body:
+        '<div class="gahiz-intro"><div class="gahiz-intro-name">GAHIZ is always ready to support you!</div>' +
+        "Al Gihaz Contracting's AI Agent for the Project Readiness (L0/L1) " +
+        "Platform.</div>" +
+        '<p class="tour-step-text">His bubble sits in the bottom-right corner of every page &#8212; ' +
+        "click it any time for a faster first stop than Ask the Team, for the kind of question that " +
+        "doesn't need a person: how the platform works, or what's on your own plate right now:</p>" +
+        '<div class="mock-window" style="position:relative;">' +
+        '<div class="mock-titlebar"><div class="mock-dot-3"></div><div class="mock-dot-3"></div>' +
+        '<div class="mock-dot-3"></div><span>Any page in the app</span></div>' +
+        '<div style="height:70px;"></div>' +
+        '<span style="position:absolute;right:64px;bottom:44px;background:var(--surface);color:var(--ink-900);' +
+        'font-size:11.5px;font-weight:700;padding:6px 11px;border-radius:10px;white-space:nowrap;box-shadow:var(--shadow-2);' +
+        'border:1px solid var(--line);">Click for Support</span>' +
+        '<img src="/static/img/gahiz-bubble.png" alt="GAHIZ" style="position:absolute;right:14px;bottom:0;width:54px;height:82px;' +
+        'object-fit:contain;object-position:bottom;filter:drop-shadow(0 8px 12px rgba(0,0,0,.3));" />' +
+        "</div>" +
+        '<div class="tour-callout" style="margin:10px 0;">&#128071; That\'s GAHIZ himself, standing bottom-right on ' +
+        "every page &#8212; hover for the \"Click for Support\" nudge, click and a chat panel opens:</div>" +
+        '<div class="mock-window"><div class="mock-titlebar"><div class="mock-dot-3"></div>' +
+        '<div class="mock-dot-3"></div><div class="mock-dot-3"></div><span>GAHIZ</span></div>' +
+        '<div style="padding:14px;display:flex;flex-direction:column;gap:8px;">' +
+        '<div style="align-self:flex-end;max-width:75%;background:var(--accent);color:#fff;border-radius:13px;border-bottom-right-radius:3px;padding:8px 12px;font-size:12.5px;">What\'s the difference between L0 and L1?</div>' +
+        '<div style="align-self:flex-start;max-width:75%;background:var(--surface-sunken);border-radius:13px;border-bottom-left-radius:3px;padding:8px 12px;font-size:12.5px;">L0 is the tender/bidding stage; L1 is the project after it\'s won.</div>' +
+        "</div></div>" +
+        '<ul class="tour-list">' +
+        "<li>Knows how the platform works &#8212; roles, deliverables, scoring, PO Lifecycle, Requests, and " +
+        "where to find things in the nav</li>" +
+        "<li>Can also answer questions about <b>your own</b> assigned deliverables (Owner or SME), by name</li>" +
+        "<li>Won't make judgment calls that are really an Admin's decision, and won't invent facts about a " +
+        "specific project it wasn't given</li>" +
+        "</ul>" +
+        '<div class="tour-callout">Not what you needed? A permanent <b>Ask the Team</b> button sits ' +
+        "right below the chat, and GAHIZ will point you there itself whenever he isn't confident.</div>",
+    },
+    {
+      eyebrow: "Around the Portal",
+      title: "Ask the Team",
+      body:
+        '<p class="tour-step-text">A question about a specific tender, project or deliverable doesn\'t have ' +
+        "to go through email or chat &#8212; raise it straight to the Admins from inside the portal, " +
+        "and track it in your own <b>My Requests</b> list.</p>" +
+        '<div class="mock-window"><div class="mock-titlebar"><div class="mock-dot-3"></div>' +
+        '<div class="mock-dot-3"></div><div class="mock-dot-3"></div><span>Open Questions</span></div>' +
+        '<div style="padding:10px 12px 4px;">' +
+        '<table class="tour-table"><thead><tr><th></th><th>Question</th><th>Asker</th><th>Status</th><th>Date</th></tr></thead><tbody>' +
+        '<tr><td><b>Q1</b></td><td>Why is item 5.3 still showing as pending?</td><td>A.Rahman</td>' +
+        '<td><span class="pill warn"><span class="dot"></span>Open</span></td><td>Aug 24</td></tr>' +
+        '<tr><td><b>Q2</b></td><td>Can we get the KB link for the BSD extension rules?</td><td>S.Alotaibi</td>' +
+        '<td><span class="pill good"><span class="dot"></span>Resolved</span></td><td>Aug 21</td></tr>' +
+        "</tbody></table></div></div>" +
+        '<p class="tour-step-text">Every question is a numbered row (Q1, Q2, &#8230;) with just the ' +
+        "essentials showing &#8212; click one for the full conversation instead of every thread " +
+        "rendering inline. Search it, or sort/filter any column straight from its header, same as " +
+        "L0 Tenders and L1 Projects.</p>" +
+        '<p class="tour-step-text">Admins see every open thread in one place under <b>Open Questions</b>, ' +
+        "reply (optionally pulling in a saved Knowledge Base answer instead of retyping the same " +
+        "explanation), and mark it resolved &#8212; you get notified the moment they do.</p>",
+    },
+    {
+      // Item [request 11]: one slide before the closing wrap-up,
+      // announcing the mobile app -- inline SVG phone mockup (same
+      // "recreate the real app's own look, not a stock photo" approach
+      // every other tour visual already uses) instead of a real
+      // screenshot, since there's no build yet to screenshot.
+      eyebrow: "Coming Soon",
+      title: "The Platform, In Your Pocket",
+      body:
+        // Item [request 17]: red gradient (var(--purple-1)/2, the app's
+        // own brand red tokens), every bit of text forced white -- .tour-
+        // callout's own "b { color: var(--ink-900) }" rule otherwise wins
+        // over the div's inline color (a descendant selector beats
+        // inheritance from an ancestor's inline style), which is exactly
+        // why the bold line was still reading dark before this fix.
+        '<div class="tour-callout" style="background:linear-gradient(135deg, var(--purple-1), var(--purple-2));' +
+        'border:none;display:flex;align-items:center;gap:10px;">' +
+        '<span style="font-size:22px;color:#fff;">&#128241;</span>' +
+        '<span style="color:#fff;"><b style="color:#fff;">Mobile app &#8212; in active development.</b> Everything you rely on here, ' +
+        "built for the phone in your pocket.</span></div>" +
+        '<div style="display:flex;gap:22px;align-items:flex-start;margin-top:16px;flex-wrap:wrap;">' +
+        '<div style="flex:0 0 auto;">' + mobileAppMock() + "</div>" +
+        '<div style="flex:1 1 220px;min-width:220px;">' +
+        '<div class="tour-feature-list">' +
+        featureRowMock("&#9989;", "good", "Approve on the go", "Review and approve deliverables the moment an SME request lands, no laptop required.") +
+        featureRowMock("&#128276;", "warn", "Push notifications", "Due-soon nudges, cross-department unlocks and milestone news, right on your lock screen.") +
+        featureRowMock("&#128247;", "accent", "Snap and upload", "Photograph a site document straight into a deliverable instead of scanning it later.") +
+        "</div></div></div>" +
+        '<p class="tour-step-text" style="margin-top:14px;">No action needed &#8212; we\'ll announce it here the moment it\'s ready.</p>',
+    },
+    {
+      eyebrow: "You're Ready",
+      title: "Finding Your Way Around",
+      body:
+        '<p class="tour-step-text">Quick reference for the rest of the nav:</p>' +
+        '<div class="tour-feature-list">' +
+        featureRowMock(NAV_ICONS.l0, "accent", "L0 Tenders / L1 Projects / Timeline", "The full project lists and the pooled Gantt view.") +
+        featureRowMock(NAV_ICONS.assigned, "accent", "Assigned Deliverables", "Every deliverable assigned to you, filterable by L0/L1 and status.") +
+        featureRowMock(NAV_ICONS.announcements, "good", "Announcements", "General program news, filterable by type and date.") +
+        featureRowMock(NAV_ICONS.reminders, "warn", "Reminders", "Everything that needs your action: due-soon/overdue nudges, request updates.") +
+        featureRowMock(NAV_ICONS.bmtriage, "good", "BM Triage Status", "Every active tender's applicable/not-required progress.") +
+        featureRowMock(NAV_ICONS.performance, "accent", "Performance", "On-time-rate tracking by department, feeding Top Achievers.") +
+        featureRowMock(NAV_ICONS.deliverableformulas, "accent", "Deliverables Catalog", "Every due-date formula and scoring weight in plain English &#8212; suggest a formula change with your reasoning.") +
+        featureRowMock(NAV_ICONS.masterpo, "accent", "Master POs List", "Every L1 project's PO status at a glance, read-only &#8212; the same data as the Admin Master PO Report, open to everyone here.") +
+        featureRowMock(NAV_ICONS.myrequests, "accent", "My Requests", "Every request you've sent to an Admin &#8212; due-dates, reassignments, SME nominations, and more &#8212; and where each stands.") +
+        featureRowMock(NAV_ICONS.support, "accent", "Q/A &#8211; Ask the Team", "Raise a question, track your own requests.") +
+        featureRowMock('<img src="/static/img/gahiz-icon.png" alt="GAHIZ" style="width:100%;height:100%;object-fit:cover;border-radius:50%;" />', "accent", "GAHIZ", "Ask how something in the platform works, or about your own assigned work &#8212; falls back to Ask the Team for anything it can't answer.") +
+        featureRowMock("&#128736;", "crit", "Admin Only", "Reports (4 filterable/printable report types), Top Achievers, Focal Points, Deliverables Configuration, Requests, Follow Up, Open Questions, Archived Projects.") +
+        "</div>" +
+        '<div class="tour-callout">&#127881; That\'s the full picture &#8212; close this and start ' +
+        "exploring. You can reopen this walkthrough anytime from the nav.</div>",
+    },
+  ];
+
+  function statMock(label, value, tone) {
+    return '<div class="mock-stat' + (tone ? " tone-" + tone : "") + '"><div class="label">' + label +
+      '</div><div class="value">' + value + "</div></div>";
+  }
+  function tourPtsRow(tone, timing, pts) {
+    return '<tr><td><span class="tour-dot-ic ' + tone + '"></span><b>' + timing + "</b></td><td>" + pts + "</td></tr>";
+  }
+  // Item [request 11]: a stylized phone frame with a miniature dashboard
+  // inside -- inline SVG (re-themes with dark mode, no image asset to
+  // ship) rather than a literal screenshot of a build that doesn't exist
+  // yet. Deliberately a recognizable miniature of the real dashboard (KPI
+  // tiles + a status list), not generic phone-UI chrome, so it reads as
+  // "this app, on mobile" at a glance.
+  function mobileAppMock() {
+    return '<svg width="168" height="336" viewBox="0 0 168 336" xmlns="http://www.w3.org/2000/svg">' +
+      '<rect x="2" y="2" width="164" height="332" rx="26" fill="var(--surface)" stroke="var(--line)" stroke-width="2"/>' +
+      '<rect x="56" y="12" width="56" height="7" rx="3.5" fill="var(--ink-500)" opacity="0.35"/>' +
+      '<rect x="14" y="34" width="140" height="30" rx="8" fill="var(--accent)"/>' +
+      '<text x="24" y="53" font-size="11" font-weight="700" fill="#fff" font-family="inherit">L0/L1 Platform</text>' +
+      '<rect x="14" y="72" width="66" height="46" rx="8" fill="var(--good)" opacity="0.16"/>' +
+      '<text x="22" y="92" font-size="14" font-weight="800" fill="var(--good)" font-family="inherit">92%</text>' +
+      '<text x="22" y="107" font-size="7" fill="var(--ink-500)" font-family="inherit">On-time</text>' +
+      '<rect x="88" y="72" width="66" height="46" rx="8" fill="var(--warn)" opacity="0.16"/>' +
+      '<text x="96" y="92" font-size="14" font-weight="800" fill="var(--warn)" font-family="inherit">7</text>' +
+      '<text x="96" y="107" font-size="7" fill="var(--ink-500)" font-family="inherit">Due soon</text>' +
+      '<rect x="14" y="128" width="140" height="1" fill="var(--line)"/>' +
+      '<text x="14" y="146" font-size="8" font-weight="700" fill="var(--ink-500)" font-family="inherit">ASSIGNED DELIVERABLES</text>' +
+      _mobileMockRow(156, "1.17", "var(--accent)") + _mobileMockRow(178, "3.5", "var(--good)") +
+      _mobileMockRow(200, "4.6", "var(--crit)") + _mobileMockRow(222, "5.3", "var(--good)") +
+      '<rect x="14" y="248" width="140" height="1" fill="var(--line)"/>' +
+      '<circle cx="30" cy="270" r="9" fill="var(--purple-1)"/><rect x="46" y="264" width="94" height="6" rx="3" fill="var(--ink-500)" opacity="0.3"/>' +
+      '<circle cx="30" cy="292" r="9" fill="var(--purple-2)"/><rect x="46" y="286" width="80" height="6" rx="3" fill="var(--ink-500)" opacity="0.3"/>' +
+      '<rect x="42" y="322" width="84" height="6" rx="3" fill="var(--ink-500)" opacity="0.35"/>' +
+      "</svg>";
+  }
+  function _mobileMockRow(y, itemNo, color) {
+    return '<rect x="14" y="' + y + '" width="140" height="16" rx="5" fill="' + color + '" opacity="0.12"/>' +
+      '<text x="20" y="' + (y + 11) + '" font-size="8" font-weight="700" fill="' + color + '" font-family="inherit">' + itemNo + '</text>' +
+      '<circle cx="144" cy="' + (y + 8) + '" r="3.5" fill="' + color + '"/>';
+  }
+  function featureRowMock(icon, tone, label, desc) {
+    return '<div class="tour-feature-row"><div class="tour-feature-ic ' + tone + '">' + icon + "</div>" +
+      "<div><b>" + label + '</b><div class="tour-feature-desc">' + desc + "</div></div></div>";
+  }
+  function deliverableMock(itemNo, name, tone, statusLabel) {
+    return '<div class="mock-deliv-row"><span><b>' + itemNo + "</b> &middot; " + name + '</span>' +
+      '<span class="pill ' + tone + '"><span class="dot"></span>' + statusLabel + "</span></div>";
+  }
+  function ganttRowMock(label, start, len, tone, milestone) {
+    return '<div class="mock-gantt-row"><div class="mock-gantt-label">' + label + '</div>' +
+      '<div class="mock-gantt-track"><div class="mock-gantt-bar ' +
+      (milestone ? "milestone " : "") + tone + '" style="left:' + start + '%;width:' + len + '%;"></div></div></div>';
+  }
+  function milestoneMock(steps) {
+    return steps.map(function (s) {
+      var code = s[0], label = s[1], done = s[2], current = s[3];
+      var cls = "fs-step" + (done ? " done" : current ? " current" : "");
+      return '<div class="' + cls + '" style="flex:1;"><div class="fs-dot" style="width:36px;height:36px;font-size:12px;">' +
+        (done ? FS_CHECK_SVG : code) + '</div><div class="fs-label">' + label + "</div></div>";
+    }).join("");
+  }
+  // Item [walkthrough expansion]: a real-pill legend row for slides
+  // explaining a status vocabulary (Progress/Deadline) -- same .pill markup
+  // the live app renders, just laid out as a reference strip instead of on
+  // a live deliverable.
+  function pillLegendMock(items) {
+    return '<div style="display:flex;flex-wrap:wrap;gap:8px;margin-bottom:14px;">' +
+      items.map(function (it) {
+        return '<span class="pill ' + it[0] + '"><span class="dot"></span>' + it[1] + "</span>";
+      }).join("") + "</div>";
+  }
+  // Item [walkthrough expansion]: same .rank-row/.rank-bar-fill markup the
+  // real Reports/Top Achievers page renders, just fed illustrative numbers.
+  function rankRowMock(rank, name, pct) {
+    return '<div class="rank-row"><div class="rank-num">' + rank + '</div>' +
+      '<div class="rank-name">' + name + '</div>' +
+      '<div class="rank-bar-track"><div class="rank-bar-fill" style="width:' + pct + '%;"></div></div>' +
+      '<div class="rank-val">' + pct + '%</div></div>';
+  }
+  function announcementRowMock(icon, title, body) {
+    return '<div class="mock-ann-row"><div class="mock-ann-ic">' + icon + '</div>' +
+      '<div><div class="mock-ann-title">' + title + '</div><div class="mock-ann-body">' + body + "</div></div></div>";
+  }
+  // Item [L0/L1 general concept slide]: recreates the flow diagram from the
+  // source "L0 L1 general concept.xlsx" (Standard sheet) -- who owns each
+  // stage, and its duration profile -- as inline SVG rather than an image,
+  // so it re-themes with dark mode the same way every other tour visual
+  // does. Unlike the other mock-* helpers, this isn't a recreation of a
+  // live app screen -- it's a new conceptual diagram, so it gets its own
+  // shape vocabulary (box/band/diamond) instead of reusing .mock-window etc.
+  function l0l1FlowDiagram() {
+    return '<svg class="tgc-svg" viewBox="0 0 620 490" xmlns="http://www.w3.org/2000/svg">' +
+      '<defs><marker id="tgcArrow" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto">' +
+      '<path d="M0,0 L10,5 L0,10 z" class="tgc-arrowhead"/></marker></defs>' +
+      '<rect class="tgc-box" x="155" y="15" width="310" height="38" rx="8"/>' +
+      '<text class="tgc-box-label" x="310" y="39" text-anchor="middle">Receive Tender Documents</text>' +
+      '<line class="tgc-arrow" x1="310" y1="53" x2="310" y2="76" marker-end="url(#tgcArrow)"/>' +
+      '<rect class="tgc-stage-band l0" x="40" y="78" width="540" height="32" rx="6"/>' +
+      '<text class="tgc-stage-text" x="310" y="98" text-anchor="middle">L0 STAGE &#183; Owner: Tendering Department &#183; Fixed Duration</text>' +
+      '<line class="tgc-arrow" x1="310" y1="110" x2="310" y2="133" marker-end="url(#tgcArrow)"/>' +
+      '<rect class="tgc-box" x="155" y="135" width="310" height="38" rx="8"/>' +
+      '<text class="tgc-box-label" x="310" y="159" text-anchor="middle">Submit Proposal to Client</text>' +
+      '<line class="tgc-arrow" x1="310" y1="173" x2="310" y2="199" marker-end="url(#tgcArrow)"/>' +
+      '<polygon class="tgc-decision" points="310,201 385,243 310,285 235,243"/>' +
+      '<text class="tgc-box-label" x="310" y="248" text-anchor="middle">Lowest Price?</text>' +
+      '<line class="tgc-arrow" x1="385" y1="243" x2="466" y2="243" marker-end="url(#tgcArrow)"/>' +
+      '<text class="tgc-branch-label" x="424" y="234" text-anchor="middle">No</text>' +
+      '<rect class="tgc-end-crit" x="470" y="222" width="130" height="42" rx="8"/>' +
+      '<text class="tgc-end-crit-text" x="535" y="248" text-anchor="middle">Tender Closed</text>' +
+      '<line class="tgc-arrow" x1="310" y1="285" x2="310" y2="308" marker-end="url(#tgcArrow)"/>' +
+      '<text class="tgc-branch-label" x="328" y="301">Yes</text>' +
+      '<rect class="tgc-box" x="140" y="310" width="340" height="38" rx="8"/>' +
+      '<text class="tgc-box-label" x="310" y="334" text-anchor="middle">Receive L1 Notification from Client</text>' +
+      '<line class="tgc-arrow" x1="310" y1="348" x2="310" y2="371" marker-end="url(#tgcArrow)"/>' +
+      '<rect class="tgc-stage-band l1" x="40" y="373" width="540" height="32" rx="6"/>' +
+      '<text class="tgc-stage-text" x="310" y="393" text-anchor="middle">L1 STAGE &#183; Owner: Operation Unit &#183; Duration Unknown (~4 months typical)</text>' +
+      '<line class="tgc-arrow" x1="310" y1="405" x2="310" y2="428" marker-end="url(#tgcArrow)"/>' +
+      '<rect class="tgc-end-good" x="180" y="430" width="260" height="42" rx="8"/>' +
+      '<text class="tgc-end-good-text" x="310" y="456" text-anchor="middle">Contract Signing</text>' +
+      "</svg>";
+  }
+
+  var tourStep = 0;
+  function renderTourStep() {
+    var s = TOUR_STEPS[tourStep];
+    document.getElementById("tourEyebrow").textContent = s.eyebrow;
+    document.getElementById("tourTitle").textContent = s.title;
+    document.getElementById("tourBody").innerHTML = s.body;
+    var dots = document.getElementById("tourDots");
+    dots.innerHTML = "";
+    TOUR_STEPS.forEach(function (_, i) {
+      var d = el("span", "tour-dot" + (i === tourStep ? " active" : i < tourStep ? " done" : ""));
+      d.addEventListener("click", function () { tourStep = i; renderTourStep(); });
+      dots.appendChild(d);
+    });
+    document.getElementById("tourPrev").disabled = tourStep === 0;
+    document.getElementById("tourNext").textContent = tourStep === TOUR_STEPS.length - 1 ? "Done" : "Next →";
+    document.getElementById("tourBody").scrollTop = 0;
+    // Redlined: GAHIZ floats outside the slide, only on his own step.
+    document.getElementById("tourGahizFloat").hidden = !s.gahiz;
+  }
+  // Item 41 (reworked): no more "mandatory, can't back out" mode -- the
+  // close button is always available now. Instead the tour auto-opens on
+  // every sign-in (see the bootstrap call at the bottom of this file),
+  // and a person who doesn't want that can turn it off for themselves via
+  // the "Disable auto tour on sign in" checkbox below, a standing
+  // per-browser preference (tourAutoDisabled) checked at that same
+  // bootstrap call.
+  function openTour() {
+    tourStep = 0;
+    renderTourStep();
+    document.getElementById("tourOverlay").hidden = false;
+  }
+  function closeTour() {
+    document.getElementById("tourOverlay").hidden = true;
+    // Item 1: whenever the walkthrough ends -- whether opened from the
+    // "L0/L1 Walkthrough" nav item (which has no real page of its own, see
+    // loadJourney) or auto-opened on sign-in on top of some other view --
+    // land the user on the Dashboard, not wherever they happened to be.
+    // (Landing on "journey" instead was tried and reverted: loadJourney()
+    // itself unconditionally reopens the tour, so it would just pop back
+    // open immediately after finishing -- "journey" IS the tour, not a
+    // separate page to land on.)
+    switchView("dashboard");
+  }
+  // #tourPrintBtn: prints the actual slides, not a reflowed summary --
+  // one .tour-card per TOUR_STEPS entry, same markup/classes renderTourStep()
+  // itself uses (modal-head/eyebrow/h2/modal-body.tour-body), so every
+  // mockup/diagram inside a step's body gets the exact CSS context it
+  // renders under on screen instead of a narrower ad-hoc print width. Each
+  // card forces a page break after it (.tour-print-pagebreak, styles.css)
+  // so it's one slide per PDF page, via the browser's own print dialog --
+  // "Save as PDF" there is what actually produces the PDF, no server
+  // round-trip or PDF library needed for content that's already HTML.
+  // #tourPrintView (index.html, a sibling of #tourOverlay) is the print
+  // target; .printing-tour (styles.css) swaps it in for the modal chrome
+  // under @media print.
+  function buildTourPrintDoc() {
+    var html = "";
+    TOUR_STEPS.forEach(function (s, i) {
+      var last = i === TOUR_STEPS.length - 1;
+      // .tour-print-page just centers the page; .tour-stage inside it is
+      // untouched from its on-screen shape (inline-flex, shrink-wrapped to
+      // the card) so #tourGahizFloat's absolute left:0/bottom:0 keeps
+      // resolving against the card's own edge exactly like it does live,
+      // instead of the full page width.
+      html += '<div class="tour-print-page' + (last ? "" : " tour-print-pagebreak") + '"><div class="tour-stage">' +
+        (s.gahiz ? '<img class="tour-gahiz-float" src="/static/img/gahiz-float.png" alt="GAHIZ">' : "") +
+        '<div class="modal-card tour-card">' +
+        '<div class="modal-head"><div><div class="eyebrow">' + s.eyebrow + "</div><h2>" + s.title + "</h2></div></div>" +
+        '<div class="modal-body tour-body">' + s.body + "</div>" +
+        "</div></div></div>";
+    });
+    return html;
+  }
+  function printTour() {
+    document.getElementById("tourPrintView").innerHTML = buildTourPrintDoc();
+    document.body.classList.add("printing-tour");
+    var cleanup = function () {
+      document.body.classList.remove("printing-tour");
+      document.getElementById("tourPrintView").innerHTML = "";
+      window.removeEventListener("afterprint", cleanup);
+    };
+    window.addEventListener("afterprint", cleanup);
+    window.print();
+    // afterprint doesn't fire reliably in every browser's print-to-PDF
+    // path -- this is just a backstop so the app doesn't get stuck hiding
+    // its own chrome if it's missed.
+    setTimeout(cleanup, 5000);
+  }
+  document.getElementById("tourPrintBtn").addEventListener("click", printTour);
+  document.getElementById("tourStartBtn").addEventListener("click", openTour);
+  document.getElementById("tourClose").addEventListener("click", closeTour);
+  document.getElementById("tourPrev").addEventListener("click", function () {
+    if (tourStep > 0) { tourStep--; renderTourStep(); }
+  });
+  document.getElementById("tourNext").addEventListener("click", function () {
+    if (tourStep < TOUR_STEPS.length - 1) { tourStep++; renderTourStep(); return; }
+    // Reaching the last slide via "Next" already leaves it on screen to
+    // read -- clicking "Done" itself is the real "I'm finished" action, so
+    // it closes the tour exactly like the X does.
+    closeTour();
+  });
+  var tourAutoToggle = document.getElementById("tourAutoToggle");
+  tourAutoToggle.checked = localStorage.getItem("tourAutoDisabled") === "1";
+  tourAutoToggle.addEventListener("change", function () {
+    if (tourAutoToggle.checked) localStorage.setItem("tourAutoDisabled", "1");
+    else localStorage.removeItem("tourAutoDisabled");
+  });
+  /* ===== [PO Lifecycle] declaring-item selection UI, inside the normal deliverable modal ===== */
+  var PO_DECLARING_ITEM_NOS = ["1.2", "4.1", "2.11", "2.17"];
+  var EARLY_ACTIVITY_TYPES = ["Geotechnical/Soil Investigation", "Topography Survey", "Route Survey",
+    "Radar/GPR Survey", "Hydrology Study", "Environmental Study (ESIA)"];
+  var MEP_TYPES = ["HCIS Consultancy", "Fire Fighting Consultancy"];
+
+  async function savePoSelection(submissionId, patch, after) {
+    try {
+      await api("/api/deliverables/" + submissionId + "/po-selection", {
+        method: "PATCH", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(Object.assign({ actor_name: CURRENT_ROLE + " (pilot)", actor_role: CURRENT_ROLE, actor_email: actingEmail() }, patch)),
+      });
+      after();
+    } catch (err) { showToast("Couldn't save &#8211; " + apiErrorDetail(err), true); }
+  }
+
+  function poChecklistSection(d, refreshModal, label, options, selectionKey, canEdit) {
+    var sec = el("div", "po-selection-section");
+    var selected = (d.po_selection && d.po_selection[selectionKey]) || [];
+    var head = el("div", "po-selection-head");
+    head.appendChild(el("span", "po-selection-label", label));
+    if (canEdit) {
+      var editBtn = el("button", "btn", "Edit");
+      editBtn.addEventListener("click", function () {
+        openChecklistEditModal({
+          eyebrow: d.item_no, title: label, options: options, selected: selected,
+          onSave: function (picked) {
+            var patch = {}; patch[selectionKey] = picked;
+            savePoSelection(d.id, patch, function () { closeChecklistEditModal(); refreshModal(); });
+          },
+        });
+      });
+      head.appendChild(editBtn);
+    }
+    sec.appendChild(head);
+    if (selected.length) {
+      var chips = el("div", "po-selection-chips");
+      selected.forEach(function (s) { chips.appendChild(el("span", "po-chip", s)); });
+      sec.appendChild(chips);
+    } else {
+      sec.appendChild(el("div", "po-selection-empty", "None selected yet"));
+    }
+    return sec;
+  }
+
+  function poLongLeadSection(d, refreshModal, canEdit) {
+    var sec = el("div", "po-selection-section");
+    sec.appendChild(el("div", "po-selection-label", "Long-lead items"));
+    var rows = (d.po_selection && d.po_selection.long_lead_items) || [];
+    var table = el("div", "po-longlead-table");
+    rows.forEach(function (r, idx) {
+      var row = el("div", "po-longlead-row");
+      row.appendChild(el("span", "po-longlead-name", r.name + (r.qty ? " &#8212; " + r.qty + " " + (r.unit || "") : "")));
+      if (canEdit) {
+        var rm = el("button", "btn ghost-crit", "Remove");
+        rm.addEventListener("click", function () {
+          var next = rows.slice(); next.splice(idx, 1);
+          savePoSelection(d.id, { long_lead_items: next }, refreshModal);
+        });
+        row.appendChild(rm);
+      }
+      table.appendChild(row);
+    });
+    if (!rows.length) table.appendChild(el("div", "po-selection-empty", "No items yet &#8212; upload the long-lead Excel above, or add one manually"));
+    sec.appendChild(table);
+    if (canEdit) {
+      var addBtn = el("button", "btn", "+ Add item manually");
+      addBtn.addEventListener("click", function () {
+        openChecklistEditModal({
+          type: "text", eyebrow: d.item_no, title: "Add long-lead item", placeholder: "Item name", selected: "",
+          onSave: function (name) {
+            if (!name || !name.trim()) return;
+            savePoSelection(d.id, { long_lead_items: rows.concat([{ name: name.trim() }]) }, function () { closeChecklistEditModal(); refreshModal(); });
+          },
+        });
+      });
+      sec.appendChild(addBtn);
+    }
+    return sec;
+  }
+
+  function poTextListSection(d, refreshModal, label, canEdit, placeholder) {
+    var sec = el("div", "po-selection-section");
+    sec.appendChild(el("div", "po-selection-label", label));
+    var items = (d.po_selection && d.po_selection.items) || [];
+    var list = el("div", "po-longlead-table");
+    items.forEach(function (name, idx) {
+      var row = el("div", "po-longlead-row");
+      row.appendChild(el("span", "po-longlead-name", name));
+      if (canEdit) {
+        var rm = el("button", "btn ghost-crit", "Remove");
+        rm.addEventListener("click", function () {
+          var next = items.slice(); next.splice(idx, 1);
+          savePoSelection(d.id, { items: next }, refreshModal);
+        });
+        row.appendChild(rm);
+      }
+      list.appendChild(row);
+    });
+    if (!items.length) list.appendChild(el("div", "po-selection-empty", "No items yet"));
+    sec.appendChild(list);
+    if (canEdit) {
+      var addBtn = el("button", "btn", "+ Add item");
+      addBtn.addEventListener("click", function () {
+        openChecklistEditModal({
+          type: "text", eyebrow: d.item_no, title: "Add " + label.toLowerCase(), placeholder: placeholder || "Agreement name", selected: "",
+          onSave: function (name) {
+            if (!name || !name.trim()) return;
+            savePoSelection(d.id, { items: items.concat([name.trim()]) }, function () { closeChecklistEditModal(); refreshModal(); });
+          },
+        });
+      });
+      sec.appendChild(addBtn);
+    }
+    return sec;
+  }
+
+  async function openDelivModal(submissionId) {
+    var qs = "?actor_role=" + encodeURIComponent(CURRENT_ROLE) + "&actor_email=" + encodeURIComponent(actingEmail() || passiveIdentity() || "");
+    var d = await api("/api/deliverables/" + submissionId + qs);
+    document.getElementById("delivModalEyebrow").textContent = d.est_no + " – " + deptLabel(d.department, d.department_number);
+    document.getElementById("delivModalTitle").textContent = d.item_no + " · " + d.name + (d.line_item_name ? " — " + d.line_item_name : "");
+    var authorized = isAssigned({ owner_emails: d.owner_emails, sme_emails: d.sme_emails });
+    var body = document.getElementById("delivModalBody");
+    body.innerHTML = "";
+
+    // Item [request 8]: 1.18 restricted to the BM + Supply Chain owners --
+    // everyone else gets a request-access screen instead of the normal
+    // deliverable UI, the same pattern as the Bid Value field's own gate.
+    if (d.access_restricted && !d.access_visible) {
+      var restrictBlock = el("div", "po-selection-block");
+      restrictBlock.appendChild(el("div", "po-selection-title", "Restricted"));
+      restrictBlock.appendChild(el("div", "po-selection-empty",
+        "This item is restricted to the Bid Manager and Supply Chain owners. Request access to view it."));
+      if (d.access_request_status === "pending") {
+        restrictBlock.appendChild(el("span", "pill warn", '<span class="dot"></span>Request Pending'));
+      } else if (d.access_request_status === "rejected") {
+        restrictBlock.appendChild(el("span", "pill crit", '<span class="dot"></span>Request Declined'));
+      } else {
+        var reqBtn = el("button", "btn primary", "Request Access");
+        reqBtn.type = "button";
+        reqBtn.addEventListener("click", async function () {
+          try {
+            await api("/api/deliverables/" + submissionId + "/request-comm-offer-access", {
+              method: "POST", headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({ actor_email: actingEmail() || passiveIdentity() || "", actor_name: passiveIdentity() }),
+            });
+            showToast("Access requested");
+            openDelivModal(submissionId);
+          } catch (err) { showToast("Couldn't request access &#8211; " + apiErrorDetail(err), true); }
+        });
+        restrictBlock.appendChild(reqBtn);
+      }
+      body.appendChild(restrictBlock);
+      document.getElementById("delivModalOverlay").hidden = false;
+      return;
+    }
+
+    // [PO Lifecycle]: a fan-out item_no (one submission per PO line item)
+    // shows as a single collapsed row in the Deliverables list -- this
+    // switcher is where each item's own upload/status/SME-review/score
+    // actually lives, inside this one window, instead of as separate
+    // top-level rows.
+    if (d.siblings && d.siblings.length) {
+      var switchDotColor = { approved: "var(--good)", pending_review: "var(--accent)", in_progress: "var(--accent)", rejected: "var(--crit)" };
+      var switcher = el("div", "item-switcher");
+      d.siblings.forEach(function (s) {
+        var chip = el("button", "item-switch-chip" + (s.id === d.id ? " active" : ""),
+          '<span class="dot" style="background:' + (switchDotColor[s.status] || "var(--ink-500)") + ';"></span>' + (s.line_item_name || "Item"));
+        chip.type = "button";
+        if (s.id !== d.id) chip.addEventListener("click", function () { openDelivModal(s.id); });
+        switcher.appendChild(chip);
+      });
+      body.appendChild(switcher);
+    }
+
+    var meta = el("div", "modal-meta-grid");
+    // Item 134 rework: SME is no longer editable from here -- it's set as
+    // a catalog default in Focal Points instead, so every new project
+    // picks it up automatically rather than being patched one project at
+    // a time from this popup.
+    var metaRows = [["Owner", (d.owner_emails && d.owner_emails.length) ? d.owner_emails.join(", ") : "&#8213;"], ["SME", (d.sme_emails && d.sme_emails.length) ? d.sme_emails.join(", ") : "&#8213;"],
+     ["Due Date", dueDateHtml(d)],
+     ["Status", statusPillsHtml(d)]];
+    // Item [request]: the modal only ever showed the scheduled Due Date --
+    // once actually Completed, the real completion date (reviewed_at,
+    // already tracked -- same field "Edit Completion Date" below edits)
+    // had nowhere to be read back, which is exactly the gap that made
+    // GAHIZ's own "5 workdays after [due date]" explanation come out
+    // backwards instead of using the real date it completed on.
+    if (d.status === "approved" && d.reviewed_at) {
+      metaRows.push(["Completion Date", fmtDate(d.reviewed_at.slice(0, 10))]);
+    }
+    // Item [early bonus]: once Completed, show the real point value earned
+    // under the Calculation Criteria, not just the pass/fail status pill.
+    if (d.points_earned !== null && d.points_earned !== undefined) {
+      metaRows.push(["Points Earned", pointsEarnedLabel(d.points_earned)]);
+    }
+    // [PO number]: read-only here on every OTHER step sharing this line
+    // item -- 3.2 itself gets its own dedicated editable block below
+    // instead, so it isn't shown twice on that one item's modal.
+    if (d.po_number && d.item_no !== "3.2") {
+      metaRows.push(["PO Number", d.po_number]);
+    }
+    metaRows.forEach(function (m) {
+        var mi = el("div");
+        mi.appendChild(el("div", "mk", m[0]));
+        mi.appendChild(el("div", "mv", m[1]));
+        meta.appendChild(mi);
+      });
+    body.appendChild(meta);
+
+    // Item 138: refreshing the modal alone left the deliverables list
+    // behind it stale (still showing the pre-action status/buttons) until
+    // a manual page reload -- also refresh that list every time.
+    var refreshModal = function () { openDelivModal(submissionId); refreshCurrentFolder(); };
+
+    // [PO Lifecycle]: 1.2/4.1/2.11/2.17 each declare which PO line items
+    // exist -- edited right here, pre-approval, through the normal
+    // Deliverables window. Nothing is created downstream until this
+    // submission is actually approved (see sync_from_submission on the
+    // backend); this block is just the scratch pad.
+    // Item [request 5]: L0's own 1.17/1.18 (Circulate technical/commercial
+    // offers, domestic Tendering Department only -- its International
+    // sibling department shares these same item_no strings for
+    // unrelated, non-declaring content) get the same manual item-list
+    // pattern as L1's S/C agreements above, no Excel and no MEP
+    // categories, per the request.
+    var isL0Declaring = (d.item_no === "1.17" || d.item_no === "1.18") && d.department === "Tendering Department";
+    if (PO_DECLARING_ITEM_NOS.indexOf(d.item_no) !== -1 || isL0Declaring) {
+      var canEditSelection = authorized && !d.project_terminal && d.status !== "approved" && d.status !== "pending_review";
+      var poBlock = el("div", "po-selection-block");
+      poBlock.appendChild(el("div", "po-selection-title", isL0Declaring ? "Items for review" : "PO Lifecycle selection"));
+      if (d.item_no === "4.1") {
+        poBlock.appendChild(poChecklistSection(d, refreshModal, "Early activities", EARLY_ACTIVITY_TYPES, "selected", canEditSelection));
+      } else if (d.item_no === "1.2") {
+        poBlock.appendChild(poLongLeadSection(d, refreshModal, canEditSelection));
+        poBlock.appendChild(poChecklistSection(d, refreshModal, "MEP consultancy", MEP_TYPES, "mep_selected", canEditSelection));
+      } else if (isL0Declaring) {
+        var l0Label = d.item_no === "1.17" ? "Technical offer items" : "Commercial offer items";
+        poBlock.appendChild(poTextListSection(d, refreshModal, l0Label, canEditSelection, "Material Name"));
+      } else {
+        poBlock.appendChild(poTextListSection(d, refreshModal, "S/C agreements", canEditSelection));
+      }
+      body.appendChild(poBlock);
+    }
+
+    // [PO number]: Owner-entered here, on 3.2 specifically, the moment
+    // terms are settled and a real PO number is known -- writes to this
+    // item's own PoLineItem (backend), so every other step sharing it
+    // (3.1, 3.3-3.7, 4.6, ...) picks it up automatically; see this item's
+    // own read-only "PO Number" meta row above for those. Same
+    // openChecklistEditModal text-entry pattern poTextListSection's own
+    // "+ Add item" button already uses, not a raw inline input, for
+    // consistency with every other text-entry point in this modal.
+    if (d.item_no === "3.2" && d.po_line_item_id) {
+      var poNumBlock = el("div", "po-selection-block");
+      poNumBlock.appendChild(el("div", "po-selection-title", "PO Number"));
+      if (d.po_number) {
+        poNumBlock.appendChild(el("div", "po-selection-empty", d.po_number));
+      } else {
+        poNumBlock.appendChild(el("div", "po-selection-empty", "Not set yet"));
+      }
+      if (authorized && !d.project_terminal) {
+        var poNumBtn = el("button", "btn", d.po_number ? "Edit PO Number" : "+ Set PO Number");
+        poNumBtn.type = "button";
+        poNumBtn.addEventListener("click", function () {
+          openChecklistEditModal({
+            type: "text", eyebrow: d.item_no, title: "PO Number", placeholder: "e.g. 4500123456",
+            selected: d.po_number || "",
+            onSave: async function (value) {
+              value = (value || "").trim();
+              if (!value) { showToast("Enter a PO number", true); return; }
+              try {
+                await api("/api/deliverables/" + submissionId + "/po-number", {
+                  method: "PATCH", headers: { "Content-Type": "application/json" },
+                  body: JSON.stringify({
+                    po_number: value, actor_role: CURRENT_ROLE, actor_email: actingEmail(),
+                    actor_name: CURRENT_ROLE + " (pilot)",
+                  }),
+                });
+              } catch (err) {
+                showToast("Could not save &#8211; " + apiErrorDetail(err), true);
+                return;
+              }
+              showToast("PO number saved");
+              closeChecklistEditModal();
+              refreshModal();
+            },
+          });
+        });
+        poNumBlock.appendChild(poNumBtn);
+      }
+      body.appendChild(poNumBlock);
+    }
+
+    // [4.6 doc reference]: 4.6's owner is reviewing whatever 3.2's owner
+    // has uploaded -- show it directly here instead of making them go find
+    // 3.2's own row on the Deliverables list.
+    if (d.item_no === "4.6" && d.reference_document) {
+      var refBlock = el("div", "po-selection-block");
+      refBlock.appendChild(el("div", "po-selection-title", "Reference: 3.2 Uploaded Document"));
+      var refLink = el("a", "", d.reference_document.file_name);
+      refLink.href = d.reference_document.file_url; refLink.target = "_blank"; refLink.rel = "noopener";
+      refBlock.appendChild(refLink);
+      body.appendChild(refBlock);
+    }
+
+    // [2.3 <-> PM two-way sync]: picking someone here calls the exact same
+    // endpoint the project detail page's own "Project Manager" field edit
+    // uses (PATCH .../project-manager), which auto-completes every "2.3"
+    // submission on the project -- so this is really just that same field,
+    // surfaced on the one deliverable that's actually about assigning it,
+    // not a separate parallel value to keep in sync by hand.
+    if (d.item_no === "2.3" && !d.project_terminal && d.status !== "approved") {
+      var pmBlock = el("div", "po-selection-block");
+      pmBlock.appendChild(el("div", "po-selection-title", "Assign Project Manager"));
+      var pmSelect = el("select");
+      pmSelect.appendChild(el("option", "", "Select from L0/L1 Group…")).value = "";
+      var roster = await _getRoster();
+      roster.forEach(function (u) {
+        var opt = el("option", "", u.name + " (" + u.email + ")");
+        opt.value = u.name;
+        if (d.project_manager && u.name === d.project_manager) opt.selected = true;
+        pmSelect.appendChild(opt);
+      });
+      pmBlock.appendChild(pmSelect);
+      var pmSaveBtn = el("button", "btn primary", "Save");
+      pmSaveBtn.style.marginTop = "8px";
+      pmSaveBtn.addEventListener("click", async function () {
+        if (!pmSelect.value) { showToast("Pick a person first", true); return; }
+        try {
+          await api("/api/projects/" + d.project_id + "/project-manager", {
+            method: "PATCH", headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ project_manager: pmSelect.value }),
+          });
+        } catch (err) {
+          showToast("Could not assign &#8211; " + apiErrorDetail(err), true);
+          return;
+        }
+        showToast("Project Manager assigned &#8211; 2.3 completed");
+        refreshModal();
+      });
+      pmBlock.appendChild(pmSaveBtn);
+      body.appendChild(pmBlock);
+    }
+
+    var actionsRow = el("div", "modal-actions-row");
+    var shareBtn = el("button", "btn", "Share");
+    shareBtn.addEventListener("click", async function () {
+      var url = location.origin + location.pathname + "#deliverable=" + d.id;
+      if (navigator.share) {
+        try { await navigator.share({ title: d.item_no + " - " + d.name, url: url }); return; }
+        catch (e) { return; } // user cancelled the native share sheet — no error to show
+      }
+      try {
+        await navigator.clipboard.writeText(url);
+        showToast("Link copied to clipboard");
+      } catch (e) {
+        prompt("Copy this link:", url);
+      }
+    });
+    actionsRow.appendChild(shareBtn);
+    actionsRow.appendChild(followButton({ id: d.id, following: d.following }));
+
+    // Item [closed-project bug]: this modal is a separate render path from
+    // the deliverables list row (renderDeliverables), which already hides
+    // every state-changing button once currentProjectTerminal is true --
+    // this one had no matching check at all, so an Owner could still
+    // upload against a closed project through the modal even though the
+    // list row correctly showed it as read-only. Gate on the project's own
+    // terminal flag from this deliverable's own API response (not the
+    // module-level currentProjectTerminal, which reflects whichever
+    // project openDetail last loaded and can be wrong here -- this modal
+    // is also reachable via a deep link or the Assigned Deliverables list,
+    // without openDetail ever having run for this item's own project).
+    if (d.project_terminal) {
+      actionsRow.appendChild(el("span", "locked-note", "&#128274; Project closed &#8212; read-only"));
+    } else {
+
+    // [Row actions trimmed]: Send reminder used to live on the Assigned
+    // Deliverables row itself; it only lives here now (same endpoint/
+    // wording), reached from that row via the "more actions" dot on an
+    // overdue item -- independent of status, same as it always was.
+    if (authorized && d.deadline_status === "due" && can("remind")) {
+      var remindBtn = el("button", "btn ghost-crit", "Send reminder");
+      remindBtn.addEventListener("click", async function () {
+        try {
+          var res = await api("/api/deliverables/bulk-remind", {
+            method: "POST", headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ submission_ids: [d.id], actor_role: CURRENT_ROLE }),
+          });
+          // This modal's own fetch returns owner_emails (a list), not the
+          // list row's pre-joined "owner" string -- join it the same way
+          // the Owner meta row above already does.
+          var ownerLabel = (d.owner_emails && d.owner_emails.length) ? d.owner_emails.join(", ") : "the owner";
+          showToast(res.sent ? "Reminder sent to " + ownerLabel : "No owner to remind");
+        } catch (err) {
+          showToast("Could not send reminder &#8211; " + apiErrorDetail(err), true);
+        }
+      });
+      actionsRow.appendChild(remindBtn);
+    }
+
+    // Item 143 (2nd revision): Upload/Add Document stays available right up
+    // until Mark Completed is clicked -- once Pending SME Review, uploads
+    // close entirely until the SME confirms or sends it back (no more
+    // slipping in new evidence mid-review).
+    var canUpload = d.status !== "approved" && d.status !== "pending_review";
+    if (authorized && canUpload && can("upload")) {
+      actionsRow.appendChild(uploadButton(d.id, refreshModal));
+    }
+
+    // Item 143 (2nd revision): Mark Completed -- Owner or SME, comment-only
+    // or with any number of documents already uploaded, it makes no
+    // difference since there's no more per-document gate to clear first.
+    // The endpoint itself decides whether the caller's click finalizes it
+    // (SME) or just flags it for the SME's confirmation (Owner).
+    var canMarkComplete = d.status === "no_progress" || d.status === "in_progress" || d.status === "rejected";
+    if (authorized && canMarkComplete && (can("upload") || can("review"))) {
+      actionsRow.appendChild(markCompleteButton(d.id, refreshModal));
+    }
+
+    var eligibleStatus = d.status === "no_progress" || d.status === "rejected";
+    if (authorized && eligibleStatus && can("upload")) {
+      if (CURRENT_ROLE === "Admin") actionsRow.appendChild(markNotRequiredButton(d.id, refreshModal));
+      var reassignBtn = el("button", "btn", "Reassign");
+      reassignBtn.addEventListener("click", async function () {
+        // Item [reassign dropdown]: was a native prompt() for a raw typed
+        // email -- easy to typo, and the backend already rejects anything
+        // that isn't a real Owner/Admin roster member, so a dropdown of
+        // exactly those candidates is both friendlier and matches what's
+        // actually allowed.
+        var roster = await _getRoster();
+        var candidates = roster.filter(function (u) { return u.role === "Owner" || u.role === "Admin"; });
+        openChecklistEditModal({
+          type: "select-text",
+          title: "Reassign " + d.item_no,
+          eyebrow: "Only Owners and Admins in the L0/L1 Group can be reassigned to.",
+          placeholder: "Select from L0/L1 Group…",
+          textPlaceholder: "Reason (optional)",
+          options: candidates.map(function (u) { return { label: u.name + " (" + u.email + ")", value: u.email }; }),
+          onSave: async function (toEmail, reason) {
+            if (!toEmail) { showToast("Pick a person first", true); return; }
+            try {
+              await api("/api/deliverables/" + d.id + "/reassign-request", {
+                method: "POST", headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ to_email: toEmail, reason: reason || null, from_email: (d.owner_emails || []).join(", ") }),
+              });
+            } catch (err) {
+              showToast("Could not request reassignment – " + apiErrorDetail(err), true);
+              return;
+            }
+            closeChecklistEditModal();
+            showToast("Reassignment requested — pending admin approval");
+          },
+        });
+      });
+      actionsRow.appendChild(reassignBtn);
+    }
+
+    // Item [due-date requests]: Owner (or Admin) can ask for more time or
+    // flag a blocker, subject to SME/Admin approval -- only while there's
+    // no request already pending and the item isn't already on hold.
+    var canRequestDueDateChange = (d.status === "no_progress" || d.status === "in_progress" || d.status === "rejected")
+      && !d.pending_due_date_request && !d.on_hold;
+    if (authorized && canRequestDueDateChange && can("upload")) {
+      var itemLabel = d.item_no + " &middot; " + d.name;
+      var extendBtn2 = el("button", "btn", "Request Extension");
+      extendBtn2.addEventListener("click", function () { openDueDateRequestModal(d.id, "extension", itemLabel, refreshModal); });
+      var holdBtn = el("button", "btn", "Put On Hold");
+      holdBtn.addEventListener("click", function () { openDueDateRequestModal(d.id, "hold", itemLabel, refreshModal); });
+      actionsRow.appendChild(extendBtn2); actionsRow.appendChild(holdBtn);
+    }
+
+    // Assigned SME or Admin decides a pending extension/hold request --
+    // same can("review") gate Confirm Completion/Send Back uses above,
+    // matching the backend's rules.can_act(..., resolve_smes(sub)) (Admin
+    // passes automatically).
+    if (authorized && d.pending_due_date_request && can("review")) {
+      var req = d.pending_due_date_request;
+      var label = req.kind === "extension" ? "Extension" : "Hold";
+      var approveBtn = el("button", "btn primary", "Approve " + label);
+      approveBtn.addEventListener("click", async function () {
+        try {
+          await api("/api/deliverables/due-date-requests/" + req.id + "/decide", {
+            method: "POST", headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ approved: true, comment: "", actor_role: CURRENT_ROLE, actor_email: actingEmail() }),
+          });
+        } catch (err) {
+          showToast("Could not approve &#8211; " + apiErrorDetail(err), true);
+          return;
+        }
+        showToast(label + " approved");
+        refreshModal();
+      });
+      var rejectBtn = el("button", "btn ghost-crit", "Reject " + label);
+      rejectBtn.addEventListener("click", async function () {
+        var comment = prompt("Reason for rejecting (optional):", "") || "";
+        try {
+          await api("/api/deliverables/due-date-requests/" + req.id + "/decide", {
+            method: "POST", headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ approved: false, comment: comment, actor_role: CURRENT_ROLE, actor_email: actingEmail() }),
+          });
+        } catch (err) {
+          showToast("Could not reject &#8211; " + apiErrorDetail(err), true);
+          return;
+        }
+        showToast(label + " rejected");
+        refreshModal();
+      });
+      actionsRow.appendChild(approveBtn); actionsRow.appendChild(rejectBtn);
+    }
+
+    // Owner (or Admin) ends an active hold.
+    if (authorized && d.on_hold && can("upload")) {
+      var resumeBtn = el("button", "btn primary", "Resume");
+      resumeBtn.addEventListener("click", async function () {
+        try {
+          await api("/api/deliverables/" + d.id + "/resume?actor_role=" + encodeURIComponent(CURRENT_ROLE) +
+            "&actor_email=" + encodeURIComponent(actingEmail()), { method: "POST" });
+        } catch (err) {
+          showToast("Could not resume &#8211; " + apiErrorDetail(err), true);
+          return;
+        }
+        showToast(d.item_no + " resumed");
+        refreshModal();
+      });
+      actionsRow.appendChild(resumeBtn);
+    }
+
+    // Item 143 (2nd revision): the SME's confirm/reject on a completion
+    // claim -- the only place a whole-deliverable Approve/Reject exists,
+    // reached only via Mark Completed now.
+    if (authorized && d.status === "pending_review" && can("review")) {
+      var confirmBtn = el("button", "btn primary", "Confirm Completion");
+      confirmBtn.addEventListener("click", function () { review(d.id, true, refreshModal); });
+      var sendBackBtn = el("button", "btn ghost-crit", "Send Back");
+      sendBackBtn.addEventListener("click", function () { review(d.id, false, refreshModal); });
+      actionsRow.appendChild(confirmBtn); actionsRow.appendChild(sendBackBtn);
+    }
+
+    } // !d.project_terminal
+
+    var isOwnerOrAdmin = CURRENT_ROLE === "Admin" ||
+      (actingEmail() && (d.owner_emails || []).map(function (e) { return (e || "").trim().toLowerCase(); }).indexOf(actingEmail().trim().toLowerCase()) !== -1);
+    // Item 108: reopening a Not Required item undoes an admin's earlier
+    // call, so it's admin-only — symmetric with markNotRequiredButton's
+    // own gating, unlike the approved case which the owner can also do.
+    var canReopen = (d.status === "approved" && isOwnerOrAdmin) || (d.status === "not_required" && CURRENT_ROLE === "Admin");
+    if (canReopen) {
+      var reopenBtn = el("button", "btn ghost-crit", "Reopen");
+      reopenBtn.addEventListener("click", async function () {
+        var confirmMsg = d.status === "not_required"
+          ? "It'll go back into the normal workflow and need a submission again."
+          : "It'll go back into the normal workflow for more work.";
+        if (!(await customConfirm(confirmMsg, { title: "Reopen " + d.item_no + "?", danger: true, okLabel: "Reopen" }))) return;
+        try {
+          await api("/api/deliverables/" + d.id + "/reopen?actor_role=" + encodeURIComponent(CURRENT_ROLE) +
+            "&actor_email=" + encodeURIComponent(actingEmail()), { method: "POST" });
+        } catch (err) {
+          showToast("Could not reopen – " + apiErrorDetail(err), true);
+          return;
+        }
+        showToast(d.item_no + " reopened");
+        refreshModal();
+      });
+      actionsRow.appendChild(reopenBtn);
+    }
+    // Admin escape hatch: downstream predecessor-chained items anchor off
+    // this deliverable's real completion date (reviewed_at), not its
+    // planned due_date -- if that recorded date is wrong (test/placeholder
+    // data, a mis-set approval) it silently pulls every dependent item's
+    // schedule along with it. Lets an admin correct it directly rather than
+    // Reopen + re-approve just to fix a date.
+    if (CURRENT_ROLE === "Admin" && d.status === "approved") {
+      var editCompletionBtn = el("button", "btn", "Edit Completion Date");
+      editCompletionBtn.addEventListener("click", function () {
+        openChecklistEditModal({
+          type: "date",
+          title: "Edit Completion Date",
+          eyebrow: "Items chained off " + d.item_no + " recompute their due dates from this date.",
+          selected: d.reviewed_at ? d.reviewed_at.slice(0, 10) : "",
+          onSave: function (nextDate) {
+            if (!nextDate) { showToast("Pick a date", true); return; }
+            api("/api/deliverables/" + d.id + "/completion-date", {
+              method: "POST", headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({ completion_date: nextDate, actor_role: CURRENT_ROLE, actor_email: actingEmail() }),
+            }).then(function () {
+              closeChecklistEditModal();
+              showToast("Completion date updated");
+              refreshModal();
+            }).catch(function (err) { showToast("Could not update &#8211; " + apiErrorDetail(err), true); });
+          },
+        });
+      });
+      actionsRow.appendChild(editCompletionBtn);
+    }
+    body.appendChild(actionsRow);
+
+    // Item 143 (2nd revision): workflow nudges -- a reminder to close out
+    // once documents are in, or while waiting on the SME's confirmation.
+    if (authorized && d.on_hold) {
+      body.appendChild(el("div", "modal-hint", "On hold" + (d.hold_reason ? " &#8211; " + d.hold_reason : "") + "."));
+    } else if (authorized && d.pending_due_date_request) {
+      var pr = d.pending_due_date_request;
+      body.appendChild(el("div", "modal-hint",
+        (pr.kind === "extension" ? "Extension" : "Hold") + " requested" +
+        (pr.kind === "extension" && pr.requested_due_date ? " (new date: " + fmtDate(pr.requested_due_date) + ")" : "") +
+        " &#8211; awaiting SME/Admin decision. &#8220;" + pr.reason + "&#8221;"));
+    } else if (authorized && d.status === "in_progress") {
+      body.appendChild(el("div", "modal-hint", "Mark Completed if no more documents are needed."));
+    } else if (authorized && d.status === "pending_review") {
+      body.appendChild(el("div", "modal-hint", "Awaiting SME confirmation."));
+    }
+
+    // Item 107: the primary upload is already mirrored into the Documents
+    // list below (same as any other upload) — a separate "Primary File"
+    // link here just duplicated it.
+    if (authorized && (d.review_comment || d.completion_note)) {
+      body.appendChild(el("div", "deliv-comment", "&#128172; " + (d.review_comment || d.completion_note)));
+    }
+
+    body.appendChild(el("div", "modal-section-title", "Documents"));
+    if (!authorized) {
+      // Item 143 (2nd revision): per-document review no longer exists, so
+      // there's no more partial mid-flight visibility -- documents are
+      // visible to everyone only once the whole deliverable is Completed,
+      // same as item 7's original rule.
+      if (d.status === "approved" && d.documents.length) {
+        d.documents.forEach(function (doc) {
+          var row = el("div", "doc-row");
+          var main = el("div", "doc-main");
+          var link = el("a", "", doc.file_name);
+          link.href = doc.file_url; link.target = "_blank"; link.rel = "noopener";
+          main.appendChild(link);
+          main.appendChild(el("div", "doc-sub", "Submitted by " + (doc.uploaded_by || "&#8213;")));
+          row.appendChild(main);
+          body.appendChild(row);
+        });
+      } else {
+        body.appendChild(el("div", "empty-state",
+          d.status === "approved" ? "No documents were attached." : "Documents are visible once this deliverable is Completed."));
+      }
+    } else {
+      if (!d.documents.length) body.appendChild(el("div", "empty-state", "No documents yet."));
+      d.documents.forEach(function (doc) {
+        var row = el("div", "doc-row");
+        var main = el("div", "doc-main");
+        var link = el("a", "", doc.file_name);
+        link.href = doc.file_url; link.target = "_blank"; link.rel = "noopener";
+        main.appendChild(link);
+        main.appendChild(el("div", "doc-sub", "Submitted by " + (doc.uploaded_by || "&#8213;")));
+        row.appendChild(main);
+        body.appendChild(row);
+      });
+      // Item 161: this used to have its own "Upload" button here too, a
+      // second control doing the same thing as the actionsRow Upload above
+      // (same canUpload gate) but through a different endpoint with a
+      // different confirmation message -- confusing since both were
+      // labeled identically. One Upload control is enough; the actionsRow
+      // button already refreshes this whole modal (including this list)
+      // after a successful upload.
+    }
+
+    body.appendChild(el("div", "modal-section-title", "Activity"));
+    if (!authorized) {
+      body.appendChild(el("div", "empty-state", "Owner/SME/Admin only."));
+    } else if (!d.history.length) {
+      body.appendChild(el("div", "empty-state", "No activity yet."));
+    } else {
+      d.history.slice().reverse().forEach(function (ev) {
+        var row = el("div", "journey-event");
+        row.appendChild(el("div", "journey-event-ic", HISTORY_ACTION_ICON[ev.action] || "&#128276;"));
+        var main = el("div", "journey-event-main");
+        var when = new Date(ev.at).toLocaleString("en-GB", { day: "2-digit", month: "short", year: "numeric", hour: "2-digit", minute: "2-digit" });
+        main.appendChild(el("div", "journey-event-top", '<span class="journey-event-time">' + when + "</span>"));
+        main.appendChild(el("div", "journey-event-sub",
+          ev.action.replace(/_/g, " ") + " by <b>" + (ev.actor || "system") + "</b>" + (ev.note ? " &#8212; " + ev.note : "")));
+        row.appendChild(main);
+        body.appendChild(row);
+      });
+    }
+
+    document.getElementById("delivModalOverlay").hidden = false;
+  }
+
+  // Item [due-date requests]: Owner's Request Extension / Put On Hold form --
+  // a proper small modal (date + reason) rather than the raw prompt()
+  // dialogs the older Reassign button still uses, reusing the same
+  // .modal-card/.modal-body shell as the checklist-edit modal.
+  function openDueDateRequestModal(submissionId, kind, itemLabel, onDone) {
+    var isExtension = kind === "extension";
+    document.getElementById("dueDateRequestEyebrow").textContent = itemLabel;
+    document.getElementById("dueDateRequestTitle").textContent = isExtension ? "Request Extension" : "Put On Hold";
+    document.getElementById("dueDateRequestDateField").style.display = isExtension ? "" : "none";
+    document.getElementById("dueDateRequestDate").value = "";
+    var reasonLabel = document.getElementById("dueDateRequestReasonLabel");
+    reasonLabel.innerHTML = (isExtension ? "Reason" : "Reason (missing data / technical issue)") + ' <span class="req">*</span>';
+    var reasonInput = document.getElementById("dueDateRequestReason");
+    reasonInput.value = "";
+    var submitBtn = document.getElementById("dueDateRequestSubmit");
+    var newSubmitBtn = submitBtn.cloneNode(true); // drop any listener from a previous open
+    submitBtn.parentNode.replaceChild(newSubmitBtn, submitBtn);
+    newSubmitBtn.addEventListener("click", async function () {
+      var reason = reasonInput.value.trim();
+      if (!reason) { showToast("A reason is required", true); return; }
+      var dateVal = document.getElementById("dueDateRequestDate").value;
+      if (isExtension && !dateVal) { showToast("A requested due date is required", true); return; }
+      try {
+        await api("/api/deliverables/" + submissionId + "/" + kind + "-request", {
+          method: "POST", headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            reason: reason, requested_due_date: isExtension ? dateVal : null,
+            actor_name: CURRENT_ROLE, actor_role: CURRENT_ROLE, actor_email: actingEmail(),
+          }),
+        });
+      } catch (err) {
+        showToast("Could not submit request &#8211; " + apiErrorDetail(err), true);
+        return;
+      }
+      document.getElementById("dueDateRequestOverlay").hidden = true;
+      showToast((isExtension ? "Extension" : "Hold") + " requested &#8211; pending SME/Admin approval");
+      if (onDone) onDone();
+    });
+    document.getElementById("dueDateRequestOverlay").hidden = false;
+  }
+  document.getElementById("dueDateRequestClose").addEventListener("click", function () {
+    document.getElementById("dueDateRequestOverlay").hidden = true;
+  });
+  document.getElementById("dueDateRequestCancel").addEventListener("click", function () {
+    document.getElementById("dueDateRequestOverlay").hidden = true;
+  });
+
+  // Follow Up bulk reminder modal -- opened either from the per-row
+  // "Remind" button (a single id) or "Send Reminders..." (every id
+  // currently shown), same modal either way so the recipient-mix/message/
+  // attachment options aren't duplicated between the two entry points.
+  // Item 29: `items` are full deliverable-like objects (id + item_no/name/
+  // est_no to actually show, not just the id) -- each gets its own
+  // checkbox, checked by default, so a reminder can be trimmed down right
+  // here before it goes out instead of being a fixed, invisible set
+  // decided entirely by whichever filters were active on the page that
+  // opened this.
+  function _remindSelectedIds() {
+    return Array.from(document.querySelectorAll('#remindDelivChecklist input[type="checkbox"]:checked'))
+      .map(function (cb) { return parseInt(cb.value, 10); });
+  }
+  function _updateRemindModalCount() {
+    var n = _remindSelectedIds().length;
+    document.getElementById("remindModalCount").textContent =
+      n + " of " + document.querySelectorAll('#remindDelivChecklist input[type="checkbox"]').length + " deliverable(s) selected.";
+  }
+  function openRemindModal(items, onDone) {
+    document.getElementById("remindModalTitle").textContent = items.length === 1 ? "Send Reminder" : "Send Reminders";
+    var checklist = document.getElementById("remindDelivChecklist");
+    checklist.innerHTML = "";
+    items.forEach(function (d) {
+      var row = el("label", "remind-deliv-row");
+      row.innerHTML = '<input type="checkbox" value="' + d.id + '" checked />' +
+        '<span>' + (d.item_no ? d.item_no + " &middot; " : "") + (d.name || "") +
+        (d.est_no ? ' <span class="remind-deliv-est">' + d.est_no + '</span>' : "") + "</span>";
+      row.querySelector("input").addEventListener("change", _updateRemindModalCount);
+      checklist.appendChild(row);
+    });
+    _updateRemindModalCount();
+    document.getElementById("remindIncludeOwner").checked = true;
+    document.getElementById("remindIncludeSme").checked = false;
+    document.getElementById("remindIncludeManager").checked = false;
+    document.getElementById("remindExtraEmails").value = "";
+    document.getElementById("remindMessage").value = "";
+    document.getElementById("remindAttachments").value = "";
+    var sendBtn = document.getElementById("remindModalSend");
+    var newSendBtn = sendBtn.cloneNode(true); // drop any listener from a previous open
+    sendBtn.parentNode.replaceChild(newSendBtn, sendBtn);
+    newSendBtn.addEventListener("click", async function () {
+      var ids = _remindSelectedIds();
+      if (!ids.length) { showToast("Pick at least one deliverable", true); return; }
+      newSendBtn.disabled = true;
+      try {
+        var fd = new FormData();
+        fd.append("submission_ids", JSON.stringify(ids));
+        fd.append("actor_role", CURRENT_ROLE);
+        var msg = document.getElementById("remindMessage").value.trim();
+        if (msg) fd.append("message", msg);
+        fd.append("include_owner", document.getElementById("remindIncludeOwner").checked);
+        fd.append("include_sme", document.getElementById("remindIncludeSme").checked);
+        fd.append("include_manager", document.getElementById("remindIncludeManager").checked);
+        var extra = document.getElementById("remindExtraEmails").value.trim();
+        if (extra) fd.append("additional_emails", extra);
+        var files = document.getElementById("remindAttachments").files;
+        for (var i = 0; i < files.length; i++) fd.append("files", files[i]);
+        var res;
+        try {
+          res = await api("/api/deliverables/bulk-remind-advanced", { method: "POST", body: fd });
+        } catch (err) {
+          showToast("Could not send &#8211; " + apiErrorDetail(err), true);
+          return;
+        }
+        document.getElementById("remindModalOverlay").hidden = true;
+        showToast("Sent " + res.sent + " reminder(s)" +
+          (res.skipped ? " (" + res.skipped + " skipped &#8211; no recipients selected)" : ""));
+        if (onDone) onDone();
+      } finally {
+        newSendBtn.disabled = false;
+      }
+    });
+    document.getElementById("remindModalOverlay").hidden = false;
+  }
+  document.getElementById("remindModalClose").addEventListener("click", function () {
+    document.getElementById("remindModalOverlay").hidden = true;
+  });
+  document.getElementById("remindModalCancel").addEventListener("click", function () {
+    document.getElementById("remindModalOverlay").hidden = true;
+  });
+
+  // Self-service SME nomination -- open to everyone, but the nominee's own
+  // name/email are resolved from the L0-L1 Group roster (not typed), and
+  // each picked item queues as its own row for an Admin to approve/reject
+  // individually (see loadFollowUp's smeNomList further down).
+  var smeNomStage = "L0", smeNomItems = [], smeNomSelected = {}, smeNomEmail = "", smeNomName = "";
+  async function openSmeNomModal() {
+    var overlay = document.getElementById("smeNomOverlay");
+    var notInRoster = document.getElementById("smeNomNotInRoster");
+    var form = document.getElementById("smeNomForm");
+    var identityLine = document.getElementById("smeNomIdentityLine");
+    var email = passiveIdentity();
+    var users = await api("/api/departments/users");
+    var match = email && users.find(function (u) { return u.email.trim().toLowerCase() === email.trim().toLowerCase(); });
+    if (!match) {
+      notInRoster.hidden = false;
+      form.hidden = true;
+      identityLine.textContent = email ? ("We don't recognize " + email + " in the roster.") : "";
+      overlay.hidden = false;
+      return;
+    }
+    notInRoster.hidden = true;
+    form.hidden = false;
+    smeNomEmail = match.email; smeNomName = match.name;
+    identityLine.textContent = "Nominating as " + (match.name || match.email) + " (" + match.email + ")";
+    smeNomSelected = {};
+    document.getElementById("smeNomFilter").value = "";
+    smeNomStage = "L0";
+    document.querySelectorAll("#smeNomStageToggle .chip").forEach(function (b) { b.classList.toggle("active", b.dataset.stage === "L0"); });
+    await loadSmeNomItems();
+    overlay.hidden = false;
+  }
+  async function loadSmeNomItems() {
+    smeNomItems = await api("/api/departments/deliverable-focal?stage=" + smeNomStage);
+    renderSmeNomItems();
+  }
+  function _itemSortKey(itemNo) {
+    return (itemNo || "").split(".").map(function (p) { return ("000" + p).slice(-4); }).join(".");
+  }
+  // Keeps the count on the submit button itself, live, as items are
+  // (de)selected -- so any accidental selection loss (stage-switch reset,
+  // etc.) is visible immediately instead of only after submitting and
+  // getting fewer nominations than expected.
+  function _updateSmeNomSubmitLabel() {
+    var count = Object.keys(smeNomSelected).length;
+    document.getElementById("smeNomSubmit").textContent = count ? "Submit Nomination (" + count + ")" : "Submit Nomination";
+  }
+  function renderSmeNomItems() {
+    _updateSmeNomSubmitLabel();
+    var filterText = document.getElementById("smeNomFilter").value.trim().toLowerCase();
+    var wrap = document.getElementById("smeNomItemList");
+    wrap.innerHTML = "";
+    var filtered = smeNomItems.filter(function (d) {
+      return !filterText || (d.item_no + " " + d.name).toLowerCase().indexOf(filterText) !== -1;
+    });
+    if (!filtered.length) {
+      wrap.appendChild(el("div", "empty-state", "No matching items."));
+      return;
+    }
+    // The backend list sorts by department NUMBER then item_no (right for
+    // the Focal Points table it's normally used for) -- same-numbered
+    // sibling departments (Operation Units' TBU/PBU/DBU/BBU, Engineering/
+    // Engineering (PBU), etc.) end up interleaved item-by-item rather than
+    // grouped, so this view re-groups by the exact department name and
+    // sorts within each group instead of trusting incoming order.
+    filtered = filtered.slice().sort(function (a, b) {
+      if (a.department_number !== b.department_number) return (a.department_number || 0) - (b.department_number || 0);
+      if (a.department !== b.department) return a.department < b.department ? -1 : 1;
+      return _itemSortKey(a.item_no) < _itemSortKey(b.item_no) ? -1 : 1;
+    });
+    var lastDept = null;
+    filtered.forEach(function (d) {
+      if (d.department !== lastDept) {
+        wrap.appendChild(el("div", "deliv-subheader", deptLabel(d.department, d.department_number)));
+        lastDept = d.department;
+      }
+      var already = (d.default_sme_emails || []).some(function (e) { return e.toLowerCase() === smeNomEmail.toLowerCase(); });
+      var row = el("label", "scope-opt");
+      row.style.padding = "6px 18px";
+      var cb = el("input"); cb.type = "checkbox";
+      cb.checked = !already && !!smeNomSelected[d.id];
+      cb.disabled = already;
+      cb.addEventListener("change", function () {
+        if (cb.checked) smeNomSelected[d.id] = true; else delete smeNomSelected[d.id];
+        _updateSmeNomSubmitLabel();
+      });
+      row.appendChild(cb);
+      row.appendChild(document.createTextNode(d.item_no + " · " + d.name + (already ? " (already SME)" : "")));
+      wrap.appendChild(row);
+    });
+    _updateSmeNomSubmitLabel();
+  }
+  document.querySelectorAll("#smeNomStageToggle .chip").forEach(function (btn) {
+    btn.addEventListener("click", async function () {
+      // Load-bearing guard: re-clicking the already-active stage chip used
+      // to still wipe smeNomSelected unconditionally below, silently
+      // dropping every item the user had already picked with no visual
+      // sign anything happened (the reloaded list looks identical, just
+      // unchecked) -- a real report of "picked several items, only one
+      // ended up submitted" traced back to exactly this.
+      if (btn.dataset.stage === smeNomStage) return;
+      document.querySelectorAll("#smeNomStageToggle .chip").forEach(function (b) { b.classList.remove("active"); });
+      btn.classList.add("active");
+      smeNomStage = btn.dataset.stage;
+      smeNomSelected = {}; // item ids aren't comparable across stages
+      await loadSmeNomItems();
+    });
+  });
+  document.getElementById("smeNomFilter").addEventListener("input", renderSmeNomItems);
+  document.getElementById("becomeSmeBtn").addEventListener("click", openSmeNomModal);
+  function closeSmeNomModal() { document.getElementById("smeNomOverlay").hidden = true; }
+  document.getElementById("smeNomClose").addEventListener("click", closeSmeNomModal);
+  document.getElementById("smeNomCancel").addEventListener("click", closeSmeNomModal);
+  document.getElementById("smeNomSubmit").addEventListener("click", async function () {
+    var ids = Object.keys(smeNomSelected).map(Number);
+    if (!ids.length) { showToast("Pick at least one item", true); return; }
+    var result;
+    try {
+      result = await api("/api/departments/sme-nominations", {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ email: smeNomEmail, name: smeNomName, definition_ids: ids }),
+      });
+    } catch (err) {
+      showToast("Could not submit &#8211; " + apiErrorDetail(err), true);
+      return;
+    }
+    closeSmeNomModal();
+    if (result.created) {
+      showToast("Nominated for " + result.created + " item" + (result.created === 1 ? "" : "s") + " &#8211; pending admin approval");
+    } else {
+      showToast("Already SME or already pending for everything you picked", true);
+    }
+  });
+
+  // Self-service "add someone to the L0-L1 Group" request -- open to
+  // everyone already in the roster themselves (same gate as Become an SME
+  // above); an Admin approves/rejects in Requests -> Group Add Requests.
+  var groupInviteRequesterEmail = "", groupInviteRequesterName = "";
+  async function openGroupInviteModal() {
+    var overlay = document.getElementById("groupInviteOverlay");
+    var notInRoster = document.getElementById("groupInviteNotInRoster");
+    var form = document.getElementById("groupInviteForm");
+    var identityLine = document.getElementById("groupInviteIdentityLine");
+    var email = passiveIdentity();
+    var users = await api("/api/departments/users");
+    var match = email && users.find(function (u) { return u.email.trim().toLowerCase() === email.trim().toLowerCase(); });
+    if (!match) {
+      notInRoster.hidden = false;
+      form.hidden = true;
+      identityLine.textContent = email ? ("We don't recognize " + email + " in the roster.") : "";
+      overlay.hidden = false;
+      return;
+    }
+    notInRoster.hidden = true;
+    form.hidden = false;
+    groupInviteRequesterEmail = match.email; groupInviteRequesterName = match.name;
+    identityLine.textContent = "Requesting as " + (match.name || match.email) + " (" + match.email + ")";
+    document.getElementById("groupInviteName").value = "";
+    document.getElementById("groupInviteEmail").value = "";
+    document.getElementById("groupInviteRole").value = "Viewer";
+    overlay.hidden = false;
+  }
+  document.getElementById("groupInviteBtn").addEventListener("click", openGroupInviteModal);
+  function closeGroupInviteModal() { document.getElementById("groupInviteOverlay").hidden = true; }
+  document.getElementById("groupInviteClose").addEventListener("click", closeGroupInviteModal);
+  document.getElementById("groupInviteCancel").addEventListener("click", closeGroupInviteModal);
+  document.getElementById("groupInviteSubmit").addEventListener("click", async function () {
+    var name = document.getElementById("groupInviteName").value.trim();
+    var email = document.getElementById("groupInviteEmail").value.trim();
+    var role = document.getElementById("groupInviteRole").value;
+    if (!email) { showToast("Email is required", true); return; }
+    try {
+      await api("/api/departments/user-add-requests", {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ email: email, name: name || null, role: role, requested_by_email: groupInviteRequesterEmail }),
+      });
+    } catch (err) {
+      showToast("Could not submit &#8211; " + apiErrorDetail(err), true);
+      return;
+    }
+    closeGroupInviteModal();
+    showToast("Request submitted &#8211; pending admin approval");
+  });
+
+  /* ================= PROJECT DETAIL ================= */
+  var currentProjectId = null, currentProjectStage = "L0", currentProjectTerminal = false, currentDeptOpen = null;
+  async function openDetail(id, highlightSubmissionId) {
+    currentProjectId = id;
+    // Always land back on Deliverables, not wherever the previously-viewed
+    // project's Activity Trail tab happened to leave things (item 96).
+    document.querySelectorAll("#dSubTabs .chip").forEach(function (b) { b.classList.toggle("active", b.dataset.tab === "deliverables"); });
+    document.getElementById("dDeliverablesPane").style.display = "";
+    document.getElementById("dTrailPane").style.display = "none";
+    document.getElementById("dPoLifecyclePane").style.display = "none";
+    // Item 112: hide the triage banner/pill synchronously, before the
+    // await below -- otherwise a just-completed triage's own re-render
+    // (openDetail() called right after confirming) briefly shows the
+    // previous "Complete Triage" state on screen until the fresh project
+    // data comes back and says it's actually done.
+    document.getElementById("dTriageBanner").hidden = true;
+    document.getElementById("dTriagePill").hidden = true;
+    // Item 157: this function makes several sequential API calls before
+    // finally switching to the detail view -- previously, if any of them
+    // failed (a transient network hiccup, cold-start timeout), the whole
+    // thing silently aborted right there with no error shown, leaving the
+    // click looking like it just didn't do anything. Now a failure at any
+    // point surfaces as a toast instead of a dead end.
+    try {
+    var p = await api("/api/projects/" + id);
+    // [Bid Value]: fetched separately from ProjectOut on purpose -- the
+    // ordinary project payload never carries this value at all, so a
+    // non-BM/Admin viewer's browser never even receives it to begin with.
+    var bidValueInfo = null;
+    if (p.stage === "L1") {
+      try {
+        bidValueInfo = await api("/api/projects/" + id + "/bid-value?actor_role=" + encodeURIComponent(CURRENT_ROLE) + "&actor_email=" + encodeURIComponent(actingEmail()));
+      } catch (e) {}
+    }
+    currentProjectStage = p.stage;
+    document.getElementById("dPoTabBtn").style.display = (p.stage === "L1") ? "" : "none";
+    currentProjectTerminal = (p.stage === "L0" && (p.status === "Submitted" || p.status === "Cancelled")) ||
+      (p.stage === "L1" && p.status === "Completed");
+    document.getElementById("dTerminalBanner").hidden = !currentProjectTerminal;
+    // [tight-BSD duration ratio]: only ever set (non-1.0) on L0 -- see
+    // rules._apply_duration_ratio. Always flagged when compression is in
+    // use at all, not just when it's insufficient, per the product call.
+    var ratioBanner = document.getElementById("dDurationRatioBanner");
+    var ratio = p.duration_ratio == null ? 1.0 : p.duration_ratio;
+    if (p.stage === "L0" && ratio < 1.0) {
+      ratioBanner.hidden = false;
+      ratioBanner.classList.toggle("insufficient", !!p.duration_ratio_insufficient);
+      var pct = Math.round(ratio * 100);
+      ratioBanner.textContent = p.duration_ratio_insufficient
+        ? "⚠ Tight BSD: durations were compressed to " + pct + "% of standard, and even that still isn't enough — some deliverables are due after the Bid Submission Date."
+        : "⏱ Tight BSD: standard item durations didn't fit before the Bid Submission Date, so they were compressed to " + pct + "% to make everything fit.";
+    } else {
+      ratioBanner.hidden = true;
+    }
+    var extendBtn = document.getElementById("dExtendBsdBtn");
+    extendBtn.hidden = !(p.stage === "L0" && can("create") && !currentProjectTerminal);
+    extendBtn.onclick = function () {
+      openChecklistEditModal({
+        type: "date",
+        title: "Extend Bid Submission Date",
+        eyebrow: "Every dependent deliverable due date recalculates automatically, and every user is notified.",
+        selected: p.bsd || "",
+        onSave: function (nextDate) {
+          if (!nextDate) { showToast("Pick a date", true); return; }
+          api("/api/projects/" + id + "/details", {
+            method: "PATCH", headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ bsd: nextDate, actor_role: CURRENT_ROLE }),
+          }).then(function () {
+            closeChecklistEditModal();
+            showToast("Bid Submission Date extended &#8211; announced to all users");
+            openDetail(id);
+          }).catch(function (err) { showToast("Could not update &#8211; " + apiErrorDetail(err), true); });
+        },
+      });
+    };
+    var triageBanner = document.getElementById("dTriageBanner");
+    var triagePill = document.getElementById("dTriagePill");
+    if (p.stage !== "L0") {
+      triageBanner.hidden = true;
+      triagePill.hidden = true;
+    } else if (p.pending_triage_count > 0) {
+      triageBanner.hidden = false;
+      document.getElementById("dTriageBannerText").textContent =
+        p.pending_triage_count + " deliverable(s) still need a Bid Manager applicable / not-required call.";
+      document.getElementById("dTriageBannerBtn").onclick = function () { openTriage(id); };
+      triagePill.hidden = false;
+      triagePill.className = "pill crit";
+      triagePill.innerHTML = '<span class="dot"></span>Triage Pending';
+    } else {
+      triageBanner.hidden = true;
+      triagePill.hidden = false;
+      triagePill.className = "pill good";
+      triagePill.innerHTML = '<span class="dot"></span>Triage Completed';
+    }
+    var stageBadge = document.getElementById("dStageBadge");
+    stageBadge.textContent = p.stage + " Stage";
+    stageBadge.className = "stage-badge " + (p.stage === "L0" ? "l0" : "l1");
+    document.getElementById("dIntlBadge").hidden = !p.is_international;
+    document.getElementById("dArchivedBadge").hidden = !p.archived;
+    document.getElementById("dArchivedBanner").hidden = !p.archived;
+    var archiveBtn = document.getElementById("dArchiveBtn");
+    archiveBtn.hidden = !can("create");
+    archiveBtn.textContent = p.archived ? "Unarchive Project" : "Archive Project";
+    archiveBtn.onclick = async function () {
+      var toArchive = !p.archived;
+      var msg = toArchive
+        ? "Archive " + p.est_no + "? It'll be hidden from every report, dashboard, and listing until an admin restores it."
+        : "Restore " + p.est_no + " to active? It'll show up in reports/dashboards/listings again.";
+      if (!(await customConfirm(msg, { danger: toArchive, okLabel: toArchive ? "Archive" : "Restore" }))) return;
+      try {
+        await api("/api/projects/" + id + "/archive", {
+          method: "PATCH", headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ archived: toArchive, actor_role: CURRENT_ROLE, actor_email: actingEmail() }),
+        });
+      } catch (err) {
+        showToast("Could not update &#8211; " + apiErrorDetail(err), true);
+        return;
+      }
+      showToast(toArchive ? "Project archived" : "Project restored");
+      openDetail(id);
+    };
+    document.getElementById("dTitle").textContent = p.est_no.toUpperCase() + " – " + p.name;
+    var l0LinkBtn = document.getElementById("dL0LinkBtn");
+    if (p.stage === "L1" && p.l0_source_id) {
+      l0LinkBtn.hidden = false;
+      l0LinkBtn.onclick = function () { openDetail(p.l0_source_id); };
+    } else {
+      l0LinkBtn.hidden = true;
+    }
+    var pill = document.getElementById("dStatusPill");
+    pill.className = "pill " + (PROJECT_STATUS_CLASS[p.status] || "neutral");
+    pill.innerHTML = '<span class="dot"></span>' + p.status;
+
+    var statusSel = document.getElementById("dStatusSelect");
+    if (can("create")) {
+      var statusOptions = ["In Progress"].concat(p.stage === "L0" ? ["Submitted", "Cancelled"] : ["Completed"]);
+      statusSel.innerHTML = "";
+      statusOptions.forEach(function (s) { var o = el("option", "", s); o.value = s; statusSel.appendChild(o); });
+      statusSel.value = p.status;
+      statusSel.style.display = "";
+      statusSel.onchange = async function () {
+        try {
+          await api("/api/projects/" + id + "/status", {
+            method: "PATCH", headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ status: statusSel.value }),
+          });
+        } catch (err) {
+          showToast("Could not update status &#8211; " + apiErrorDetail(err), true);
+          statusSel.value = p.status;
+          return;
+        }
+        showToast("Status updated to " + statusSel.value);
+        openDetail(id);
+      };
+    } else {
+      statusSel.style.display = "none";
+    }
+
+    var meta = document.getElementById("dMeta");
+    meta.innerHTML = "";
+    var buLabel = (p.business_units && p.business_units.length) ? sortBusinessUnits(p.business_units).join(" / ") : "&#8213;";
+    // [L0 International]: Country replaces Region in this row for these
+    // projects -- there is no region data to show for them.
+    var regionRow = p.is_international ? ["Country", p.country || "&#8213;", "country"] : ["Region", joinList(p.region), "region"];
+    var metaItems = p.stage === "L0"
+      ? [["Bid Manager", p.bid_manager || "&#8213;", "bm"], ["RFX", p.rfx_number || "&#8213;", "rfx"], regionRow, ["Scope", joinList(p.scope), "scope"],
+         ["Business Unit", buLabel, "bu"],
+         ["Announced", fmtDate(p.announcement_date), "date:announcement_date:Announcement Date"],
+         ["Site Visit", fmtDate(p.site_visit_date), "date:site_visit_date:Site Visit Date"],
+         ["Pre-Bid Meeting", fmtDate(p.pre_bid_meeting_date), "date:pre_bid_meeting_date:Pre-Bid Meeting Date"],
+         ["Pre-Bid Deadline", fmtDate(p.pre_bid_deadline), "date:pre_bid_deadline:Pre-Bid Deadline"],
+         // Item 149: BSD is editable like every other anchor date -- extending
+         // it recomputes every dependent deliverable's due date the same way
+         // any other date-field edit already does (see the shared "date:"
+         // handler above and update_project_details's date_changed loop).
+         ["Bid Submission Date", fmtDate(p.bsd), "date:bsd:Bid Submission Date"]]
+      : [["Bid Manager", p.bid_manager || "&#8213;", "bm"], ["Project Manager", p.project_manager || "&#8213;", "pm"],
+         ["Region", joinList(p.region), "region"], ["Scope", joinList(p.scope), "scope"], ["Business Unit", buLabel, "bu"],
+         ["Announced", fmtDate(p.announcement_date), "date:announcement_date:Announcement Date"],
+         ["Contract Status", p.contract_status === "Signed"
+           ? '<span class="pill good"><span class="dot"></span>Signed</span>'
+           : (p.contract_status || "&#8213;")]];
+    metaItems.forEach(function (m) {
+      var mi = el("div", "meta-item");
+      mi.appendChild(el("div", "mk", m[0]));
+      var mv = el("div", "mv", m[1]);
+      var tag = m[2];
+      if (tag && can("create") && !currentProjectTerminal) {
+        var editLink = el("a", "meta-edit-link", "Edit");
+        editLink.href = "#";
+        editLink.addEventListener("click", async function (e) {
+          e.preventDefault();
+          if (tag === "pm") {
+            openChecklistEditModal({
+              type: "text",
+              title: "Edit Project Manager",
+              eyebrow: "Setting this also auto-completes 2.3 (Assignment of Temporary Project Manager & Project Engineer) if it isn't already.",
+              placeholder: "Project Manager name",
+              selected: p.project_manager || "",
+              onSave: function (nextPm) {
+                api("/api/projects/" + id + "/project-manager", {
+                  method: "PATCH", headers: { "Content-Type": "application/json" },
+                  body: JSON.stringify({ project_manager: (nextPm || "").trim() || null }),
+                }).then(function () { closeChecklistEditModal(); showToast("Project Manager updated"); openDetail(id); })
+                  .catch(function (err) { showToast("Could not update &#8211; " + apiErrorDetail(err), true); });
+              },
+            });
+          } else if (tag === "bm") {
+            var opts = await getCreateOptions();
+            openChecklistEditModal({
+              type: "select",
+              title: "Edit Bid Manager",
+              options: opts.bid_managers,
+              selected: p.bid_manager || "",
+              onSave: function (nextBm) {
+                if (!nextBm) return;
+                api("/api/projects/" + id + "/details", {
+                  method: "PATCH", headers: { "Content-Type": "application/json" },
+                  body: JSON.stringify({ bid_manager: nextBm, actor_role: CURRENT_ROLE }),
+                }).then(function () { closeChecklistEditModal(); showToast("Bid Manager updated"); openDetail(id); })
+                  .catch(function (err) { showToast("Could not update &#8211; " + apiErrorDetail(err), true); });
+              },
+            });
+          } else if (tag === "rfx") {
+            openChecklistEditModal({
+              type: "text",
+              title: "Edit RFX Number",
+              placeholder: "RFX Number",
+              selected: p.rfx_number || "",
+              onSave: function (nextRfx) {
+                api("/api/projects/" + id + "/details", {
+                  method: "PATCH", headers: { "Content-Type": "application/json" },
+                  body: JSON.stringify({ rfx_number: nextRfx || null, actor_role: CURRENT_ROLE }),
+                }).then(function () { closeChecklistEditModal(); showToast("RFX updated"); openDetail(id); })
+                  .catch(function (err) { showToast("Could not update &#8211; " + apiErrorDetail(err), true); });
+              },
+            });
+          } else if (tag === "country") {
+            openChecklistEditModal({
+              type: "text",
+              title: "Edit Country",
+              placeholder: "Country",
+              selected: p.country || "",
+              onSave: function (nextCountry) {
+                if (!nextCountry) { showToast("Country is required", true); return; }
+                api("/api/projects/" + id + "/details", {
+                  method: "PATCH", headers: { "Content-Type": "application/json" },
+                  body: JSON.stringify({ country: nextCountry, actor_role: CURRENT_ROLE }),
+                }).then(function () { closeChecklistEditModal(); showToast("Country updated"); openDetail(id); })
+                  .catch(function (err) { showToast("Could not update &#8211; " + apiErrorDetail(err), true); });
+              },
+            });
+          } else if (tag === "scope") {
+            var sopts = await getCreateOptions();
+            openChecklistEditModal({
+              eyebrow: "Only allowed before this tender has any real progress — changing it regenerates the deliverable list to match.",
+              title: "Edit Scope",
+              options: sopts.scopes,
+              selected: p.scope || [],
+              hasOther: true,
+              otherValue: p.scope_other || "",
+              onSave: function (scopeArr, scopeOther) {
+                if (!scopeArr.length) { showToast("Select at least one Scope", true); return; }
+                api("/api/projects/" + id + "/details", {
+                  method: "PATCH", headers: { "Content-Type": "application/json" },
+                  body: JSON.stringify({ scope: scopeArr, scope_other: scopeOther || null, actor_role: CURRENT_ROLE }),
+                }).then(function () { closeChecklistEditModal(); showToast("Scope updated &#8211; deliverables regenerated"); openDetail(id); })
+                  .catch(function (err) { showToast("Could not update &#8211; " + apiErrorDetail(err), true); });
+              },
+            });
+          } else if (tag === "bu") {
+            openChecklistEditModal({
+              eyebrow: "Only allowed before this tender has any real progress — changing it regenerates the deliverable list to match.",
+              title: "Edit Business Unit",
+              options: ["TBU", "PBU", "DBU", "BBU", "IBU", "TBA"],
+              selected: p.business_units || [],
+              hasOther: false,
+              onSave: function (buArr) {
+                if (!buArr.length) { showToast("Select at least one Business Unit", true); return; }
+                api("/api/projects/" + id + "/details", {
+                  method: "PATCH", headers: { "Content-Type": "application/json" },
+                  body: JSON.stringify({ business_units: buArr, actor_role: CURRENT_ROLE }),
+                }).then(function () { closeChecklistEditModal(); showToast("Business Unit updated &#8211; deliverables regenerated"); openDetail(id); })
+                  .catch(function (err) { showToast("Could not update &#8211; " + apiErrorDetail(err), true); });
+              },
+            });
+          } else if (tag === "region") {
+            var ropts = await getCreateOptions();
+            openChecklistEditModal({
+              title: "Edit Region",
+              options: ropts.regions,
+              selected: p.region || [],
+              hasOther: true,
+              otherValue: p.region_other || "",
+              onSave: function (regionArr, regionOther) {
+                if (!regionArr.length) { showToast("Select at least one Region", true); return; }
+                api("/api/projects/" + id + "/details", {
+                  method: "PATCH", headers: { "Content-Type": "application/json" },
+                  body: JSON.stringify({ region: regionArr, region_other: regionOther || null, actor_role: CURRENT_ROLE }),
+                }).then(function () { closeChecklistEditModal(); showToast("Region updated"); openDetail(id); })
+                  .catch(function (err) { showToast("Could not update &#8211; " + apiErrorDetail(err), true); });
+              },
+            });
+          } else if (tag.indexOf("date:") === 0) {
+            var parts = tag.split(":");
+            var fieldName = parts[1], fieldLabel = parts[2];
+            var currentVal = p[fieldName] || "";
+            openChecklistEditModal({
+              type: "date",
+              title: "Edit " + fieldLabel,
+              selected: currentVal,
+              onSave: function (nextDate) {
+                if (!nextDate && fieldName === "announcement_date") { showToast("Announcement Date is required", true); return; }
+                var body = { actor_role: CURRENT_ROLE };
+                body[fieldName] = nextDate || null;
+                api("/api/projects/" + id + "/details", {
+                  method: "PATCH", headers: { "Content-Type": "application/json" },
+                  body: JSON.stringify(body),
+                }).then(function () { closeChecklistEditModal(); showToast(fieldLabel + " updated"); openDetail(id); })
+                  .catch(function (err) { showToast("Could not update &#8211; " + apiErrorDetail(err), true); });
+              },
+            });
+          }
+        });
+        mv.appendChild(document.createTextNode(" "));
+        mv.appendChild(editLink);
+      }
+      mi.appendChild(mv);
+      meta.appendChild(mi);
+    });
+
+    // [Bid Value]: not a generic metaItems/tag row -- its Edit link is
+    // gated to the Bid Manager or Admin specifically (rules.can_act against
+    // project.bid_manager), not the blanket can("create") === Admin-only
+    // check every other Edit link above uses. A locked row instead offers
+    // Request Access, or shows the outstanding request's own status.
+    if (p.stage === "L1" && bidValueInfo && (bidValueInfo.can_edit || bidValueInfo.has_value)) {
+      var bvItem = el("div", "meta-item");
+      bvItem.appendChild(el("div", "mk", "Bid Value"));
+      var bvVal = el("div", "mv");
+      if (bidValueInfo.visible) {
+        bvVal.insertAdjacentHTML("beforeend",
+          bidValueInfo.bid_value != null ? fmtCurrency(bidValueInfo.bid_value) : "&#8213;"
+        );
+        if (bidValueInfo.can_edit && !currentProjectTerminal) {
+          var bvEdit = el("a", "meta-edit-link", "Edit");
+          bvEdit.href = "#";
+          bvEdit.addEventListener("click", function (e) {
+            e.preventDefault();
+            openChecklistEditModal({
+              type: "text",
+              title: "Edit Bid Value",
+              eyebrow: "Hidden from everyone except the Bid Manager and Admin — others must request Admin approval to view it.",
+              placeholder: "Bid Value",
+              selected: bidValueInfo.bid_value != null ? String(bidValueInfo.bid_value) : "",
+              onSave: function (nextVal) {
+                var num = (nextVal || "").trim() ? Number(nextVal) : null;
+                if (nextVal && nextVal.trim() && Number.isNaN(num)) { showToast("Enter a valid number", true); return; }
+                api("/api/projects/" + id + "/bid-value", {
+                  method: "PATCH", headers: { "Content-Type": "application/json" },
+                  body: JSON.stringify({ bid_value: num, actor_role: CURRENT_ROLE, actor_email: actingEmail() }),
+                }).then(function () { closeChecklistEditModal(); showToast("Bid Value updated"); openDetail(id); })
+                  .catch(function (err) { showToast("Could not update &#8211; " + apiErrorDetail(err), true); });
+              },
+            });
+          });
+          bvVal.appendChild(document.createTextNode(" "));
+          bvVal.appendChild(bvEdit);
+        }
+      } else {
+        var lockPill = el("span", "pill neutral", '<span class="dot"></span>&#128274; Locked');
+        bvVal.appendChild(lockPill);
+        if (bidValueInfo.request_status === "pending") {
+          bvVal.appendChild(el("span", "meta-edit-link", " Request pending"));
+        } else {
+          var reqBtn = el("a", "meta-edit-link", " " + (bidValueInfo.request_status === "rejected" ? "Request again" : "Request access"));
+          reqBtn.href = "#";
+          reqBtn.addEventListener("click", function (e) {
+            e.preventDefault();
+            var email = actingEmail();
+            if (!email) { showToast("Enter your acting email first", true); return; }
+            api("/api/projects/" + id + "/bid-value/request-access", {
+              method: "POST", headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({ actor_email: email }),
+            }).then(function () { showToast("Access requested &#8211; an Admin will decide"); openDetail(id); })
+              .catch(function (err) { showToast("Could not request &#8211; " + apiErrorDetail(err), true); });
+          });
+          bvVal.appendChild(reqBtn);
+        }
+      }
+      bvItem.appendChild(bvVal);
+      meta.appendChild(bvItem);
+    }
+
+    var stepperCard = document.getElementById("dStepperCard");
+    if (p.stage === "L1") {
+      stepperCard.style.display = "";
+      var ms = await api("/api/projects/" + id + "/milestones");
+      var stepper = document.getElementById("dStepper");
+      stepper.innerHTML = "";
+      var lastDoneIdx = -1;
+      ms.forEach(function (m, i) { if (m.reached) lastDoneIdx = i; });
+      // Item [milestone stepper redesign]: the connecting line's filled
+      // portion reaches exactly to the last-reached dot's own center, not
+      // just some fraction of the row -- same center-of-column math as the
+      // dots themselves (col i's center sits at (i+.5)/count of the row),
+      // translated into the ::before/::after line's own coordinate space
+      // (which starts 4% in from the row edge, per .fs-row::before).
+      var progressPct = lastDoneIdx >= 0 ? Math.max(0, ((lastDoneIdx + 0.5) / ms.length) * 100 - 4) : 0;
+      stepper.style.setProperty("--fs-progress", progressPct + "%");
+      ms.forEach(function (m, i) {
+        var cls = "fs-step" + (m.reached ? " done" : (i === lastDoneIdx + 1 ? " current" : ""));
+        var step = el("div", cls);
+        step.appendChild(el("div", "fs-dot", m.reached ? FS_CHECK_SVG : m.code));
+        var label = el("div", "fs-label", m.code + " &middot; " + (L1_MILESTONE_LABELS[m.code] || m.name));
+        step.appendChild(label);
+        step.appendChild(el("div", "fs-date", m.reached ? fmtDate(m.actual_date) : "&#8213;"));
+        stepper.appendChild(step);
+      });
+    } else {
+      stepperCard.style.display = "none";
+    }
+
+    var allDeptsMeta = await api("/api/departments");
+    var deptFocal = {}, deptNumber = {};
+    allDeptsMeta.forEach(function (d) { deptFocal[d.name] = d.focal_point_name; deptNumber[d.name] = d.number; });
+    var allDelivs = await api("/api/projects/" + id + "/deliverables");
+    var tenderDocs = await api("/api/projects/" + id + "/tender-documents");
+    var deptNames = [];
+    allDelivs.forEach(function (d) { if (deptNames.indexOf(d.department) === -1) deptNames.push(d.department); });
+    var folders = document.getElementById("dFolders");
+    folders.innerHTML = "";
+    document.getElementById("dFolderCount").textContent = (deptNames.length + 1) + " total";
+    currentDeptOpen = deptNames.length ? deptNames[0] : null;
+
+    // Folder 0: plain project-level file storage, not a department -- no
+    // due date, owner, SME, or tracking of any kind, so it's built here as
+    // its own row rather than through makeFolderRow/renderDeliverables.
+    var tdRow = el("div", "folder-row");
+    tdRow.innerHTML =
+      '<div class="folder-left"><span class="folder-ic">&#128196;</span><div><div class="folder-name">0. Tender Documents</div>' +
+      '<div class="folder-focal">' + tenderDocs.length + " file" + (tenderDocs.length === 1 ? "" : "s") + '</div></div></div>' +
+      '<div class="folder-right"></div>';
+    tdRow.addEventListener("click", function () {
+      document.querySelectorAll(".folder-row").forEach(function (r) { r.classList.remove("active"); });
+      tdRow.classList.add("active");
+      currentDeptOpen = null;
+      document.getElementById("dDeliverTitle").textContent = "Tender Documents";
+      renderTenderDocs(tenderDocs, id);
+    });
+    folders.appendChild(tdRow);
+
+    function makeFolderRow(deptName, isChild) {
+      var deptItems = allDelivs.filter(function (d) { return d.department === deptName; });
+      // [PO Lifecycle placeholder visibility]: a pending-declaration
+      // placeholder isn't real trackable work yet -- excluded from the
+      // folder's own completion percentage the same way Not Required
+      // items already are, so it doesn't dilute the rate with something
+      // that can't be approved yet.
+      var realItems = deptItems.filter(function (d) { return !d.pending_declaration_note; });
+      var approved = realItems.filter(function (d) { return d.status === "approved"; }).length;
+      var pct = realItems.length ? Math.round((approved / realItems.length) * 100) : null;
+      var row = el("div", "folder-row" + (isChild ? " folder-row-child" : ""));
+      row.dataset.dept = deptName;
+      var label = isChild ? deptName.replace(/^.* \(([^)]+)\)$/, "$1") : deptLabel(deptName, deptNumber[deptName]);
+      row.innerHTML =
+        '<div class="folder-left"><span class="folder-ic">&#128193;</span><div><div class="folder-name">' + label + '</div>' +
+        '<div class="folder-focal">Focal: ' + (deptFocal[deptName] || "&#8213;") + '</div></div></div>' +
+        '<div class="folder-right"><span class="folder-pct">' + (pct === null ? "&#8213;" : pct + "%") + '</span></div>';
+      row.addEventListener("click", function () {
+        document.querySelectorAll(".folder-row").forEach(function (r) { r.classList.remove("active"); });
+        row.classList.add("active");
+        currentDeptOpen = deptName;
+        document.getElementById("dDeliverTitle").textContent = deptLabel(deptName, deptNumber[deptName]) + " Deliverables";
+        renderDeliverables(deptItems);
+      });
+      return row;
+    }
+    // Item 98: departments that share a common base name (e.g. Operation
+    // Units' TBU/PBU/DBU/BBU split, all "Operation Units (X)") nest as a
+    // group instead of appearing as separate same-numbered top-level rows.
+    var groupOrder = [], groups = {};
+    deptNames.forEach(function (deptName) {
+      var key = (deptName.match(/^(.*) \([^)]+\)$/) || [null, deptName])[1];
+      if (!groups[key]) { groups[key] = []; groupOrder.push(key); }
+      groups[key].push(deptName);
+    });
+    var firstRow = true;
+    groupOrder.forEach(function (key) {
+      var members = groups[key];
+      if (members.length === 1) {
+        var row = makeFolderRow(members[0], false);
+        if (firstRow) { row.classList.add("active"); firstRow = false; }
+        folders.appendChild(row);
+      } else {
+        var groupHead = el("div", "folder-group-head", '<span class="folder-ic">&#128193;</span>' + deptLabel(key, deptNumber[members[0]]));
+        folders.appendChild(groupHead);
+        members.forEach(function (deptName) {
+          var row = makeFolderRow(deptName, true);
+          if (firstRow) { row.classList.add("active"); firstRow = false; }
+          folders.appendChild(row);
+        });
+      }
+    });
+    var highlightItem = highlightSubmissionId
+      ? allDelivs.find(function (d) { return d.id === Number(highlightSubmissionId); })
+      : null;
+    var initialDept = highlightItem ? highlightItem.department : deptNames[0];
+    var initialDeptItems = deptNames.length ? allDelivs.filter(function (d) { return d.department === initialDept; }) : [];
+    document.getElementById("dDeliverTitle").textContent = deptNames.length ? deptLabel(initialDept, deptNumber[initialDept]) + " Deliverables" : "Deliverables";
+    currentDeptOpen = initialDept;
+    document.querySelectorAll(".folder-row").forEach(function (r) { r.classList.toggle("active", r.dataset.dept === initialDept); });
+    renderDeliverables(initialDeptItems);
+
+    switchView("detail");
+    location.hash = "project=" + id; // item 99 — survives a refresh
+    if (highlightItem) {
+      setTimeout(function () {
+        var target = document.querySelector('.deliv-row[data-sid="' + highlightSubmissionId + '"]');
+        if (target) {
+          target.scrollIntoView({ behavior: "smooth", block: "center" });
+          target.classList.add("flash");
+          setTimeout(function () { target.classList.remove("flash"); }, 1800);
+        }
+      }, 50);
+    }
+    } catch (err) {
+      showToast("Could not open this project &#8211; " + apiErrorDetail(err), true);
+    }
+  }
+
+  // Item [action-comment-modal]: replaces the native prompt()/confirm()
+  // pair used for Mark Completed / Confirm Completion / Send Back with a
+  // real, centered modal. Returns a Promise resolving to {comment, file}
+  // on Confirm, or null on Cancel/close -- same call shape as the old
+  // `var x = prompt(...); if (x === null) return;` pattern it replaces.
+  function openActionCommentModal(cfg) {
+    return new Promise(function (resolve) {
+      document.getElementById("actionCommentTitle").textContent = cfg.title;
+      document.getElementById("actionCommentHint").textContent = cfg.hint || "";
+      var textEl = document.getElementById("actionCommentText");
+      textEl.value = cfg.defaultValue || "";
+      textEl.placeholder = cfg.placeholder || "";
+      var fileRow = document.getElementById("actionCommentFileRow");
+      var fileInput = document.getElementById("actionCommentFile");
+      var fileNameEl = document.getElementById("actionCommentFileName");
+      fileInput.value = "";
+      fileNameEl.textContent = "";
+      fileRow.hidden = !cfg.allowFile;
+      var confirmBtn = document.getElementById("actionCommentConfirm");
+      confirmBtn.textContent = cfg.confirmLabel;
+      confirmBtn.className = "btn " + (cfg.confirmVariant === "crit" ? "ghost-crit" : "primary");
+      var cancelBtn = document.getElementById("actionCommentCancel");
+      var closeBtn = document.getElementById("actionCommentClose");
+      var overlay = document.getElementById("actionCommentOverlay");
+
+      function cleanup() {
+        overlay.hidden = true;
+        confirmBtn.removeEventListener("click", onConfirm);
+        cancelBtn.removeEventListener("click", onCancel);
+        closeBtn.removeEventListener("click", onCancel);
+        fileInput.removeEventListener("change", onFileChange);
+      }
+      function onFileChange() { fileNameEl.textContent = fileInput.files[0] ? fileInput.files[0].name : ""; }
+      function onConfirm() {
+        var comment = textEl.value.trim();
+        if (cfg.required && !comment) {
+          showToast(cfg.requiredMessage || "A comment is required", true);
+          return;
+        }
+        var file = fileInput.files[0] || null;
+        cleanup();
+        resolve({ comment: comment, file: file });
+      }
+      function onCancel() { cleanup(); resolve(null); }
+
+      confirmBtn.addEventListener("click", onConfirm);
+      cancelBtn.addEventListener("click", onCancel);
+      closeBtn.addEventListener("click", onCancel);
+      fileInput.addEventListener("change", onFileChange);
+      overlay.hidden = false;
+      textEl.focus();
+    });
+  }
+
+  // Item 46 (picker rework): a small reusable edit modal covering every
+  // real-picker case this project detail page needs -- checkboxes
+  // (Scope/Business Unit/Region), a single dropdown (Bid Manager), a
+  // native date input (every anchor date), or a plain text field (RFX) --
+  // instead of a free-text prompt() for any of them.
+  // cfg.type: "checklist" (default) | "select" | "date" | "text".
+  var _checklistEditSave = null;
+  function openChecklistEditModal(cfg) {
+    document.getElementById("checklistEditEyebrow").textContent = cfg.eyebrow || "";
+    document.getElementById("checklistEditTitle").textContent = cfg.title;
+    var grid = document.getElementById("checklistEditGrid");
+    var otherInput = document.getElementById("checklistEditOtherInput");
+    var selectEl = document.getElementById("checklistEditSelect");
+    var dateEl = document.getElementById("checklistEditDateInput");
+    var textEl = document.getElementById("checklistEditTextInput");
+    grid.style.display = "none";
+    otherInput.style.display = "none";
+    selectEl.style.display = "none";
+    dateEl.style.display = "none";
+    textEl.style.display = "none";
+
+    if (cfg.type === "text") {
+      textEl.value = cfg.selected || "";
+      textEl.placeholder = cfg.placeholder || "";
+      textEl.style.display = "";
+      textEl.style.marginTop = "";
+      _checklistEditSave = function () { cfg.onSave(textEl.value.trim()); };
+    } else if (cfg.type === "select") {
+      selectEl.innerHTML = "";
+      cfg.options.forEach(function (opt) {
+        var o = el("option", "", opt); o.value = opt; selectEl.appendChild(o);
+      });
+      selectEl.value = cfg.selected || "";
+      selectEl.style.display = "";
+      _checklistEditSave = function () { cfg.onSave(selectEl.value); };
+    } else if (cfg.type === "date") {
+      dateEl.value = cfg.selected || "";
+      dateEl.style.display = "";
+      _checklistEditSave = function () { cfg.onSave(dateEl.value); };
+    } else if (cfg.type === "select-text") {
+      // Item [reassign dropdown]: a roster picker (value != label, e.g.
+      // "Name (email)" shown but the email is what's saved) plus an
+      // optional free-text field shown together -- Reassign needs both
+      // "who" and an optional reason in one step, unlike every other
+      // select/text caller here which only ever needs one.
+      selectEl.innerHTML = "";
+      selectEl.appendChild(el("option", "", cfg.placeholder || "Select…")).value = "";
+      cfg.options.forEach(function (opt) {
+        var o = el("option", "", opt.label); o.value = opt.value; selectEl.appendChild(o);
+      });
+      selectEl.value = cfg.selected || "";
+      selectEl.style.display = "";
+      textEl.value = "";
+      textEl.placeholder = cfg.textPlaceholder || "";
+      textEl.style.display = "";
+      textEl.style.marginTop = "10px";
+      _checklistEditSave = function () { cfg.onSave(selectEl.value, textEl.value.trim()); };
+    } else {
+      grid.style.display = "";
+      grid.innerHTML = "";
+      cfg.options.forEach(function (opt) {
+        var label = el("label", "scope-opt");
+        var cb = el("input"); cb.type = "checkbox"; cb.value = opt;
+        cb.checked = cfg.selected.indexOf(opt) !== -1;
+        label.appendChild(cb);
+        label.appendChild(document.createTextNode(opt));
+        grid.appendChild(label);
+        if (cfg.hasOther && opt === "Other") {
+          cb.addEventListener("change", function () { otherInput.style.display = cb.checked ? "" : "none"; });
+        }
+      });
+      if (cfg.hasOther) {
+        otherInput.style.display = cfg.selected.indexOf("Other") !== -1 ? "" : "none";
+        otherInput.value = cfg.otherValue || "";
+      }
+      _checklistEditSave = function () {
+        var picked = Array.prototype.slice.call(grid.querySelectorAll("input:checked")).map(function (c) { return c.value; });
+        cfg.onSave(picked, otherInput.value.trim());
+      };
+    }
+    document.getElementById("checklistEditOverlay").hidden = false;
+  }
+  function closeChecklistEditModal() {
+    document.getElementById("checklistEditOverlay").hidden = true;
+  }
+  document.getElementById("checklistEditSave").addEventListener("click", function () { if (_checklistEditSave) _checklistEditSave(); });
+  document.getElementById("checklistEditCancel").addEventListener("click", closeChecklistEditModal);
+  document.getElementById("checklistEditClose").addEventListener("click", closeChecklistEditModal);
+
+  // Custom-styled replacement for native confirm() -- same modal shell as
+  // the rest of the app instead of the browser's own unstyled dialog.
+  // Promise-based so call sites just `await customConfirm(...)`.
+  var _confirmResolve = null;
+  function customConfirm(message, opts) {
+    opts = opts || {};
+    document.getElementById("confirmTitle").textContent = opts.title || "Are you sure?";
+    document.getElementById("confirmMessage").textContent = message;
+    var okBtn = document.getElementById("confirmOkBtn");
+    okBtn.textContent = opts.okLabel || "OK";
+    okBtn.className = "btn " + (opts.danger ? "ghost-crit" : "primary");
+    document.getElementById("confirmOverlay").hidden = false;
+    return new Promise(function (resolve) { _confirmResolve = resolve; });
+  }
+  function _settleConfirm(result) {
+    document.getElementById("confirmOverlay").hidden = true;
+    if (_confirmResolve) { var r = _confirmResolve; _confirmResolve = null; r(result); }
+  }
+  document.getElementById("confirmOkBtn").addEventListener("click", function () { _settleConfirm(true); });
+  document.getElementById("confirmCancelBtn").addEventListener("click", function () { _settleConfirm(false); });
+  document.getElementById("confirmClose").addEventListener("click", function () { _settleConfirm(false); });
+
+  // PDFs, images, and text open inline in a browser tab on their own --
+  // Office formats (Word/Excel/PowerPoint) never do, regardless of any
+  // server header, because browsers simply have no built-in renderer for
+  // them and fall back to downloading. Route just those through Microsoft's
+  // Office Online viewer (needs a real absolute, publicly-fetchable URL --
+  // works on the deployed pilot, not off a bare localhost dev server).
+  var _OFFICE_VIEWER_EXTS = ["doc", "docx", "xls", "xlsx", "ppt", "pptx"];
+  function tenderDocViewUrl(fileName, fileUrl) {
+    var ext = (fileName.split(".").pop() || "").toLowerCase();
+    if (_OFFICE_VIEWER_EXTS.indexOf(ext) === -1) return fileUrl;
+    var absolute = location.origin + fileUrl;
+    return "https://view.officeapps.live.com/op/view.aspx?src=" + encodeURIComponent(absolute);
+  }
+  // A browser's native file dialog can't offer an in-dialog toggle between
+  // picking files vs. a folder -- that choice has to be made before the
+  // dialog opens. This is the closest real equivalent to "one button": a
+  // single visible button that pops a tiny two-option menu (Files/Folder),
+  // each wired to click a real (hidden) <input>, one plain and one
+  // webkitdirectory. Reused everywhere a Tender Documents upload control
+  // is needed instead of two separate buttons.
+  function fileOrFolderButton(label, fileInput, folderInput) {
+    var wrap = el("span", "upload-choice-wrap");
+    var btn = el("button", "btn", label + " &#9662;");
+    btn.type = "button";
+    var menu = el("div", "upload-choice-menu");
+    var filesOpt = el("button", "upload-choice-opt", "&#128196; Files&#8230;");
+    var folderOpt = el("button", "upload-choice-opt", "&#128193; Folder&#8230;");
+    filesOpt.type = "button"; folderOpt.type = "button";
+    filesOpt.addEventListener("click", function (e) { e.stopPropagation(); menu.classList.remove("open"); fileInput.click(); });
+    folderOpt.addEventListener("click", function (e) { e.stopPropagation(); menu.classList.remove("open"); folderInput.click(); });
+    menu.appendChild(filesOpt); menu.appendChild(folderOpt);
+    btn.addEventListener("click", function (e) {
+      e.stopPropagation();
+      var opening = !menu.classList.contains("open");
+      document.querySelectorAll(".upload-choice-menu.open").forEach(function (m) { m.classList.remove("open"); });
+      if (opening) menu.classList.add("open");
+    });
+    document.addEventListener("click", function () { menu.classList.remove("open"); });
+    wrap.appendChild(btn); wrap.appendChild(menu);
+    return wrap;
+  }
+  // Uploads a FileList to the given project/folder, one request per file
+  // (relative_path carries a folder pick's own structure, see
+  // upload_tender_document). Returns the count that actually succeeded.
+  async function uploadTenderDocFiles(projectId, fileList, currentPath, isFolder) {
+    var ok = 0;
+    for (var i = 0; i < fileList.length; i++) {
+      var f = fileList[i];
+      var rel = isFolder ? f.webkitRelativePath : f.name;
+      var fullRel = currentPath ? currentPath + "/" + rel : rel;
+      var fd = new FormData();
+      fd.append("file", f);
+      fd.append("relative_path", fullRel);
+      fd.append("actor_name", CURRENT_ROLE + " (pilot)");
+      fd.append("actor_role", CURRENT_ROLE);
+      fd.append("actor_email", actingEmail());
+      try {
+        await api("/api/projects/" + projectId + "/tender-documents", { method: "POST", body: fd });
+        ok++;
+      } catch (err) {
+        showToast('"' + f.name + '" failed to upload &#8211; ' + apiErrorDetail(err), true);
+      }
+    }
+    return ok;
+  }
+  // Folder 0 is a real navigable tree, not a flat list -- folder_path on
+  // each doc (e.g. "Drawings/Civil") groups documents client-side into
+  // subfolders you click into, with a breadcrumb back to the root, same
+  // interaction shape as the Departments folder list beside it.
+  function renderTenderDocs(docs, projectId) {
+    var currentPath = "";
+    function refresh() {
+      api("/api/projects/" + projectId + "/tender-documents").then(function (fresh) {
+        docs = fresh;
+        draw();
+      });
+    }
+    function draw() {
+      var wrap = document.getElementById("dDeliverables");
+      wrap.innerHTML = "";
+      var prefix = currentPath ? currentPath + "/" : "";
+      var childFolders = {}, childFiles = [];
+      docs.forEach(function (d) {
+        var fp = d.folder_path || "";
+        if (fp === currentPath) {
+          childFiles.push(d);
+        } else if (fp.indexOf(prefix) === 0) {
+          var nextSeg = fp.slice(prefix.length).split("/")[0];
+          childFolders[nextSeg] = (childFolders[nextSeg] || 0) + 1;
+        }
+      });
+      var folderNames = Object.keys(childFolders).sort();
+      document.getElementById("dDeliverCount").textContent =
+        (folderNames.length + childFiles.length) + " item" + (folderNames.length + childFiles.length === 1 ? "" : "s");
+
+      // Breadcrumb -- root + one clickable segment per path part, so you can
+      // jump back to any ancestor folder in one click, not just "up one".
+      var crumb = el("div", "deliv-row");
+      var crumbBody = el("div", "deliv-body");
+      var rootLink = el("a", "", "0. Tender Documents");
+      rootLink.href = "#"; rootLink.style.fontWeight = "700"; rootLink.style.color = currentPath ? "var(--purple-1)" : "var(--ink-900)";
+      rootLink.addEventListener("click", function (e) { e.preventDefault(); currentPath = ""; draw(); });
+      crumbBody.appendChild(rootLink);
+      var acc = "";
+      (currentPath ? currentPath.split("/") : []).forEach(function (seg, idx, arr) {
+        acc = acc ? acc + "/" + seg : seg;
+        var accPath = acc;
+        var isLast = idx === arr.length - 1;
+        crumbBody.appendChild(document.createTextNode(" / "));
+        var segLink = el("a", "", seg);
+        segLink.href = "#"; segLink.style.fontWeight = "700";
+        segLink.style.color = isLast ? "var(--ink-900)" : "var(--purple-1)";
+        segLink.addEventListener("click", function (e) { e.preventDefault(); currentPath = accPath; draw(); });
+        crumbBody.appendChild(segLink);
+      });
+      crumb.appendChild(crumbBody);
+      wrap.appendChild(crumb);
+
+      if (can("create")) {
+        var uploadRow = el("div", "deliv-row");
+        var fileInput = el("input"); fileInput.type = "file"; fileInput.multiple = true; fileInput.style.display = "none";
+        var folderInput = el("input"); folderInput.type = "file"; folderInput.webkitdirectory = true; folderInput.multiple = true; folderInput.style.display = "none";
+        fileInput.addEventListener("change", async function () {
+          if (!fileInput.files.length) return;
+          var ok = await uploadTenderDocFiles(projectId, fileInput.files, currentPath, false);
+          if (ok) showToast(ok + " file" + (ok === 1 ? "" : "s") + " uploaded");
+          refresh();
+        });
+        folderInput.addEventListener("change", async function () {
+          if (!folderInput.files.length) return;
+          var ok = await uploadTenderDocFiles(projectId, folderInput.files, currentPath, true);
+          if (ok) showToast(ok + " file" + (ok === 1 ? "" : "s") + " uploaded");
+          refresh();
+        });
+        uploadRow.appendChild(fileOrFolderButton("Upload", fileInput, folderInput));
+        uploadRow.appendChild(fileInput); uploadRow.appendChild(folderInput);
+        wrap.appendChild(uploadRow);
+      }
+
+      if (!folderNames.length && !childFiles.length) {
+        wrap.appendChild(el("div", "deliv-row", '<span style="color:var(--ink-500);font-size:12.5px;">No tender documents here yet.</span>'));
+        return;
+      }
+      folderNames.forEach(function (name) {
+        var count = childFolders[name];
+        var childPath = currentPath ? currentPath + "/" + name : name;
+        var row = el("div", "folder-row");
+        row.innerHTML =
+          '<div class="folder-left"><span class="folder-ic">&#128193;</span><div><div class="folder-name">' + name + '</div>' +
+          '<div class="folder-focal">' + count + " file" + (count === 1 ? "" : "s") + '</div></div></div>';
+        row.addEventListener("click", function () { currentPath = childPath; draw(); });
+        if (can("create")) {
+          var folderRight = el("div", "folder-right");
+          var delFolderBtn = el("button", "btn ghost-crit", "Delete Folder");
+          delFolderBtn.addEventListener("click", async function (e) {
+            e.stopPropagation();
+            if (!(await customConfirm("This deletes " + count + " file" + (count === 1 ? "" : "s") + " and cannot be undone.",
+              { title: 'Delete "' + name + '"?', danger: true, okLabel: "Delete" }))) return;
+            try {
+              await api("/api/projects/" + projectId + "/tender-documents/folder?path=" + encodeURIComponent(childPath) +
+                "&actor_role=" + encodeURIComponent(CURRENT_ROLE) + "&actor_email=" + encodeURIComponent(actingEmail()),
+                { method: "DELETE" });
+              showToast("Folder deleted");
+              refresh();
+            } catch (err) {
+              showToast("Could not delete folder &#8211; " + apiErrorDetail(err), true);
+            }
+          });
+          folderRight.appendChild(delFolderBtn);
+          row.appendChild(folderRight);
+        }
+        wrap.appendChild(row);
+      });
+      childFiles.forEach(function (d) {
+        var row = el("div", "deliv-row");
+        var body = el("div", "deliv-body");
+        var link = el("a", "deliv-name", d.file_name);
+        link.href = tenderDocViewUrl(d.file_name, d.file_url); link.target = "_blank"; link.rel = "noopener";
+        link.style.color = "var(--purple-1)";
+        body.appendChild(link);
+        body.appendChild(el("div", "folder-focal",
+          "Uploaded by " + (d.uploaded_by || "&#8213;") + " &middot; " + fmtDate(d.uploaded_at ? d.uploaded_at.slice(0, 10) : null)));
+        row.appendChild(body);
+        if (can("create")) {
+          var delBtn = el("button", "btn", "Remove");
+          delBtn.addEventListener("click", async function () {
+            if (!(await customConfirm("This removes the file and cannot be undone.",
+              { title: 'Remove "' + d.file_name + '"?', danger: true, okLabel: "Remove" }))) return;
+            try {
+              await api("/api/projects/" + projectId + "/tender-documents/" + d.id +
+                "?actor_role=" + encodeURIComponent(CURRENT_ROLE) + "&actor_email=" + encodeURIComponent(actingEmail()),
+                { method: "DELETE" });
+              showToast("Document removed");
+              refresh();
+            } catch (err) {
+              showToast("Could not remove &#8211; " + apiErrorDetail(err), true);
+            }
+          });
+          row.appendChild(delBtn);
+        }
+        wrap.appendChild(row);
+      });
+    }
+    draw();
+  }
+  function buildDelivRow(d) {
+    var row = el("div", "deliv-row");
+    row.dataset.sid = String(d.id);
+    var body = el("div", "deliv-body");
+    // [PO Lifecycle]: a fan-out row (e.g. "2.6" spawned once per checked
+    // early activity) needs its named line item visible right in the
+    // list, or two rows sharing one item_no would be indistinguishable.
+    var displayName = d.line_item_name ? d.name + " — " + d.line_item_name : d.name;
+    var nameEl = el("div", "deliv-name", displayName);
+    nameEl.title = displayName;
+    body.appendChild(nameEl);
+    // Item 169: a null due_date pending a milestone reads as a stalled
+    // "Due —" otherwise, with no explanation of what it's actually
+    // waiting on.
+    var dueLabel = d.due_date ? ("Due " + dueDateHtml(d)) : (d.awaiting_note || "Due " + fmtDate(d.due_date));
+    // Item [early bonus]: once Completed, show the real point value
+    // earned right in the list row, not just inside the detail modal.
+    var pointsHtml = (d.points_earned !== null && d.points_earned !== undefined)
+      ? ' &middot; ' + pointsEarnedLabel(d.points_earned) : "";
+    body.appendChild(el("div", "deliv-due", '<span class="deliv-due-date">' + dueLabel + '</span> ' + statusPillsHtml(d) + pointsHtml));
+    var authorized = isAssigned(d);
+    if (authorized && d.completion_note) {
+      body.appendChild(el("div", "deliv-comment", "&#128172; " + d.completion_note));
+    }
+    body.style.cursor = "pointer";
+    body.addEventListener("click", function () { openDelivModal(d.id); });
+    row.appendChild(el("div", "deliv-num", d.item_no));
+    row.appendChild(body);
+
+    var actions = el("div", "deliv-actions");
+    if (!authorized) {
+      actions.appendChild(el("span", "locked-note", "Owner/SME only"));
+    } else if (currentProjectTerminal) {
+      if (d.file_url) actions.appendChild(fileLink(d));
+    } else if (d.status === "pending_review") {
+      // Item 143 (2nd revision): Mark Completed was clicked -- awaiting
+      // the SME's confirm/reject. Uploads close entirely until the SME
+      // decides, so only a view link shows here, no Upload button.
+      if (d.file_url) actions.appendChild(fileLink(d));
+      if (can("review")) {
+        var appr = el("button", "btn primary", "Confirm Completion");
+        appr.addEventListener("click", function () { review(d.id, true, function () { openDetail(currentProjectId); }); });
+        var rej = el("button", "btn ghost-crit", "Send Back");
+        rej.addEventListener("click", function () { review(d.id, false, function () { openDetail(currentProjectId); }); });
+        actions.appendChild(appr); actions.appendChild(rej);
+      } else {
+        actions.appendChild(el("span", "locked-note", "Awaiting SME confirmation"));
+      }
+    } else if (d.status === "no_progress" || d.status === "in_progress" || d.status === "rejected") {
+      if (d.file_url) actions.appendChild(fileLink(d));
+      if (d.deadline_status === "due" && can("remind")) actions.appendChild(el("button", "btn ghost-crit", "Send reminder"));
+      if (can("upload")) { actions.appendChild(uploadButton(d.id)); actions.appendChild(markCompleteButton(d.id)); }
+      if (CURRENT_ROLE === "Admin") actions.appendChild(markNotRequiredButton(d.id));
+    } else if (d.file_url) {
+      actions.appendChild(fileLink(d));
+    }
+    row.appendChild(actions);
+    return row;
+  }
+  // [PO Lifecycle]: a fan-out item_no (one submission per PO line item, e.g.
+  // 5 long-lead items each needing their own 4.5) collapses into ONE row
+  // here -- each item's own upload/status/SME-review/score still lives
+  // independently on the backend, but is only ever surfaced inside this
+  // row's modal (via its sibling switcher), not as separate top-level rows.
+  function buildFanoutDelivRow(subs) {
+    var first = subs[0];
+    var row = el("div", "deliv-row");
+    row.dataset.sid = String(first.id);
+    var body = el("div", "deliv-body");
+    var displayName = first.name + " (" + subs.length + " items)";
+    var nameEl = el("div", "deliv-name", displayName);
+    nameEl.title = displayName;
+    body.appendChild(nameEl);
+    // [3.12 not-required]: an item marked Not Required (no prequalification
+    // needed for that vendor) counts as complete here, same as a real
+    // approval -- it's done, not stuck open forever waiting on work that
+    // was never going to happen.
+    var complete = subs.filter(function (s) { return s.status === "approved" || s.applicability === "not_required"; }).length;
+    var inProgress = subs.filter(function (s) { return s.applicability !== "not_required" && (s.status === "in_progress" || s.status === "pending_review"); }).length;
+    var noProgress = subs.length - complete - inProgress;
+    var pending = subs.filter(function (s) { return s.status !== "approved" && s.applicability !== "not_required" && s.due_date; });
+    var soonest = pending.reduce(function (min, s) { return (!min || s.due_date < min.due_date) ? s : min; }, null);
+    // Item [PO Lifecycle per-item notes]: soonest.awaiting_note explains
+    // ONE item's own due-date anchor -- at the aggregate "N items" level
+    // that reads as a single blanket blocker for the whole group, which
+    // isn't right (each item's own predecessor chain is independent; see
+    // the PO Lifecycle tab's own per-item "Pending X" for the real
+    // conceptual blocker). Plain date only here; the full note still shows
+    // correctly once you open a specific item via the switcher.
+    var dueHtml = soonest ? '<span class="deliv-due-date">Next due ' + fmtDate(soonest.due_date) + '</span> ' : "";
+    var countHtml = '<span class="pill neutral"><span class="dot"></span>' + complete + "/" + subs.length + " complete</span>"
+      + (inProgress ? ' <span class="pill warn"><span class="dot"></span>' + inProgress + " in progress</span>" : "")
+      + (noProgress ? ' <span class="pill neutral"><span class="dot"></span>' + noProgress + " no progress</span>" : "");
+    body.appendChild(el("div", "deliv-due", dueHtml + countHtml));
+    body.style.cursor = "pointer";
+    body.addEventListener("click", function () { openDelivModal(first.id); });
+    row.appendChild(el("div", "deliv-num", first.item_no));
+    row.appendChild(body);
+    var actions = el("div", "deliv-actions");
+    // Item [3.12 bulk not-required]: most named items on a given project
+    // often don't need prequalification at all -- ticking "Not Required"
+    // one by one across 10+ line items is real Admin busywork this bulk
+    // action skips.
+    if (first.item_no === "3.12" && CURRENT_ROLE === "Admin" && noProgress > 0) {
+      var bulkBtn = el("button", "btn", "Mark All Not Required");
+      bulkBtn.addEventListener("click", async function (e) {
+        e.stopPropagation();
+        if (!(await customConfirm("Marks every 3.12 item on this project that hasn't started yet as Not Required.", { title: "Mark All Not Required?" }))) return;
+        try {
+          var res = await api("/api/projects/" + currentProjectId + "/po-line-items/mark-all-not-required/3.12?actor_role=" + encodeURIComponent(CURRENT_ROLE), { method: "POST" });
+        } catch (err) {
+          showToast("Could not update &#8211; " + apiErrorDetail(err), true);
+          return;
+        }
+        showToast(res.count + " item(s) marked Not Required");
+        refreshCurrentFolder();
+      });
+      actions.appendChild(bulkBtn);
+    }
+    row.appendChild(actions);
+    return row;
+  }
+  function renderDeliverables(items) {
+    var wrap = document.getElementById("dDeliverables");
+    wrap.innerHTML = "";
+    document.getElementById("dDeliverCount").textContent = items.length + " item" + (items.length === 1 ? "" : "s");
+    if (!items.length) {
+      wrap.appendChild(el("div", "deliv-row", '<span style="color:var(--ink-500);font-size:12.5px;">No deliverables catalogued for this department yet.</span>'));
+      return;
+    }
+    var groups = [], groupByItemNo = {};
+    items.forEach(function (d) {
+      var g = groupByItemNo[d.item_no];
+      if (!g) { g = []; groupByItemNo[d.item_no] = g; groups.push(g); }
+      g.push(d);
+    });
+    var hasSplit = items.some(function (d) { return /\[PBU\]/.test(d.name); }) && items.some(function (d) { return !/\[PBU\]/.test(d.name); });
+    var lastSubGroup = null;
+    groups.forEach(function (subs) {
+      var d = subs[0];
+      var subGroup = /\[PBU\]/.test(d.name) ? "PBU" : "Main";
+      if (hasSplit && subGroup !== lastSubGroup) {
+        wrap.appendChild(el("div", "deliv-subheader", subGroup === "PBU" ? "PBU-Specific Items" : "Main Business Unit"));
+        lastSubGroup = subGroup;
+      }
+      wrap.appendChild(d.pending_declaration_note ? buildPendingDeclarationRow(d) : (subs.length > 1 ? buildFanoutDelivRow(subs) : buildDelivRow(d)));
+    });
+  }
+  // [PO Lifecycle placeholder visibility]: a fan-out item_no with zero real
+  // submissions yet (its declaring item hasn't been approved, so the named
+  // items don't exist to fan out against) -- shown as a locked, informational
+  // row instead of vanishing, so it reads as "not started yet" rather than
+  // "this item is gone". Never clickable -- there's no real submission id
+  // behind it to open a modal for.
+  function buildPendingDeclarationRow(d) {
+    var row = el("div", "deliv-row pending-declaration");
+    var body = el("div", "deliv-body");
+    body.appendChild(el("div", "deliv-name", d.name));
+    // Same .pending-note treatment (color, plain wrapping text) 3.9's own
+    // "Pending X completion" note already uses -- a .pill here was wrong on
+    // two counts: pills are neutral-grey, not the warn/orange every other
+    // "Pending" note in this app uses, and .pill is white-space:nowrap, so
+    // this one (much longer -- it names a full predecessor description,
+    // not just an item number) ran off the row's right edge instead of
+    // wrapping.
+    body.appendChild(el("div", "deliv-due", '<span class="pending-note">' + d.pending_declaration_note + "</span>"));
+    row.appendChild(el("div", "deliv-num", d.item_no));
+    row.appendChild(body);
+    row.appendChild(el("div", "deliv-actions", '<span class="locked-note">Not yet determined</span>'));
+    return row;
+  }
+  // Item 138: a lighter refresh than openDetail() for the project detail
+  // deliverables list -- re-fetches and re-renders just the currently-open
+  // folder's items, without rebuilding the whole page (which resets
+  // currentDeptOpen back to the first folder every time, jarring if the
+  // user was looking at a different one). Used as the default post-action
+  // refresh for the list's own inline buttons, and also fired alongside
+  // the popup's own refresh so status/action changes made there show up
+  // here immediately too, instead of needing a manual page reload.
+  async function refreshCurrentFolder() {
+    if (!currentProjectId || !currentDeptOpen) return;
+    var allDelivs = await api("/api/projects/" + currentProjectId + "/deliverables");
+    renderDeliverables(allDelivs.filter(function (d) { return d.department === currentDeptOpen; }));
+  }
+  function fileLink(d) {
+    // Item 107: opens the deliverable popup to pick which document to
+    // view/download, instead of jumping straight to just the primary file.
+    var btn = el("button", "btn", "View Document");
+    btn.addEventListener("click", function () { openDelivModal(d.id); });
+    return btn;
+  }
+  function uploadButton(submissionId, after) {
+    after = after || refreshCurrentFolder;
+    var wrapper = document.createDocumentFragment();
+    var fileInput = el("input"); fileInput.type = "file"; fileInput.style.display = "none";
+    var btn = el("button", "btn", "Upload");
+    btn.addEventListener("click", function () { fileInput.click(); });
+    fileInput.addEventListener("change", async function () {
+      if (!fileInput.files[0]) return;
+      var fd = new FormData();
+      fd.append("file", fileInput.files[0]);
+      fd.append("actor_name", CURRENT_ROLE + " (pilot)");
+      fd.append("actor_role", CURRENT_ROLE);
+      fd.append("actor_email", actingEmail());
+      try {
+        await api("/api/deliverables/" + submissionId + "/upload", { method: "POST", body: fd });
+      } catch (err) {
+        showToast("Upload blocked &#8211; " + apiErrorDetail(err), true);
+        return;
+      }
+      showToast("Submitted " + fileInput.files[0].name + " &#8211; SME notified");
+      after();
+    });
+    var span = el("span"); span.appendChild(btn); span.appendChild(fileInput);
+    return span;
+  }
+  function markCompleteButton(submissionId, after) {
+    after = after || refreshCurrentFolder;
+    var btn = el("button", "btn", "Mark Completed");
+    btn.addEventListener("click", async function () {
+      var result = await openActionCommentModal({
+        title: "Mark Completed", hint: "Describe how this was completed — no file to attach here.",
+        placeholder: "e.g. Uploaded via email, confirmed by client…",
+        required: true, requiredMessage: "A comment is required to mark this complete",
+        confirmLabel: "Mark Completed", allowFile: false,
+      });
+      if (!result) return;
+      var comment = result.comment;
+      try {
+        await api("/api/deliverables/" + submissionId + "/mark-complete", {
+          method: "POST", headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ comment: comment, actor_name: CURRENT_ROLE + " (pilot)", actor_role: CURRENT_ROLE, actor_email: actingEmail() }),
+        });
+      } catch (err) {
+        showToast("Could not mark complete &#8211; " + apiErrorDetail(err), true);
+        return;
+      }
+      showToast("Marked complete &#8211; SME notified");
+      // Item [auto-refresh]: same full reload as an SME approval -- see review().
+      location.reload();
+    });
+    return btn;
+  }
+  function markNotRequiredButton(submissionId, after) {
+    after = after || refreshCurrentFolder;
+    var btn = el("button", "btn ghost-crit", "Mark Not Required");
+    btn.addEventListener("click", async function () {
+      if (!(await customConfirm("It won't need a due date or a submission.", { title: "Mark as Not Required?" }))) return;
+      try {
+        await api("/api/deliverables/" + submissionId + "/mark-not-required?actor_role=" + encodeURIComponent(CURRENT_ROLE) +
+          "&actor_email=" + encodeURIComponent(actingEmail()), { method: "POST" });
+      } catch (err) {
+        showToast("Could not mark Not Required &#8211; " + apiErrorDetail(err), true);
+        return;
+      }
+      showToast("Marked Not Required");
+      after();
+    });
+    return btn;
+  }
+  async function review(submissionId, approved, after) {
+    // Item 152's optional attachment (e.g. a marked-up file or reference
+    // doc) is now just part of the same modal's file row, instead of a
+    // separate confirm()+file-picker step.
+    var result = approved
+      ? await openActionCommentModal({
+          title: "Confirm Completion", hint: "Add a comment (optional).",
+          placeholder: "Optional comment…", confirmLabel: "Confirm", allowFile: true,
+        })
+      : await openActionCommentModal({
+          title: "Send Back", hint: "Reason for rejection (shown to the owner).",
+          defaultValue: "Please review and resubmit with updated supporting documents.",
+          confirmLabel: "Send Back", confirmVariant: "crit", allowFile: true,
+        });
+    if (!result) return;
+    var comment = result.comment || null;
+    var file = result.file;
+    var fd = new FormData();
+    fd.append("approved", approved ? "true" : "false");
+    fd.append("comment", comment || "");
+    fd.append("reviewer_name", CURRENT_ROLE);
+    fd.append("actor_role", CURRENT_ROLE);
+    fd.append("actor_email", actingEmail());
+    if (file) fd.append("file", file);
+    try {
+      await api("/api/deliverables/" + submissionId + "/review", { method: "POST", body: fd });
+    } catch (err) {
+      showToast("Review blocked &#8211; " + apiErrorDetail(err), true);
+      return;
+    }
+    showToast(approved ? "Approved &#8211; owner notified" : "Rejected &#8211; owner notified");
+    // Item [auto-refresh]: an approval reaches a real Completed state, so a
+    // full reload replaces the usual in-place after() -- guarantees every
+    // stale surface (sidebar badge, dashboard stats, other open panes)
+    // reflects it, not just the list/modal the click happened in. A
+    // rejection isn't "completed," so it keeps the lighter in-place refresh.
+    if (approved) { location.reload(); return; }
+    if (after) after();
+  }
+
+  /* ================= TIMELINE / GANTT ================= */
+  var DEPT_COLORS = {
+    1: "#b91c1c", 2: "#f3722c", 3: "#ca8a04", 4: "#65a30d", 5: "#0d9488",
+    6: "#0284c7", 7: "#4f46e5", 8: "#7c3aed", 9: "#db2777", 10: "#f472b6",
+    11: "#78716c", 12: "#44403c",
+  };
+  function deptColor(number) { return DEPT_COLORS[number] || "#94a3b8"; }
+  var ganttStage = "L0";
+  var ganttRowsUnfiltered = [];
+  var ganttIsPooled = true;
+  document.querySelectorAll("#ganttStageToggle .chip").forEach(function (btn) {
+    btn.addEventListener("click", function () {
+      document.querySelectorAll("#ganttStageToggle .chip").forEach(function (b) { b.classList.remove("active"); });
+      btn.classList.add("active");
+      ganttStage = btn.dataset.stage;
+      loadGanttForStage();
+    });
+  });
+  document.getElementById("ganttDeptFilter").addEventListener("change", applyGanttFilters);
+  document.getElementById("ganttWbsFilter").addEventListener("change", applyGanttFilters);
+  document.getElementById("ganttDeadlineFilter").addEventListener("change", applyGanttFilters);
+  document.getElementById("ganttProgressFilter").addEventListener("change", applyGanttFilters);
+  document.getElementById("ganttRows").addEventListener("scroll", function () {
+    document.getElementById("ganttAxis").style.transform = "translateX(-" + this.scrollLeft + "px)";
+  });
+  document.getElementById("ganttScope").addEventListener("change", function () { renderGanttFor(this.value); });
+
+  async function loadGantt() { await loadGanttForStage(); }
+
+  async function loadGanttForStage() {
+    var list = await api("/api/projects?stage=" + ganttStage + "&status=" + encodeURIComponent("In Progress"));
+    var scopeSel = document.getElementById("ganttScope");
+    scopeSel.innerHTML = '<option value="">Pooled Timeline (all active ' + ganttStage + ' projects)</option>';
+    list.forEach(function (p) {
+      // [L0 International]: <option> can't hold markup, so a plain text
+      // suffix stands in for the pill badge used everywhere else.
+      var label = p.est_no + " &#8211; " + p.name + (p.is_international ? " (International)" : "");
+      var o = el("option", "", label); o.value = p.id;
+      scopeSel.appendChild(o);
+    });
+    document.getElementById("ganttDeadlineFilter").value = "";
+    document.getElementById("ganttProgressFilter").value = "";
+    document.getElementById("ganttDeptFilter").innerHTML = '<option value="">All Departments</option>';
+    var wbsSel = document.getElementById("ganttWbsFilter");
+    wbsSel.innerHTML = '<option value="">All WBS Categories</option>';
+    wbsSel.value = "";
+    // WBS categorization (from "Gantt chart WBS.xlsx") only applies to L1 --
+    // L0 rows carry category=null and stay flat/ungrouped, so the filter
+    // would just be a dead control there.
+    wbsSel.hidden = ganttStage !== "L1";
+    await renderGanttFor(scopeSel.value);
+  }
+
+  async function openProjectGantt(projectId) {
+    switchView("gantt");
+    ganttStage = currentProjectStage;
+    document.querySelectorAll("#ganttStageToggle .chip").forEach(function (b) {
+      b.classList.toggle("active", b.dataset.stage === ganttStage);
+    });
+    await loadGanttForStage();
+    var scopeSel = document.getElementById("ganttScope");
+    scopeSel.value = String(projectId);
+    await renderGanttFor(scopeSel.value);
+  }
+
+  var ganttCurrentProjectId = null;
+  async function renderGanttFor(projectId) {
+    ganttIsPooled = !projectId;
+    ganttCurrentProjectId = projectId || null;
+    ganttRowsUnfiltered = ganttIsPooled
+      ? await api("/api/gantt/timeline?stage=" + ganttStage)
+      : await api("/api/gantt/projects/" + projectId);
+
+    var deptSel = document.getElementById("ganttDeptFilter");
+    var seenDepts = {};
+    ganttRowsUnfiltered.forEach(function (r) { seenDepts[r.department] = r.department_number; });
+    var sortedDeptNames = Object.keys(seenDepts).sort(function (a, b) { return (seenDepts[a] || 0) - (seenDepts[b] || 0); });
+    deptSel.innerHTML = '<option value="">All Departments</option>';
+    sortedDeptNames.forEach(function (name) {
+      var o = el("option", "", deptLabel(name, seenDepts[name])); o.value = name;
+      deptSel.appendChild(o);
+    });
+    // Rows arrive pre-sorted by WBS category (backend's GANTT_WBS_CATEGORY_ORDER),
+    // so preserving first-seen order here reproduces that order without
+    // duplicating the category list in JS.
+    var wbsSel = document.getElementById("ganttWbsFilter");
+    var seenCats = [];
+    ganttRowsUnfiltered.forEach(function (r) { if (r.category && seenCats.indexOf(r.category) === -1) seenCats.push(r.category); });
+    wbsSel.innerHTML = '<option value="">All WBS Categories</option>';
+    seenCats.forEach(function (cat) {
+      var o = el("option", "", cat); o.value = cat;
+      wbsSel.appendChild(o);
+    });
+
+    applyGanttFilters();
+  }
+
+  // Item [Timeline legend follows filters]: this used to build from
+  // ganttRowsUnfiltered inside renderGanttFor(), once per project/scope
+  // change -- so it always listed every department that HAD deliverables
+  // in the pooled/project data, regardless of which deadline/progress/WBS/
+  // department filter was actually narrowing the visible rows. Takes the
+  // already-filtered `rows` now (called from applyGanttFilters below) so a
+  // filter that happens to leave only Tendering and Planning rows visible
+  // shows only those two swatches, not every department in the catalog.
+  function renderGanttLegend(rows) {
+    var legend = document.getElementById("ganttDeptLegend");
+    legend.innerHTML = "";
+    if (ganttIsPooled) {
+      // Timeline-display-only: TBU/PBU/DBU/BBU are 4 real, separate
+      // departments everywhere else in the app (folders, focal points,
+      // performance) -- only the Gantt legend collapses them into one "2.
+      // Operation Units" swatch, since they already share one color (same
+      // department_number) and 4 near-identical legend rows was just visual
+      // noise here. The BU itself still shows -- as a note on each bar's own
+      // label below, not as a separate legend entry.
+      var seenDepts = {};
+      rows.forEach(function (r) { seenDepts[r.department] = r.department_number; });
+      var sortedDeptNames = Object.keys(seenDepts).sort(function (a, b) { return (seenDepts[a] || 0) - (seenDepts[b] || 0); });
+      var seenOpUnitsBU = sortedDeptNames.some(function (name) { return /^Operation Units \((TBU|PBU|DBU|BBU)\)$/.test(name); });
+      sortedDeptNames.forEach(function (name) {
+        if (/^Operation Units \((TBU|PBU|DBU|BBU)\)$/.test(name)) return;
+        var lg = el("span", "lg");
+        lg.innerHTML = '<span class="sw" style="background:' + deptColor(seenDepts[name]) + '"></span>';
+        lg.appendChild(document.createTextNode(deptLabel(name, seenDepts[name])));
+        legend.appendChild(lg);
+      });
+      if (seenOpUnitsBU) {
+        var opLg = el("span", "lg");
+        opLg.innerHTML = '<span class="sw" style="background:' + deptColor(2) + '"></span>';
+        opLg.appendChild(document.createTextNode("2. Operation Units"));
+        legend.appendChild(opLg);
+      }
+    } else {
+      // Per-project view colors bars by deadline/status instead of
+      // department (see the barCls branch below) -- three tones is all
+      // that logic actually produces: "crit" for Due or Rejected, "good"
+      // for Completed, "neutral" for everything else (Not Due, On Hold,
+      // and any deadline_status MATRIX_BUCKET_META doesn't cover). Item
+      // [Timeline Not-Due color collision]: this used to match .gantt-
+      // bar.neutral's own var(--purple-1) -- but --purple-1 was rebranded
+      // to the app's red accent a while back (same red as --crit), so
+      // "Not Due" and "Due/Rejected" rendered as the same color, reading
+      // as though only one status ever showed. Both now use --neutral, the
+      // same grey-blue token Matrix/deadline pills already use for "not
+      // due". Fixed 3-item list regardless of filters -- it's not
+      // department-based, so "follow the filters" doesn't apply here.
+      [["var(--good)", "Completed"], ["var(--crit)", "Due / Rejected"], ["var(--neutral)", "Not Due"]].forEach(function (pair) {
+        var lg = el("span", "lg");
+        lg.innerHTML = '<span class="sw" style="background:' + pair[0] + '"></span>';
+        lg.appendChild(document.createTextNode(pair[1]));
+        legend.appendChild(lg);
+      });
+    }
+    // Regression fix: this used to also carry "ann-type-key" for its base
+    // flex/chip layout, borrowed from the Announcements legend -- item 5
+    // deleted that legend (and its CSS) entirely, which silently broke this
+    // one too (fell back to unstyled inline spans, reading as one run-on
+    // wall of text). .gantt-dept-legend now owns its own complete layout.
+    legend.className = "gantt-dept-legend";
+    legend.style.display = "";
+  }
+
+  function applyGanttFilters() {
+    var dept = document.getElementById("ganttDeptFilter").value;
+    var wbs = document.getElementById("ganttWbsFilter").value;
+    var deadline = document.getElementById("ganttDeadlineFilter").value;
+    var progress = document.getElementById("ganttProgressFilter").value;
+    var rows = ganttRowsUnfiltered.filter(function (r) {
+      return (!dept || r.department === dept) && (!wbs || r.category === wbs) &&
+        (!deadline || r.deadline_status === deadline) && (!progress || r.status === progress);
+    });
+    renderGanttLegend(rows);
+    drawGanttRows(rows, ganttIsPooled);
+  }
+
+  function drawGanttRows(rows, isPooled) {
+    var axis = document.getElementById("ganttAxis");
+    var wrap = document.getElementById("ganttRows");
+    axis.innerHTML = "";
+    wrap.innerHTML = "";
+    // Est only exists as its own column in the pooled (cross-project)
+    // Timeline -- shifts the track offset (axis padding + gridlines) right
+    // by its width + gap when shown, computed here instead of two parallel
+    // CSS layouts. Matches the .gantt-frozen-cols row padding/gap/widths.
+    var ROW_PAD = 14, GAP = 12, LABEL_W = 210, EST_W = 70, COL_W = 80;
+    var trackOffset = ROW_PAD + LABEL_W + GAP + (isPooled ? EST_W + GAP : 0) + COL_W + GAP + COL_W + GAP;
+    var estHeader = document.getElementById("ganttEstColHeader");
+    estHeader.hidden = !isPooled;
+    axis.style.paddingLeft = trackOffset + "px";
+    if (!rows.length) {
+      wrap.appendChild(el("div", "empty-state", "Nothing scheduled yet."));
+      return;
+    }
+    var min = Math.min.apply(null, rows.map(function (r) { return new Date(r.start + "T00:00:00").getTime(); }));
+    var max = Math.max.apply(null, rows.map(function (r) { return new Date(r.end + "T00:00:00").getTime(); }));
+    var DAY = 86400000;
+    max += DAY; // include the last day's full width, not just its start instant
+    var totalDays = Math.max(1, Math.round((max - min) / DAY));
+    var PX_PER_DAY = 30;
+    var trackWidthPx = Math.max(500, totalDays * PX_PER_DAY);
+    function px(t) { return ((t - min) / DAY) * PX_PER_DAY; }
+
+    // Year row
+    var yearRow = el("div", "gantt-axis-row year");
+    var yc = new Date(min); yc.setHours(0, 0, 0, 0); yc.setMonth(0, 1);
+    while (yc.getTime() <= max) {
+      var ySegStart = Math.max(yc.getTime(), min);
+      var yNext = new Date(yc.getFullYear() + 1, 0, 1).getTime();
+      var ySegEnd = Math.min(yNext, max);
+      if (ySegEnd > ySegStart) {
+        var ySeg = el("span", "", String(yc.getFullYear()));
+        ySeg.style.width = (px(ySegEnd) - px(ySegStart)) + "px";
+        yearRow.appendChild(ySeg);
+      }
+      yc = new Date(yc.getFullYear() + 1, 0, 1);
+    }
+    yearRow.style.width = trackWidthPx + "px";
+    axis.appendChild(yearRow);
+
+    // Month row
+    var monthRow = el("div", "gantt-axis-row month");
+    var cur = new Date(min); cur.setHours(0, 0, 0, 0); cur.setDate(1);
+    while (cur.getTime() <= max) {
+      var segStart = Math.max(cur.getTime(), min);
+      var next = new Date(cur.getFullYear(), cur.getMonth() + 1, 1).getTime();
+      var segEnd = Math.min(next, max);
+      if (segEnd > segStart) {
+        var seg = el("span", "", cur.toLocaleDateString("en-GB", { month: "short" }));
+        seg.style.width = (px(segEnd) - px(segStart)) + "px";
+        monthRow.appendChild(seg);
+      }
+      cur = new Date(cur.getFullYear(), cur.getMonth() + 1, 1);
+    }
+    monthRow.style.width = trackWidthPx + "px";
+    axis.appendChild(monthRow);
+
+    // Day row -- Friday/Saturday is this app's weekend everywhere else
+    // (rules.skip_weekend_forward etc.), so those columns get a highlight
+    // here too instead of reading identically to a working day.
+    var dayRow = el("div", "gantt-axis-row day");
+    for (var d = min; d < max; d += DAY) {
+      var dDate = new Date(d);
+      var isWeekend = dDate.getDay() === 5 || dDate.getDay() === 6; // Fri=5, Sat=6
+      var dSeg = el("span", isWeekend ? "weekend" : "", String(dDate.getDate()));
+      dSeg.style.width = PX_PER_DAY + "px";
+      dayRow.appendChild(dSeg);
+    }
+    dayRow.style.width = trackWidthPx + "px";
+    axis.appendChild(dayRow);
+
+    // Gridlines overlay (month boundaries + week ticks + today marker), aligned under the track area.
+    var gridlines = el("div", "gantt-gridlines");
+    gridlines.style.width = trackWidthPx + "px";
+    gridlines.style.left = trackOffset + "px";
+    // Weekend bands (Friday/Saturday) -- full row height, so a weekend
+    // reads as a weekend all the way down through the bars, not just in
+    // the day-number row above.
+    for (var wd = min; wd < max; wd += DAY) {
+      var wdDate = new Date(wd);
+      if (wdDate.getDay() === 5 || wdDate.getDay() === 6) {
+        var wdBand = el("div", "gantt-gridline weekend-band");
+        wdBand.style.left = px(wd) + "px";
+        wdBand.style.width = PX_PER_DAY + "px";
+        gridlines.appendChild(wdBand);
+      }
+    }
+    var monthCur = new Date(min); monthCur.setHours(0, 0, 0, 0); monthCur.setDate(1);
+    monthCur = new Date(monthCur.getFullYear(), monthCur.getMonth() + 1, 1);
+    while (monthCur.getTime() < max) {
+      var mLine = el("div", "gantt-gridline month");
+      mLine.style.left = px(monthCur.getTime()) + "px";
+      gridlines.appendChild(mLine);
+      monthCur = new Date(monthCur.getFullYear(), monthCur.getMonth() + 1, 1);
+    }
+    for (var w = min + DAY; w < max; w += DAY) {
+      var wLine = el("div", "gantt-gridline week");
+      wLine.style.left = px(w) + "px";
+      gridlines.appendChild(wLine);
+    }
+    var today = new Date(); today.setHours(0, 0, 0, 0);
+    if (today.getTime() >= min && today.getTime() < max) {
+      var tLine = el("div", "gantt-gridline today");
+      tLine.style.left = px(today.getTime()) + "px";
+      tLine.title = "Data Date: " + fmtDate(today.toISOString().slice(0, 10));
+      var tLabel = el("div", "gantt-today-label", "Today");
+      tLabel.style.left = px(today.getTime()) + "px";
+      gridlines.appendChild(tLine);
+      gridlines.appendChild(tLabel);
+    }
+    wrap.appendChild(gridlines);
+
+    // L1's rows carry a WBS category (Milestones, Budget, Early Activities,
+    // etc, from "Gantt chart WBS.xlsx") and arrive pre-grouped by it from
+    // the backend sort -- a header row goes in wherever it changes from the
+    // previous row. L0 rows have category=null and stay flat/ungrouped.
+    var lastCategory = undefined;
+    rows.forEach(function (r) {
+      if (r.category !== undefined && r.category !== lastCategory) {
+        var catHeader = el("div", "gantt-cat-header", r.category);
+        wrap.appendChild(catHeader);
+        lastCategory = r.category;
+      }
+      var s = new Date(r.start + "T00:00:00").getTime();
+      var e = new Date(r.end + "T00:00:00").getTime() + DAY;
+      var leftPx = px(s);
+      var widthPx = Math.max(4, px(e) - px(s));
+      var row = el("div", "gantt-row");
+      // The legend collapses TBU/PBU/DBU/BBU into one "Operation Units"
+      // swatch (see above), so which BU this particular bar belongs to
+      // would otherwise be invisible -- noted on the label itself instead.
+      var buMatch = /^Operation Units \((TBU|PBU|DBU|BBU)\)$/.exec(r.department);
+      var buNote = buMatch ? ' <span class="gantt-bu-note">(' + buMatch[1] + ")</span>" : "";
+      var label = el("div", "gantt-label", "<b>" + r.item_no + "</b> &middot; " + r.short_name + buNote);
+      label.title = r.name;
+      var frozenCols = el("div", "gantt-frozen-cols");
+      frozenCols.appendChild(label);
+      if (isPooled) frozenCols.appendChild(el("div", "gantt-est-col", r.est_no));
+      frozenCols.appendChild(el("div", "gantt-start-col", fmtDate(r.start)));
+      frozenCols.appendChild(el("div", "gantt-finish-col", fmtDate(r.end)));
+      row.appendChild(frozenCols);
+      var track = el("div", "gantt-track");
+      track.style.width = trackWidthPx + "px";
+      var bar;
+      if (isPooled) {
+        bar = el("div", "gantt-bar" + (r.is_milestone ? " milestone" : ""));
+        bar.style.background = deptColor(r.department_number);
+      } else {
+        // Item 143 (2nd revision): rejected is its own worth-flagging red;
+        // everything else colors by the live Deadline collapse (matches
+        // the matrix) since that's what a schedule view is really about.
+        var barCls = r.status === "rejected" ? "crit" : (MATRIX_BUCKET_META[r.status === "approved" ? "completed" : r.deadline_status] || ["neutral"])[0];
+        bar = el("div", "gantt-bar " + barCls + (r.is_milestone ? " milestone" : ""));
+      }
+      bar.style.left = leftPx + "px";
+      bar.style.width = widthPx + "px";
+      var statusLabel = (STATUS_META[r.status] || ["", r.status])[1];
+      bar.title = (isPooled ? r.department + " &#8211; " + statusLabel + " &#8211; " : "") +
+        fmtDate(r.start) + " " + String.fromCharCode(8594) + " " + fmtDate(r.end);
+      track.appendChild(bar);
+      row.appendChild(track);
+      if (r.submission_id) {
+        row.style.cursor = "pointer";
+        // Item 92: opens straight to the deliverable popup instead of
+        // redirecting to project detail first.
+        row.addEventListener("click", function () { openDelivModal(r.submission_id); });
+      }
+      wrap.appendChild(row);
+    });
+    gridlines.style.height = wrap.scrollHeight + "px";
+  }
+
+  /* ================= PERFORMANCE / REPORTS ================= */
+  var perfTriageStage = "L0";
+  var perfData = null;
+  var perfSearchTerm = "";
+  var perfCompareSelected = {};  // department name -> true
+  var perfChipSelected = {};  // department name -> true, independent multi-select
+  var perfStatusFilter = null;  // { level: "l1"|"l0", status: "Excellent"|"Acceptable"|"Needs Action" } | null
+  var PERF_MONTH_ORDER = ["Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec", "Current"];
+  // Item 7 (doc redline): department-compare colors, not a level color --
+  // each line is one selected department, the same color across both the
+  // L1 and L0 sections. But comparing exactly 2 departments (the common
+  // case) always landed on the old palette's first two entries, which were
+  // both purple/indigo shades -- reading as "L0 and L1 both purple" even
+  // though it's really "both departments happened to get similar colors."
+  // Reordered so the first two (and every adjacent pair) are maximally
+  // distinct -- also reuses the app's own L1-green/L0-orange identity
+  // colors as the top two picks.
+  var PERF_COLORS = ["#1f9d5c", "#cc6a1e", "#667eea", "#ef4444", "#06b6d4", "#f59e0b", "#8b5cf6", "#ec4899"];
+  function perfStatusClass(status) {
+    if (status === "Excellent") return "excellent";
+    if (status === "Acceptable") return "acceptable";
+    if (status === "Needs Action") return "needs-action";
+    return "na";
+  }
+  function perfPct(pct) { return pct === null || pct === undefined ? "&#8213;" : pct + "%"; }
+  // "Monthly Trend & Variance" wording -- the design spec's arrow+word
+  // convention (Improved/Declined/Stable), kept separate from the raw
+  // signed variance number so a card can show both side by side.
+  function perfTrendWord(level) {
+    if (level.trend === "no_baseline") return '<span class="perf-trend no_baseline">&#8213; No Baseline</span>';
+    var arrow = level.trend === "up" ? "&#8593;" : (level.trend === "down" ? "&#8595;" : "&#8594;");
+    var word = level.trend === "up" ? "Improved" : (level.trend === "down" ? "Declined" : "Stable");
+    return '<span class="perf-trend ' + level.trend + '">' + arrow + " " + word + "</span>";
+  }
+  function perfVariance(level) {
+    if (level.trend === "no_baseline") return "";
+    var sign = level.variance > 0 ? "+" : "";
+    return '<span class="pc2-variance ' + level.trend + '">' + sign + level.variance + "%</span>";
+  }
+  function perfYtd(level) {
+    if (!level.ytd) return '<div class="pc2-flex-row"><span class="pc2-ytd-range">&#8213;</span></div>';
+    var y = level.ytd;
+    var cls = y.delta > 0 ? "up" : (y.delta < 0 ? "down" : "stable");
+    var sign = y.delta > 0 ? "+" : "";
+    return '<div class="pc2-flex-row">' +
+      '<span class="pc2-ytd-range">vs ' + y.month + ": " + y.from + "% &rarr; " + y.to + '%</span>' +
+      '<span class="pc2-ytd-delta ' + cls + '">' + sign + y.delta + '%</span>' +
+      "</div>";
+  }
+  // Item [performance history]: minimal inline trend chart, shared by the
+  // card sparkline and the Compare/History modal's bigger version -- one or
+  // more series (department histories) plotted on a shared axis. Dots are
+  // absolutely-positioned divs, not SVG <circle>s, since the SVG stretches
+  // non-uniformly and circles would distort into ellipses; the line itself
+  // (a <polyline>) doesn't have that problem.
+  function _perfFmtTick(v) {
+    var r = Math.round(v * 10) / 10;
+    return (Math.round(r) === r ? r.toFixed(0) : r.toFixed(1)) + "%";
+  }
+  function buildTrendChartHtml(seriesList, heightPx, alignToTable) {
+    var allMonths = [];
+    seriesList.forEach(function (s) {
+      s.points.forEach(function (p) { if (allMonths.indexOf(p.month) === -1) allMonths.push(p.month); });
+    });
+    allMonths.sort(function (a, b) { return PERF_MONTH_ORDER.indexOf(a) - PERF_MONTH_ORDER.indexOf(b); });
+    if (!allMonths.length) return '<div class="perf-chart-empty">No history yet</div>';
+    var allPcts = [];
+    seriesList.forEach(function (s) { s.points.forEach(function (p) { if (p.pct !== null && p.pct !== undefined) allPcts.push(p.pct); }); });
+    var minV = allPcts.length ? Math.min.apply(null, allPcts) : 0;
+    var maxV = allPcts.length ? Math.max.apply(null, allPcts) : 100;
+    if (maxV === minV) { minV -= 5; maxV += 5; }
+    var pad = (maxV - minV) * 0.15;
+    minV -= pad; maxV += pad;
+    if (minV < 0) minV = 0;
+    if (maxV > 100) maxV = 100;
+    // Same formula drives the gridline/tick positions and the dot/line
+    // positions, so they always land in exact alignment with each other.
+    // In table-aligned mode (Compare/History modals, which show the same
+    // periods/departments as columns in a table right above the chart)
+    // each point sits at the CENTER of its own equal-width slice, same as
+    // how the table's own header text centers within its column -- not
+    // spread edge-to-edge, which drifted out of alignment with the table.
+    function xPos(i) {
+      if (allMonths.length <= 1) return 50;
+      return alignToTable ? ((i + 0.5) / allMonths.length) * 100 : (i / (allMonths.length - 1)) * 100;
+    }
+    function yPos(pct) { return maxV === minV ? 50 : 100 - ((pct - minV) / (maxV - minV)) * 100; }
+    var svgHtml = "", dotsHtml = "";
+    seriesList.forEach(function (s) {
+      var byMonth = {};
+      s.points.forEach(function (p) { byMonth[p.month] = p.pct; });
+      var coords = [];
+      allMonths.forEach(function (m, i) {
+        var pct = byMonth[m];
+        if (pct === null || pct === undefined) return;
+        coords.push([xPos(i), yPos(pct)]);
+      });
+      if (coords.length > 1) {
+        var poly = coords.map(function (c) { return c[0] + "," + c[1]; }).join(" ");
+        svgHtml += '<polyline points="' + poly + '" fill="none" stroke="' + s.color +
+          '" stroke-width="2" vector-effect="non-scaling-stroke" stroke-linejoin="round" stroke-linecap="round" />';
+      }
+      coords.forEach(function (c, ci) {
+        var isLast = ci === coords.length - 1;
+        var size = isLast ? 8 : 5;
+        dotsHtml += '<div class="spark-dot' + (isLast ? " last" : "") + '" style="left:' + c[0] + "%;top:" + c[1] +
+          "%;background:" + s.color + ";width:" + size + "px;height:" + size + "px;margin-left:-" + (size / 2) +
+          "px;margin-top:-" + (size / 2) + 'px;" title="' + s.label + '"></div>';
+      });
+    });
+    var labelsHtml = allMonths.map(function (m, i) {
+      return '<span class="spark-label" style="left:' + xPos(i) + '%;">' + m + "</span>";
+    }).join("");
+    var legendHtml = seriesList.length > 1
+      ? '<div class="spark-legend">' + seriesList.map(function (s) {
+          return '<span class="spark-legend-item"><span class="dot" style="background:' + s.color + '"></span>' + s.label + "</span>";
+        }).join("") + "</div>"
+      : "";
+    var midV = (minV + maxV) / 2;
+    var axisHtml = [maxV, midV, minV].map(function (v, i) {
+      return '<span style="top:' + (i * 50) + '%;">' + _perfFmtTick(v) + "</span>";
+    }).join("");
+    var gridHtml = [0, 50, 100].map(function (top) {
+      return '<div class="spark-gridline" style="top:' + top + '%;"></div>';
+    }).join("");
+    var alignCls = alignToTable ? " pcmp-aligned" : "";
+    return '<div class="spark-chart-row' + alignCls + '" style="height:' + (heightPx || 90) + 'px;">' +
+      '<div class="spark-axis' + alignCls + '">' + axisHtml + "</div>" +
+      '<div class="spark-plot">' +
+        '<div class="spark-gridlines">' + gridHtml + "</div>" +
+        '<svg viewBox="0 0 100 100" preserveAspectRatio="none" class="spark-svg">' + svgHtml + "</svg>" +
+        dotsHtml +
+      "</div></div>" +
+      '<div class="spark-labels-row"><div class="spark-axis-spacer' + alignCls + '"></div>' +
+      '<div class="spark-labels">' + labelsHtml + "</div></div>" + legendHtml;
+  }
+  function renderPerfCol(d, levelKey, levelLabel) {
+    var lv = d[levelKey];
+    var statusCls = perfStatusClass(lv.status);
+    var clickable = lv.percentage !== null ? " pc2-pct-clickable" : "";
+    var html = '<div class="pc2-title">' + levelLabel + " Performance</div>" +
+      '<div class="pc2-pct ' + statusCls + clickable + '" data-dept="' + d.name.replace(/"/g, "&quot;") +
+      '" data-level="' + levelKey + '">' + perfPct(lv.percentage) + "</div>" +
+      '<span class="pc2-status ' + statusCls + '">' + lv.status + "</span>" +
+      '<div class="pc2-label">Monthly Trend &amp; Variance</div>' +
+      '<div class="pc2-flex-row">' + perfTrendWord(lv) + perfVariance(lv) + "</div>" +
+      '<div class="pc2-label">YTD Trend' + (lv.ytd ? " (vs " + lv.ytd.month + ")" : "") + "</div>" +
+      perfYtd(lv) +
+      '<div class="pc2-label">Yearly Trend (2026)</div>' +
+      buildTrendChartHtml([{ label: d.name, color: levelKey === "l1" ? "var(--l1-1)" : "var(--l0-1)", points: lv.history }], 70);
+    return html;
+  }
+  function perfTrackedDepts() {
+    return perfData.departments.filter(function (d) { return d.has_data; });
+  }
+  function renderPerfCards() {
+    var wrap = document.getElementById("perfCardGrid");
+    wrap.innerHTML = "";
+    var chipNames = Object.keys(perfChipSelected);
+    var tracked = perfTrackedDepts();
+    var depts = tracked.filter(function (d) {
+      if (perfSearchTerm && d.name.toLowerCase().indexOf(perfSearchTerm) === -1) return false;
+      if (chipNames.length && !perfChipSelected[d.name]) return false;
+      if (perfStatusFilter && d[perfStatusFilter.level].status !== perfStatusFilter.status) return false;
+      return true;
+    });
+    var footer = document.getElementById("perfDeptFooter");
+    if (footer) footer.textContent = "Showing " + depts.length + " of " + tracked.length + " departments.";
+    if (!depts.length) { wrap.appendChild(el("div", "empty-state", "No departments match your filters.")); return; }
+    depts.forEach(function (d) {
+      var card = el("div", "card perf-card2");
+      var head = el("div", "perf-card2-head");
+      head.appendChild(el("div", "perf-card2-name", d.name));
+      var actions = el("div", "perf-card2-actions");
+      var historyBtn = el("button", "perf-history-btn", "History");
+      historyBtn.addEventListener("click", function (e) { e.stopPropagation(); openPerfHistoryModal(d); });
+      actions.appendChild(historyBtn);
+      var compareLbl = el("label", "perf-compare-check");
+      var compareCb = document.createElement("input");
+      compareCb.type = "checkbox";
+      compareCb.checked = !!perfCompareSelected[d.name];
+      compareCb.addEventListener("click", function (e) { e.stopPropagation(); });
+      compareCb.addEventListener("change", function () {
+        if (compareCb.checked) perfCompareSelected[d.name] = true; else delete perfCompareSelected[d.name];
+        renderPerfCompareBar();
+      });
+      compareLbl.appendChild(compareCb);
+      compareLbl.appendChild(document.createTextNode("Compare"));
+      actions.appendChild(compareLbl);
+      head.appendChild(actions);
+      card.appendChild(head);
+      var cols = el("div", "perf-card2-cols");
+      var c1 = el("div", "perf-card2-col l1");
+      c1.innerHTML = renderPerfCol(d, "l1", "L1");
+      var c0 = el("div", "perf-card2-col l0");
+      c0.innerHTML = renderPerfCol(d, "l0", "L0");
+      cols.appendChild(c1); cols.appendChild(c0);
+      card.appendChild(cols);
+      wrap.appendChild(card);
+    });
+  }
+  function renderPerfCompareBar() {
+    var names = Object.keys(perfCompareSelected);
+    var bar = document.getElementById("perfCompareBar");
+    if (!bar) return;
+    if (!names.length) { bar.hidden = true; return; }
+    bar.hidden = false;
+    document.getElementById("perfCompareCount").textContent = names.length + " selected";
+    document.getElementById("perfCompareGo").disabled = names.length < 2;
+  }
+  function perfStatusFor(pct, minAcceptable) {
+    if (pct === null || pct === undefined) return "N/A";
+    if (pct >= 90) return "Excellent";
+    if (pct >= minAcceptable) return "Acceptable";
+    return "Needs Action";
+  }
+  // Item [performance history]: per-card "History" -- pick any 2+ recorded
+  // periods for just that one department and compare them, laid out as a
+  // period-over-period comparison: each column's Change is vs the column
+  // immediately to its left (not vs the first month, which is what the
+  // card's own YTD row already shows), and the first selected column reads
+  // "baseline" since there's nothing before it to compare against.
+  function openPerfHistoryModal(d) {
+    var allMonths = [];
+    ["l1", "l0"].forEach(function (levelKey) {
+      d[levelKey].history.forEach(function (p) { if (allMonths.indexOf(p.month) === -1) allMonths.push(p.month); });
+    });
+    allMonths.sort(function (a, b) { return PERF_MONTH_ORDER.indexOf(a) - PERF_MONTH_ORDER.indexOf(b); });
+    var selected = {};
+    allMonths.slice(-2).forEach(function (m) { selected[m] = true; });
+
+    function renderHistoryBody() {
+      var chosen = allMonths.filter(function (m) { return selected[m]; });
+      var pillsHtml = '<div class="pmonth-picker"><div class="pmonth-label">Select 2+ months to compare:</div>' +
+        '<div class="pmonth-pills">' + allMonths.map(function (m) {
+          return '<button type="button" class="pmonth-pill' + (selected[m] ? " active" : "") + '" data-month="' +
+            m + '">' + m + "</button>";
+        }).join("") + "</div></div>";
+      var sectionsHtml = ["l1", "l0"].map(function (levelKey) {
+        var lv = d[levelKey];
+        var byMonth = {};
+        lv.history.forEach(function (p) { byMonth[p.month] = p.pct; });
+        var periods = chosen.map(function (m) { return { month: m, pct: byMonth.hasOwnProperty(m) ? byMonth[m] : null }; });
+        var levelLabel = levelKey.toUpperCase() + " Performance";
+        var rows = "";
+        rows += '<tr class="pcmp-head-row"><td></td>' + periods.map(function (p) { return "<td>" + p.month + "</td>"; }).join("") + "</tr>";
+        rows += "<tr><td>Performance</td>" + periods.map(function (p) {
+          var st = perfStatusFor(p.pct, d.min_acceptable);
+          var clickable = p.month === "Current" && p.pct !== null ? " pc2-pct-clickable" : "";
+          var attrs = p.month === "Current" ? ' data-dept="' + d.name.replace(/"/g, "&quot;") + '" data-level="' + levelKey + '"' : "";
+          return '<td class="pcmp-pct ' + perfStatusClass(st) + clickable + '"' + attrs + ">" + perfPct(p.pct) + "</td>";
+        }).join("") + "</tr>";
+        rows += "<tr><td>Status</td>" + periods.map(function (p) {
+          var st = perfStatusFor(p.pct, d.min_acceptable);
+          return '<td><span class="pc2-status ' + perfStatusClass(st) + '">' + st + "</span></td>";
+        }).join("") + "</tr>";
+        rows += "<tr><td>Change</td>" + periods.map(function (p, i) {
+          if (i === 0) return '<td><span class="pc2-ytd-range">baseline</span></td>';
+          var prev = periods[i - 1];
+          if (p.pct === null || p.pct === undefined || prev.pct === null || prev.pct === undefined) return "<td>&#8213;</td>";
+          var delta = p.pct - prev.pct;
+          var cls = delta > 0 ? "up" : (delta < 0 ? "down" : "stable");
+          var sign = delta > 0 ? "+" : "";
+          return '<td><span class="pc2-ytd-delta ' + cls + '">' + sign + delta.toFixed(2) + '%</span>' +
+            '<div class="pc2-ytd-sub">vs ' + prev.month + "</div></td>";
+        }).join("") + "</tr>";
+        // Item 7: match the real L0/L1 identity colors renderPerfCol() already
+        // uses on the summary cards (green L1 / orange L0), instead of two
+        // near-identical purples that made both levels look the same here.
+        var seriesList = [{ label: d.name, color: levelKey === "l1" ? "var(--l1-1)" : "var(--l0-1)", points: periods }];
+        return '<div class="pcmp-section-head ' + levelKey + '">' + levelLabel + "</div>" +
+          '<div class="pcmp-table-wrap"><table class="pcmp-table pcmp-align-table"><tbody>' + rows + "</tbody></table></div>" +
+          buildTrendChartHtml(seriesList, 170, true);
+      }).join("");
+      var body = document.getElementById("perfCompareBody");
+      body.innerHTML = pillsHtml + sectionsHtml;
+      body.querySelectorAll(".pmonth-pill").forEach(function (btn) {
+        btn.addEventListener("click", function () {
+          var m = btn.dataset.month;
+          if (selected[m]) {
+            if (Object.keys(selected).length <= 2) return;
+            delete selected[m];
+          } else {
+            selected[m] = true;
+          }
+          renderHistoryBody();
+        });
+      });
+    }
+    document.getElementById("perfCompareTitle").innerHTML = d.name + " &#8211; Period Comparison";
+    renderHistoryBody();
+    document.getElementById("perfCompareOverlay").hidden = false;
+  }
+  function openPerfCompareModal(depts) {
+    document.getElementById("perfCompareTitle").innerHTML = "Department Comparison";
+    var body = document.getElementById("perfCompareBody");
+    body.innerHTML = ["l1", "l0"].map(function (levelKey) {
+      var levelLabel = levelKey.toUpperCase() + " Performance";
+      var rows = "";
+      rows += '<tr class="pcmp-head-row"><td></td>' + depts.map(function (d) {
+        return "<td>" + d.name + "</td>";
+      }).join("") + "</tr>";
+      rows += "<tr><td>Performance</td>" + depts.map(function (d) {
+        var lv = d[levelKey];
+        var clickable = lv.percentage !== null ? " pc2-pct-clickable" : "";
+        return '<td class="pcmp-pct ' + perfStatusClass(lv.status) + clickable + '" data-dept="' +
+          d.name.replace(/"/g, "&quot;") + '" data-level="' + levelKey + '">' + perfPct(lv.percentage) + "</td>";
+      }).join("") + "</tr>";
+      rows += "<tr><td>Status</td>" + depts.map(function (d) {
+        var lv = d[levelKey];
+        return '<td><span class="pc2-status ' + perfStatusClass(lv.status) + '">' + lv.status + "</span></td>";
+      }).join("") + "</tr>";
+      rows += "<tr><td>Monthly Trend</td>" + depts.map(function (d) {
+        return "<td>" + perfTrendWord(d[levelKey]) + "</td>";
+      }).join("") + "</tr>";
+      rows += "<tr><td>Yearly Trend</td>" + depts.map(function (d) {
+        var lv = d[levelKey];
+        if (!lv.ytd) return "<td>&#8213;</td>";
+        var cls = lv.ytd.delta > 0 ? "up" : (lv.ytd.delta < 0 ? "down" : "stable");
+        var sign = lv.ytd.delta > 0 ? "+" : "";
+        return '<td><span class="pc2-ytd-delta ' + cls + '">' + sign + lv.ytd.delta + '%</span>' +
+          '<div class="pc2-ytd-sub">vs ' + lv.ytd.month + ": " + lv.ytd.from + "% &rarr; " + lv.ytd.to + "%</div></td>";
+      }).join("") + "</tr>";
+      var seriesList = depts.map(function (d, i) {
+        return { label: d.name, color: PERF_COLORS[i % PERF_COLORS.length], points: d[levelKey].history };
+      });
+      return '<div class="pcmp-section-head ' + levelKey + '">' + levelLabel + "</div>" +
+        '<div class="pcmp-table-wrap"><table class="pcmp-table pcmp-align-table"><tbody>' + rows + "</tbody></table></div>" +
+        buildTrendChartHtml(seriesList, 170, true);
+    }).join("");
+    document.getElementById("perfCompareOverlay").hidden = false;
+  }
+  function closePerfCompareModal() { document.getElementById("perfCompareOverlay").hidden = true; }
+  document.getElementById("perfCompareClose").addEventListener("click", closePerfCompareModal);
+  document.getElementById("perfCompareOverlay").addEventListener("click", function (e) { if (e.target === this) closePerfCompareModal(); });
+  document.getElementById("perfCompareGo").addEventListener("click", function () {
+    var names = Object.keys(perfCompareSelected);
+    if (names.length < 2) return;
+    var depts = perfData.departments.filter(function (d) { return perfCompareSelected[d.name]; });
+    openPerfCompareModal(depts);
+  });
+  document.getElementById("perfCompareClear").addEventListener("click", function () {
+    perfCompareSelected = {};
+    renderPerfCompareBar();
+    renderPerfCards();
+  });
+  // Item [performance history]: "click a percentage to see the math" --
+  // itemized cohort breakdown, per architecture_map.md section 5's
+  // "drill-down why this score" modal. Delegated so it works from the
+  // card grid and the Compare/History modal's Current-period cells alike.
+  // Item 6: shared builder for both breakdown tables -- a real
+  // installExcelHeader-managed table (sort + filter + export, same as
+  // every other data table in the app) instead of one string of raw
+  // HTML per open. `cols` follow the normal {key,get,uniqueValues,...}
+  // shape; `rowHtml(row)` returns that row's <td>...</td> string (badges/
+  // color identity live there, not in the column config, since those are
+  // presentation, not sortable/filterable values). Built fresh every
+  // modal open -- no persistent cache needed, the whole table is thrown
+  // away and rebuilt next time regardless.
+  function _buildPbdTable(titleText, exportName, cols, rawRows, rowHtml) {
+    var wrap = el("div", "pbd-table-wrap");
+    if (titleText) {
+      var titleRow = el("div", "pbd-table-title-row");
+      titleRow.appendChild(el("div", "pbd-table-title", titleText));
+      var exportBtn = el("button", "btn pbd-export-btn", "&#11015;&#65039; Export");
+      exportBtn.type = "button";
+      titleRow.appendChild(exportBtn);
+      wrap.appendChild(titleRow);
+    }
+    var table = el("table", "pcmp-table pbd-table");
+    var thead = el("thead");
+    var theadRow = el("tr");
+    // Item 6 follow-up: header text was always left-aligned (installExcelHeader's
+    // own layout) regardless of which way a column's own cells aligned --
+    // c.align lets a numeric column's header sit right-aligned to actually
+    // match its data instead of just guessing which side looked closer.
+    cols.forEach(function (c) { theadRow.appendChild(el("th", c.align === "right" ? "pbd-th-num" : "", c.label)); });
+    thead.appendChild(theadRow);
+    table.appendChild(thead);
+    var tbody = el("tbody");
+    table.appendChild(tbody);
+    var xh = installExcelHeader(theadRow, cols);
+    function draw() {
+      tbody.innerHTML = "";
+      var rows = xh.process(rawRows);
+      if (!rows.length) { tbody.innerHTML = '<tr><td colspan="' + cols.length + '" style="text-align:center;color:var(--ink-500);padding:20px;">No matching rows.</td></tr>'; return; }
+      rows.forEach(function (r) { tbody.insertAdjacentHTML("beforeend", "<tr>" + rowHtml(r) + "</tr>"); });
+    }
+    xh.onChange(draw);
+    draw();
+    if (titleText) {
+      wrap.querySelector(".pbd-export-btn").addEventListener("click", function () {
+        exportTableToExcel(exportName, xh, rawRows);
+      });
+    }
+    wrap.appendChild(table);
+    return wrap;
+  }
+  // Plain-value uniq() (no live cache to read from -- the raw array is
+  // captured directly, same shape _projectsXh/_getAssignedXh's own uniq()
+  // closures use against their own live caches).
+  function _pbdUniq(rows, getter) {
+    var seen = {}, out = [];
+    rows.forEach(function (r) {
+      var v = getter(r); v = v == null || v === "" ? "" : String(v);
+      if (!seen[v]) { seen[v] = true; out.push(v); }
+    });
+    return out.sort(function (a, b) { return a.localeCompare(b, undefined, { numeric: true, sensitivity: "base" }); });
+  }
+  async function openPerfBreakdownModal(deptName, levelKey) {
+    var data;
+    try {
+      data = await api("/api/dashboard/performance/breakdown?department=" + encodeURIComponent(deptName) +
+        "&stage=" + encodeURIComponent(levelKey.toUpperCase()));
+    } catch (err) { showToast("Could not load breakdown &#8211; " + apiErrorDetail(err), true); return; }
+    // Item 7 (doc redline)/item 6: L0/L1 color identity -- the title
+    // already had it; now the Project column in the items table (all one
+    // stage per modal, so a single class covers the whole table) does too.
+    var levelColor = levelKey === "l1" ? "var(--l1-1)" : "var(--l0-1)";
+    document.getElementById("perfBreakdownTitle").innerHTML = deptName + " &#8211; <span style=\"color:" + levelColor + ";\">" + levelKey.toUpperCase() + "</span> Calculation Breakdown";
+    var body = document.getElementById("perfBreakdownBody");
+    body.innerHTML = "";
+
+    // Item 6: L0's per_item_groups summary table, previously the only
+    // level that got one -- L1 pools its overall score directly rather
+    // than averaging these groups, but the groups themselves (total
+    // points/due count per deliverable across every project) are just as
+    // real and useful to see for L1, so the backend now always returns
+    // them (see get_performance_breakdown) and both levels render it.
+    var note = data.aggregation === "per_item_averaged"
+      ? "L0 averages each deliverable item's own submitted ÷ due ratio, then averages those ratios equally."
+      : "L1 pools every due submission's points into one ratio -- the totals below are per deliverable, for reference, not each averaged separately into the score.";
+    body.appendChild(el("p", "pbd-note", note));
+    // Item 6 follow-up: Weight added; Due dropped as its own column (it's
+    // the same number Total Points now shows, just relabeled -- showing
+    // both read as a mistake, not two different facts). Earned Points/
+    // Total Points moved next to each other at the far right, in place of
+    // the old separate Points/.../Ratio columns.
+    var groupCols = [
+      { key: "item_no", label: "Item", get: function (g) { return g.item_no; }, uniqueValues: function () { return _pbdUniq(data.per_item_groups, function (g) { return g.item_no; }); } },
+      { key: "name", label: "Name", get: function (g) { return g.short_name || g.name; }, uniqueValues: function () { return _pbdUniq(data.per_item_groups, function (g) { return g.short_name || g.name; }); } },
+      { key: "weight", label: "Weight", align: "right", get: function (g) { return g.weight; }, uniqueValues: function () { return _pbdUniq(data.per_item_groups, function (g) { return g.weight; }); } },
+      { key: "earned", label: "Earned Points", align: "right", get: function (g) { return g.points; }, uniqueValues: function () { return _pbdUniq(data.per_item_groups, function (g) { return g.points; }); } },
+      { key: "total", label: "Total Points", align: "right", get: function (g) { return g.due; }, uniqueValues: function () { return _pbdUniq(data.per_item_groups, function (g) { return g.due; }); } },
+    ];
+    body.appendChild(_buildPbdTable("By Deliverable", deptName + " " + levelKey.toUpperCase() + " by deliverable", groupCols, data.per_item_groups, function (g) {
+      return "<td class=\"pbd-left\">" + g.item_no + "</td><td class=\"pbd-left\">" + (g.short_name || g.name) + "</td>" +
+        "<td class=\"pbd-num\">" + (g.weight === null || g.weight === undefined ? "&#8213;" : "&asymp; " + g.weight + "%") + "</td>" +
+        "<td class=\"pbd-num\">" + g.points + "</td><td class=\"pbd-num\">" + g.due + "</td>";
+    }));
+
+    // Item 6 follow-up: same "earned / total = %" shape for both levels
+    // now -- .pbd-note above already explains L0's real per-item-averaged
+    // math vs L1's pooled one, so this line doesn't need two different
+    // wordings on top of that; overall_pct itself is untouched (still the
+    // correct backend-computed value for whichever method applies), these
+    // sums are just the visible earned/total this table's own rows add up
+    // to alongside it.
+    var sumEarned = data.per_item_groups.reduce(function (sum, g) { return sum + g.points; }, 0);
+    var sumTotal = data.per_item_groups.reduce(function (sum, g) { return sum + g.due; }, 0);
+    body.appendChild(el("div", "pbd-total", "Overall = " + (Math.round(sumEarned * 100) / 100) + " earned points &#247; " +
+      sumTotal + " total points = <b>" + (data.overall_pct === null ? "&#8213;" : data.overall_pct + "%") + "</b>"));
+
+    // Item 6: title above this table now says what it is ("every
+    // individual submission" vs the deliverable-level summary above it).
+    // Item 6 follow-up: every column's header now aligns the same way its
+    // own cells do (left for text/badges, right for numbers/dates) --
+    // Item/Project/Status used to sit center by .pcmp-table's own default
+    // while their left-aligned xh header sat at the opposite edge.
+    var itemCols = [
+      { key: "item_no", label: "Item", get: function (it) { return it.item_no; }, uniqueValues: function () { return _pbdUniq(data.items, function (it) { return it.item_no; }); } },
+      { key: "name", label: "Name", get: function (it) { return it.short_name || it.name; }, uniqueValues: function () { return _pbdUniq(data.items, function (it) { return it.short_name || it.name; }); } },
+      { key: "project", label: "Project", get: function (it) { return it.project; }, uniqueValues: function () { return _pbdUniq(data.items, function (it) { return it.project; }); } },
+      { key: "due_date", label: "Due", align: "right", get: function (it) { return fmtDate(it.due_date); }, sortValue: function (it) { return it.due_date || ""; }, uniqueValues: function () { return _pbdUniq(data.items, function (it) { return fmtDate(it.due_date); }); } },
+      { key: "submitted_date", label: "Submitted", align: "right", get: function (it) { return it.submitted_date ? fmtDate(it.submitted_date) : "Not submitted"; }, sortValue: function (it) { return it.submitted_date || ""; }, uniqueValues: function () { return _pbdUniq(data.items, function (it) { return it.submitted_date ? fmtDate(it.submitted_date) : "Not submitted"; }); } },
+      { key: "status", label: "Status", get: function (it) { return (STATUS_META[it.status] || ["", it.status])[1]; }, uniqueValues: function () { return _pbdUniq(data.items, function (it) { return (STATUS_META[it.status] || ["", it.status])[1]; }); } },
+      { key: "points", label: "Points", align: "right", get: function (it) { return it.points; }, uniqueValues: function () { return _pbdUniq(data.items, function (it) { return it.points; }); } },
+    ];
+    body.appendChild(_buildPbdTable("Every Submission", deptName + " " + levelKey.toUpperCase() + " submissions", itemCols, data.items, function (it) {
+      var statusMeta = STATUS_META[it.status] || ["neutral", it.status];
+      return "<td class=\"pbd-left\">" + it.item_no + "</td><td class=\"pbd-left\">" + (it.short_name || it.name) + "</td>" +
+        "<td class=\"pbd-left est-no " + levelKey + "\">" + it.project + "</td>" +
+        "<td class=\"pbd-num\">" + (it.due_date ? fmtDate(it.due_date) : "&#8213;") + "</td>" +
+        "<td class=\"pbd-num\">" + (it.submitted_date ? fmtDate(it.submitted_date) : "Not submitted") + "</td>" +
+        "<td class=\"pbd-left\"><span class=\"pill " + statusMeta[0] + "\"><span class=\"dot\"></span>" + statusMeta[1] + "</span></td>" +
+        "<td class=\"pbd-num\">" + it.points + "</td>";
+    }));
+
+    document.getElementById("perfBreakdownOverlay").hidden = false;
+  }
+  function closePerfBreakdownModal() { document.getElementById("perfBreakdownOverlay").hidden = true; }
+  document.getElementById("perfBreakdownClose").addEventListener("click", closePerfBreakdownModal);
+  document.getElementById("perfBreakdownOverlay").addEventListener("click", function (e) { if (e.target === this) closePerfBreakdownModal(); });
+  document.getElementById("perfBreakdownPrintBtn").addEventListener("click", function () { window.print(); });
+  [document.getElementById("perfCardGrid"), document.getElementById("perfCompareBody")].forEach(function (container) {
+    container.addEventListener("click", function (e) {
+      var target = e.target.closest(".pc2-pct-clickable");
+      if (!target) return;
+      openPerfBreakdownModal(target.dataset.dept, target.dataset.level);
+    });
+  });
+  document.getElementById("perfSearch").addEventListener("input", function (e) {
+    perfSearchTerm = e.target.value.trim().toLowerCase();
+    renderPerfChips();
+    renderPerfCards();
+  });
+  document.getElementById("perfPrintBtn").addEventListener("click", function () { window.print(); });
+  function renderPerfSummaryCards() {
+    var strip = document.getElementById("perfSummaryStrip");
+    strip.innerHTML = "";
+    var tracked = perfTrackedDepts();
+    ["l1", "l0"].forEach(function (levelKey) {
+      var vals = tracked.map(function (d) { return d[levelKey].percentage; }).filter(function (v) { return v !== null; });
+      var avg = vals.length ? Math.round((vals.reduce(function (a, b) { return a + b; }, 0) / vals.length) * 10) / 10 : null;
+      var counts = { Excellent: 0, Acceptable: 0, "Needs Action": 0 };
+      tracked.forEach(function (d) { var st = d[levelKey].status; if (counts.hasOwnProperty(st)) counts[st]++; });
+      var totalRated = counts.Excellent + counts.Acceptable + counts["Needs Action"];
+      var projectCount = levelKey === "l1" ? perfData.l1_project_count : perfData.l0_project_count;
+      var card = el("div", "card perf-summary-card2 " + levelKey);
+      var barSegs = ["Excellent", "Acceptable", "Needs Action"].map(function (status) {
+        var n = counts[status];
+        var w = totalRated ? (n / totalRated * 100) : 0;
+        return '<div class="psb-seg ' + perfStatusClass(status) + '" style="width:' + w + '%;"></div>';
+      }).join("");
+      var hasFilter = perfStatusFilter && perfStatusFilter.level === levelKey;
+      var legendHtml = ["Excellent", "Acceptable", "Needs Action"].map(function (status) {
+        var active = hasFilter && perfStatusFilter.level === levelKey && perfStatusFilter.status === status;
+        var dim = hasFilter && !active;
+        return '<span class="psc2-legend-item ' + perfStatusClass(status) + (active ? " active" : "") + (dim ? " dim" : "") +
+          '" data-level="' + levelKey + '" data-status="' + status + '"><span class="dot"></span>' + counts[status] + " " + status + "</span>";
+      }).join("");
+      card.innerHTML = '<div class="psc2-head"><span class="psc2-title">' + levelKey.toUpperCase() + ' Performance</span>' +
+        '<span class="psc2-avg">' + (avg === null ? "&#8213;" : avg + "%") + ' <span class="psc2-avg-lbl">AVG</span></span></div>' +
+        '<div class="psc2-pill">Total Number of ' + levelKey.toUpperCase() + " Projects: " + projectCount + "</div>" +
+        '<div class="psc2-body">' +
+          '<div class="psc2-count psc2-count-clickable' + (hasFilter ? " dim" : "") + '"><b>' + totalRated + '</b><span>DEPARTMENTS</span></div>' +
+          '<div class="psc2-bar-wrap"><div class="psc2-bar">' + barSegs + '</div>' +
+            '<div class="psc2-legend">' + legendHtml + "</div></div>" +
+        "</div>" +
+        '<div class="psc2-hint">Click a status to filter</div>';
+      strip.appendChild(card);
+      card.querySelectorAll("[data-status]").forEach(function (item) {
+        item.addEventListener("click", function () {
+          var level = item.dataset.level, status = item.dataset.status;
+          perfStatusFilter = (perfStatusFilter && perfStatusFilter.level === level && perfStatusFilter.status === status)
+            ? null : { level: level, status: status };
+          renderPerfSummaryCards();
+          renderPerfCards();
+        });
+      });
+      // Design spec: clicking the count/average area clears every active
+      // filter (status, chips, search) at once, not just this card's own.
+      card.querySelector(".psc2-count-clickable").addEventListener("click", function () {
+        perfStatusFilter = null;
+        perfChipSelected = {};
+        perfSearchTerm = "";
+        document.getElementById("perfSearch").value = "";
+        renderPerfSummaryCards();
+        renderPerfChips();
+        renderPerfCards();
+      });
+    });
+  }
+  function renderPerfChips() {
+    var wrap = document.getElementById("perfDeptChips");
+    wrap.innerHTML = "";
+    perfTrackedDepts().forEach(function (d) {
+      var dim = perfSearchTerm && d.name.toLowerCase().indexOf(perfSearchTerm) === -1;
+      var chip = el("span", "perf-chip" + (perfChipSelected[d.name] ? " active" : "") + (dim ? " dim" : ""),
+        d.name);
+      chip.addEventListener("click", function () {
+        if (perfChipSelected[d.name]) delete perfChipSelected[d.name]; else perfChipSelected[d.name] = true;
+        renderPerfChips();
+        renderPerfCards();
+      });
+      wrap.appendChild(chip);
+    });
+  }
+  async function loadPerformance() {
+    // [Reports redesign]: perfOverviewCore may currently be sitting inside
+    // the Performance Report's mount point (see loadReportPerformance) --
+    // re-home it here unconditionally so navigating to the real Performance
+    // nav tab always shows it in its normal place, regardless of whichever
+    // view last relocated it. A no-op (stays exactly where it already is)
+    // when it's already home.
+    document.getElementById("perfOverviewPane").appendChild(document.getElementById("perfOverviewCore"));
+    perfData = await api("/api/dashboard/performance");
+    document.getElementById("perfFreshness").textContent = "Data as of " + fmtDate(perfData.data_as_of);
+    renderPerfSummaryCards();
+    renderPerfChips();
+    renderPerfCards();
+    renderPerfCompareBar();
+    // Item 117: only admins get the "Manage Tracking" sub-tab; everyone
+    // else just sees the Overview scores.
+    document.getElementById("perfTriageTabBtn").hidden = !can("create");
+    if (!can("create") && document.getElementById("perfTriagePane").hidden === false) {
+      document.querySelectorAll("#perfSubTabs .chip").forEach(function (b) { b.classList.toggle("active", b.dataset.pane === "overview"); });
+      document.getElementById("perfOverviewPane").hidden = false;
+      document.getElementById("perfTriagePane").hidden = true;
+    }
+  }
+  // [Reports redesign]: the Performance Report -- same live component as
+  // the real Performance nav tab (search, chips, card grid, compare/
+  // history), just relocated into its own page without Manage Tracking or
+  // the calc-panel (neither ever leaves view-performance, see the HTML).
+  // Runs the exact same load/render as loadPerformance() -- zero risk of
+  // this report's numbers or filters ever drifting from the real page's --
+  // then moves the now-populated node into this report's own mount point.
+  async function loadReportPerformance() {
+    await loadPerformance();
+    document.getElementById("repPerfMount").appendChild(document.getElementById("perfOverviewCore"));
+  }
+  document.querySelectorAll("#perfSubTabs .chip").forEach(function (btn) {
+    btn.addEventListener("click", function () {
+      document.querySelectorAll("#perfSubTabs .chip").forEach(function (b) { b.classList.remove("active"); });
+      btn.classList.add("active");
+      var pane = btn.dataset.pane;
+      document.getElementById("perfOverviewPane").hidden = pane === "triage";
+      document.getElementById("perfTriagePane").hidden = pane !== "triage";
+      if (pane === "triage") loadPerfTriage();
+    });
+  });
+  document.querySelectorAll("#perfTriageStageToggle .chip").forEach(function (btn) {
+    btn.addEventListener("click", function () {
+      document.querySelectorAll("#perfTriageStageToggle .chip").forEach(function (b) { b.classList.remove("active"); });
+      btn.classList.add("active");
+      perfTriageStage = btn.dataset.stage;
+      loadPerfTriage();
+    });
+  });
+  var _perfTriageCache = [];
+  async function loadPerfTriage() {
+    // [L0 International]: its own tab here (unlike the Overview above, which
+    // now merges international into its counterpart's L0 score) -- an admin
+    // still needs to toggle kpi_relevant per catalog independently.
+    var stage = perfTriageStage === "L0intl" ? "L0" : perfTriageStage;
+    var qs = "stage=" + stage + (perfTriageStage === "L0intl" ? "&international=true" : "");
+    _perfTriageCache = await api("/api/departments/performance-triage?" + qs);
+    _renderPerfTriage();
+  }
+  // Items 4/9/36: header-inline filter -- same live-as-you-type convention,
+  // over the wrap-table treatment #perfTriagePane's .fp-table already has --
+  // plus Excel-style sort+filter on Item/Name/Department.
+  var _perfTriageXh = null;
+  function _getPerfTriageXh() {
+    if (_perfTriageXh) return _perfTriageXh;
+    function uniq(getter) {
+      return function () {
+        var seen = {}, out = [];
+        _perfTriageCache.forEach(function (r) {
+          var v = getter(r); v = v == null ? "" : String(v);
+          if (!seen[v]) { seen[v] = true; out.push(v); }
+        });
+        return out.sort(function (a, b) { return a.localeCompare(b, undefined, { numeric: true, sensitivity: "base" }); });
+      };
+    }
+    var columns = [
+      { key: "item_no", get: function (r) { return r.item_no; }, uniqueValues: uniq(function (r) { return r.item_no; }) },
+      { key: "name", get: function (r) { return r.name; }, uniqueValues: uniq(function (r) { return r.name; }) },
+      { key: "department", get: function (r) { return r.department; }, uniqueValues: uniq(function (r) { return r.department; }) },
+      null,
+    ];
+    var theadRow = document.getElementById("perfTriageBody").closest("table").querySelector("thead tr");
+    _perfTriageXh = installExcelHeader(theadRow, columns);
+    _perfTriageXh.onChange(function () { _renderPerfTriage(); });
+    return _perfTriageXh;
+  }
+  function _renderPerfTriage() {
+    var term = document.getElementById("perfTriageSearch").value.trim().toLowerCase();
+    var rows = _perfTriageCache.filter(function (r) {
+      if (!term) return true;
+      return (r.item_no + " " + r.name + " " + r.department).toLowerCase().indexOf(term) !== -1;
+    });
+    rows = _getPerfTriageXh().process(rows);
+    var tbody = document.getElementById("perfTriageBody");
+    tbody.innerHTML = "";
+    if (!rows.length) {
+      var tr0 = el("tr");
+      var td0 = el("td", "", "No items match &#8220;" + term + "&#8221;.");
+      td0.setAttribute("colspan", "4");
+      tr0.appendChild(td0);
+      tbody.appendChild(tr0);
+      return;
+    }
+    rows.forEach(function (r) {
+      var tr = el("tr");
+      tr.appendChild(el("td", "num", r.item_no));
+      tr.appendChild(el("td", "", r.name + (r.is_milestone ? ' <span class="gantt-est-tag">Milestone</span>' : "")));
+      tr.appendChild(el("td", "", r.department));
+      var tdToggle = el("td");
+      var toggleBtn = el("button", "chip" + (r.kpi_relevant ? " active" : ""), r.kpi_relevant ? "On" : "Off");
+      // Item 15: milestones used to be locked On here on the (mistaken)
+      // assumption that turning one off would break the due-date chain --
+      // is_milestone's chain-anchoring (rules.py: an approved milestone
+      // unblocks its dependents) reads the submission's own approval
+      // status directly, entirely independent of kpi_relevant, which only
+      // gates *scoring* inclusion (_kpi_cohort). The backend never
+      // enforced this rule either -- it was frontend-only. 1.1 (just the
+      // GO-approach announcement) is the concrete case: real work, but
+      // not something that should count toward on-time performance.
+      toggleBtn.addEventListener("click", async function () {
+        var next = !r.kpi_relevant;
+        try {
+          await api("/api/departments/performance-triage/" + r.id, {
+            method: "PATCH", headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ kpi_relevant: next }),
+          });
+        } catch (err) {
+          showToast("Could not update &#8211; " + apiErrorDetail(err), true);
+          return;
+        }
+        r.kpi_relevant = next;
+        toggleBtn.textContent = next ? "On" : "Off";
+        toggleBtn.classList.toggle("active", next);
+      });
+      tdToggle.appendChild(toggleBtn);
+      tr.appendChild(tdToggle);
+      tbody.appendChild(tr);
+    });
+  }
+  /* ================= REPORTS (landing page + Master PO / Overview PO /
+     Budget Status -- Performance Report lives up near loadPerformance()
+     itself, see loadReportPerformance() there) ================= */
+
+  // [PO Status report design]: ported from the real "L1 Delay Dashboard"
+  // (Dashboard Design System Reference.md's own source build) -- see
+  // reports.py's _po_status_and_delay for how po_status/delay_label/
+  // delay_badge get derived from this app's real submission data instead
+  // of that dashboard's Excel-sourced PO Number/signed-date fields.
+  var _PO_STATUS_LABEL2 = { "signed": "Signed by both parties", "not-due": "Not Due", "pending-due": "Pending (Due)" };
+  var _PO_STATUS_BADGE = { "signed": "excellent", "not-due": "neutral", "pending-due": "needs-action" };
+  function _poBar(counts, total) {
+    var bar = el("div", "rep-po-bar");
+    [["signed", "excellent"], ["not-due", "neutral"], ["pending-due", "needs-action"]].forEach(function (pair) {
+      var n = counts[pair[0]] || 0;
+      if (!n) return;
+      var seg = el("div", "seg " + pair[1]);
+      seg.style.width = (n / total * 100) + "%";
+      bar.appendChild(seg);
+    });
+    return bar;
+  }
+  function _poProgressLabel(counts, total) {
+    var parts = [(counts["signed"] || 0) + " signed by both parties", (counts["not-due"] || 0) + " not due"];
+    if (counts["pending-due"]) parts.push(counts["pending-due"] + " pending (due)");
+    var pct = total ? Math.round((counts["signed"] || 0) / total * 100) : 0;
+    return parts.join(" &middot; ") + " &mdash; " + total + " PO/deliverable item" + (total === 1 ? "" : "s") + " (" + pct + "% signed)";
+  }
+  function _poCountsFromRows(rows) {
+    var counts = { "signed": 0, "not-due": 0, "pending-due": 0 };
+    rows.forEach(function (r) { counts[r.po_status] = (counts[r.po_status] || 0) + 1; });
+    return counts;
+  }
+  function _wirePmChips(container) {
+    container.querySelectorAll(".rep-po-pm-chip").forEach(function (chip) {
+      chip.addEventListener("click", function (e) {
+        e.stopPropagation();
+        var email = chip.dataset.email;
+        if (navigator.clipboard && navigator.clipboard.writeText) {
+          navigator.clipboard.writeText(email).catch(function () { _fallbackCopy(email); });
+        } else { _fallbackCopy(email); }
+        var original = chip.textContent;
+        chip.textContent = "Copied!";
+        chip.classList.add("copied");
+        setTimeout(function () { chip.textContent = original; chip.classList.remove("copied"); }, 1200);
+      });
+    });
+  }
+  function _fallbackCopy(text) {
+    var ta = document.createElement("textarea");
+    ta.value = text; ta.style.position = "fixed"; ta.style.opacity = "0";
+    document.body.appendChild(ta); ta.focus(); ta.select();
+    try { document.execCommand("copy"); } catch (e) {}
+    document.body.removeChild(ta);
+  }
+
+  // Item 12: masterPoCore may currently be sitting in the standalone
+  // Master PO nav tab's mount point (see loadMasterPo below) -- re-home it
+  // here unconditionally, same pattern as loadPerformance/perfOverviewCore,
+  // so navigating to the Reports page's Master PO Report always shows it
+  // in its normal place regardless of whichever view last relocated it.
+  // Items 4/36 (redlined: replace the old dropdown filter row with the
+  // Excel header, same as everywhere else): full sort+filter on every
+  // categorical column -- built once and reused across every
+  // loadReportMasterPo() call so re-visiting the tab doesn't double-wrap
+  // the header cells.
+  var _masterPoXhController = null, _masterPoAllRows = [];
+  function _masterPoXh() {
+    if (_masterPoXhController) return _masterPoXhController;
+    function uniq(getter) {
+      return function () {
+        var seen = {}, out = [];
+        (_masterPoAllRows || []).forEach(function (r) {
+          var v = getter(r); v = v == null ? "" : String(v);
+          if (!seen[v]) { seen[v] = true; out.push(v); }
+        });
+        return out.sort(function (a, b) { return a.localeCompare(b, undefined, { numeric: true, sensitivity: "base" }); });
+      };
+    }
+    var projectOf = function (r) { return r.est_no + " " + r.project_name; };
+    var categoryOf = function (r) { return r.category.replace(/_/g, " "); };
+    var poStatusOf = function (r) { return _PO_STATUS_LABEL2[r.po_status] || r.po_status; };
+    var itemOf = function (r) { return r.current_item_no || ""; };
+    var nameOf = function (r) { return r.name; };
+    var poNumberOf = function (r) { return r.po_number || ""; };
+    var finalDueOf = function (r) { return fmtDate(r.final_due_date); };
+    var actualSignedOf = function (r) { return r.actual_or_signed ? fmtDate(r.actual_or_signed) : ""; };
+    var delayOf = function (r) { return r.delay_label; };
+    // [queued: filterability treatment] item/name/final_due/actual_signed/
+    // delay were filterable:false -- same "too many uniques" judgment call
+    // as Assigned Deliverables' Deliverable/Due Date columns originally
+    // got, reversed the same way once asked for consistently everywhere.
+    var columns = [
+      { key: "contract_status", get: function (r) { return r.contract_status || ""; }, uniqueValues: uniq(function (r) { return r.contract_status || ""; }) },
+      { key: "project", get: projectOf, uniqueValues: uniq(projectOf) },
+      { key: "item", get: itemOf, uniqueValues: uniq(itemOf) },
+      { key: "name", get: nameOf, uniqueValues: uniq(nameOf) },
+      { key: "po_number", get: poNumberOf, uniqueValues: uniq(poNumberOf) },
+      { key: "category", get: categoryOf, uniqueValues: uniq(categoryOf) },
+      { key: "po_status", get: poStatusOf, uniqueValues: uniq(poStatusOf) },
+      { key: "final_due", get: finalDueOf, sortValue: function (r) { return r.final_due_date || ""; }, uniqueValues: uniq(finalDueOf) },
+      { key: "actual_signed", get: actualSignedOf, sortValue: function (r) { return r.actual_or_signed || ""; }, uniqueValues: uniq(actualSignedOf) },
+      { key: "delay", get: delayOf, uniqueValues: uniq(delayOf) },
+    ];
+    // Item 36: .rep-po-table is reused by the Custom Report table too (a
+    // second, empty instance elsewhere in the DOM) -- anchor off
+    // #repMasterPoBody itself so this always wires the right table's header.
+    var theadRow = document.getElementById("repMasterPoBody").closest("table").querySelector("thead tr");
+    _masterPoXhController = installExcelHeader(theadRow, columns);
+    return _masterPoXhController;
+  }
+  // Card counts need to reproduce the same value each filterable column's
+  // get() produces (see _masterPoXh) so "everything except this column's
+  // own filter" stays in sync with what the header's own filter actually
+  // matches against.
+  var _MASTER_PO_COL_GET = {
+    contract_status: function (r) { return r.contract_status || ""; },
+    project: function (r) { return r.est_no + " " + r.project_name; },
+    category: function (r) { return r.category.replace(/_/g, " "); },
+    po_status: function (r) { return _PO_STATUS_LABEL2[r.po_status] || r.po_status; },
+  };
+  // Item [PO Category display]: the canonical label for every PO category
+  // the backend's CATEGORY_STEP_SEQUENCE tracks (po_line_items.py) --
+  // Overview PO's filter dropdown draws its option list from this fixed
+  // set now, not from whatever categories happen to already have a PO
+  // line item somewhere (that silently dropped "Consultancy", since no
+  // project has used it yet) -- and gives MEP/S/C their real acronym
+  // casing instead of a raw db value like "mep"/"sc".
+  var PO_CATEGORY_LABELS = {
+    long_lead: "Long Lead", early_activity: "Early Activity", mep: "MEP",
+    consultancy: "Consultancy", sc: "S/C",
+  };
+  async function loadReportMasterPo() {
+    document.getElementById("view-report-masterpo").appendChild(document.getElementById("masterPoCore"));
+    document.getElementById("masterPoTitle").textContent = "Master PO Report";
+    var rows = await api("/api/reports/master-po?actor_role=" + encodeURIComponent(CURRENT_ROLE));
+    _masterPoAllRows = rows;
+    var search = document.getElementById("repMasterPoSearch");
+    var masterPoXh = _masterPoXh();
+
+    function searchFiltered() {
+      var term = search.value.trim().toLowerCase();
+      if (!term) return rows;
+      return rows.filter(function (r) { return (r.project_name + " " + r.name + " " + r.category).toLowerCase().indexOf(term) !== -1; });
+    }
+    // Items 4/36 (redlined): the old dropdown filter row is gone -- every
+    // column filter now lives in its own header, same convention as every
+    // other table. filteredExcluding still backs the category cards, which
+    // (same "must exclude the filter dimension it represents" rule as
+    // before) ignore the Category column's own filter but react to every
+    // other active filter plus the search box.
+    function filteredExcluding(excludeKey) {
+      var out = searchFiltered();
+      var filters = masterPoXh.state.filters;
+      Object.keys(filters).forEach(function (key) {
+        if (key === excludeKey) return;
+        var allowed = filters[key], getter = _MASTER_PO_COL_GET[key];
+        if (!allowed || !getter) return;
+        out = out.filter(function (r) { return allowed.has(String(getter(r))); });
+      });
+      return out;
+    }
+    var CAT_TITLES = { long_lead: "Long Lead Items POs", early_activity: "Early Activities POs", mep: "MEP POs", consultancy: "Consultancy POs", sc: "S/C POs" };
+    function renderCategoryCards() {
+      var byCat = {};
+      filteredExcluding("category").forEach(function (r) { (byCat[r.category] = byCat[r.category] || []).push(r); });
+      var activeCatFilter = masterPoXh.state.filters.category;
+      var grid = document.getElementById("repMasterPoCatGrid");
+      grid.innerHTML = "";
+      Object.keys(byCat).sort().forEach(function (cat) {
+        var catRows = byCat[cat];
+        var counts = _poCountsFromRows(catRows);
+        var total = catRows.length;
+        var delays = catRows.filter(function (r) { return r.po_status === "signed"; })
+          .map(function (r) { return /(-?\d+)d/.exec(r.delay_label); }).filter(Boolean).map(function (m) { return parseInt(m[1], 10); });
+        var avgDelay = delays.length ? (delays.reduce(function (a, b) { return a + b; }, 0) / delays.length).toFixed(1) : null;
+        var isActive = activeCatFilter && activeCatFilter.has(cat.replace(/_/g, " "));
+        var card = el("div", "rep-po-card" + (isActive ? " active-filter" : ""));
+        card.style.cursor = "pointer";
+        var head = el("div", "rep-po-card-head");
+        head.appendChild(el("div", "rep-po-card-title", CAT_TITLES[cat] || cat));
+        head.appendChild(el("span", "rep-po-badge neutral", total + " item" + (total === 1 ? "" : "s")));
+        card.appendChild(head);
+        card.appendChild(el("div", "rep-po-card-sub", total + " PO/deliverable items"));
+        card.appendChild(_poBar(counts, total));
+        card.appendChild(el("div", "rep-po-progress-label", _poProgressLabel(counts, total)));
+        var statRow = el("div", "rep-po-stat-row cols-4");
+        [["signed", "Signed", "excellent"], ["not-due", "Not Due", ""], ["pending-due", "Pending (Due)", "needs-action"]].forEach(function (t) {
+          var cell = el("div", "cell");
+          cell.appendChild(el("div", "v " + (counts[t[0]] ? t[2] : ""), String(counts[t[0]] || 0)));
+          cell.appendChild(el("div", "l", t[1]));
+          statRow.appendChild(cell);
+        });
+        var avgCell = el("div", "cell");
+        avgCell.appendChild(el("div", "v", avgDelay !== null ? avgDelay + "d" : "&#8213;"));
+        avgCell.appendChild(el("div", "l", "Avg Delay (Signed)"));
+        statRow.appendChild(avgCell);
+        card.appendChild(statRow);
+        card.addEventListener("click", function () {
+          masterPoXh.setFilter("category", isActive ? null : [cat.replace(/_/g, " ")]);
+        });
+        grid.appendChild(card);
+      });
+    }
+    masterPoXh.onChange(renderAll);
+    function renderTable() {
+      var filtered = masterPoXh.process(searchFiltered());
+      document.getElementById("repMasterPoCount").textContent = "Showing " + filtered.length + " of " + rows.length + " PO/deliverable items";
+      var body = document.getElementById("repMasterPoBody");
+      body.innerHTML = "";
+      if (!filtered.length) { body.innerHTML = '<tr><td colspan="10" style="text-align:center;color:var(--ink-500);padding:30px;">No matching PO/deliverable items.</td></tr>'; return; }
+      filtered.forEach(function (r) {
+        var tr = el("tr");
+        // Item [request 11]: was plain text -- same good/neutral pill every
+        // other contract-status cell in the app already uses (line ~6786).
+        tr.appendChild(el("td", "", r.contract_status
+          ? '<span class="pill ' + (r.contract_status === "Signed" ? "good" : "neutral") + '"><span class="dot"></span>' + r.contract_status + "</span>"
+          : "&#8213;"));
+        tr.appendChild(el("td", "", r.est_no + " &middot; " + r.project_name));
+        tr.appendChild(el("td", "", r.current_item_no || "&#8213;"));
+        tr.appendChild(el("td", "", r.name));
+        tr.appendChild(el("td", "", r.po_number || "&#8213;"));
+        tr.appendChild(el("td", "", r.category.replace(/_/g, " ")));
+        tr.appendChild(el("td", "", '<span class="rep-po-badge ' + _PO_STATUS_BADGE[r.po_status] + '">' + _PO_STATUS_LABEL2[r.po_status] + '</span>'));
+        tr.appendChild(el("td", "", fmtDate(r.final_due_date)));
+        tr.appendChild(el("td", "", r.actual_or_signed ? fmtDate(r.actual_or_signed) : "&#8213;"));
+        tr.appendChild(el("td", "", '<span class="rep-po-badge ' + r.delay_badge + '">' + r.delay_label + '</span>'));
+        body.appendChild(tr);
+      });
+    }
+    function renderAll() { renderCategoryCards(); renderTable(); }
+    search.oninput = renderAll;
+    renderAll();
+  }
+  // Item 12: the standalone "Master PO" nav tab -- runs the exact same
+  // load/render as the Reports page's Master PO Report (zero risk of the
+  // two ever showing different data or filters), then relocates the
+  // now-populated node into this tab's own mount point.
+  async function loadMasterPo() {
+    await loadReportMasterPo();
+    document.getElementById("masterPoMount").appendChild(document.getElementById("masterPoCore"));
+    document.getElementById("masterPoTitle").textContent = "Master POs List";
+  }
+
+  async function loadReportOverviewPo() {
+    // [Overview PO 3-projects bug]: master-po only emits a row for a
+    // project once it has at least one real PoLineItem (po_cycle_summary
+    // returns an empty items list otherwise) -- so a project that hasn't
+    // started PO Lifecycle tracking yet had no row anywhere, and byProject
+    // below (built purely from those rows) silently dropped it instead of
+    // showing it with 0 items, same as every other report in this app
+    // that keeps an empty-but-real card visible rather than hiding it.
+    // Fetching the L1 project list directly and seeding byProject from it
+    // first means every active L1 project always gets a card.
+    var results = await Promise.all([
+      api("/api/reports/master-po?actor_role=" + encodeURIComponent(CURRENT_ROLE)),
+      api("/api/reports/budget-status?actor_role=" + encodeURIComponent(CURRENT_ROLE)),
+      api("/api/projects?stage=L1"),
+    ]);
+    var rows = results[0], budgetRows = results[1], l1Projects = results[2];
+    var budgetByProject = {};
+    budgetRows.forEach(function (b) { budgetByProject[b.est_no] = b.items; });
+    function budgetTier(b) {
+      if (!b) return "neutral";
+      if (b.status === "approved") return "excellent";
+      if (b.deadline_status === "due") return "needs-action";
+      if (b.status === "in_progress" || b.status === "pending_review") return "acceptable";
+      return "neutral";
+    }
+
+    var byProject = {};
+    l1Projects.filter(function (p) { return !p.archived; }).forEach(function (p) {
+      byProject[p.est_no] = { est_no: p.est_no, project_name: p.name, project_manager: p.project_manager,
+        bid_manager: p.bid_manager, contract_status: p.contract_status, rows: [] };
+    });
+    rows.forEach(function (r) { (byProject[r.est_no] = byProject[r.est_no] || { est_no: r.est_no, project_name: r.project_name, project_manager: r.project_manager, bid_manager: r.bid_manager, contract_status: r.contract_status, rows: [] }).rows.push(r); });
+    var projects = Object.keys(byProject).map(function (k) { return byProject[k]; }).sort(function (a, b) { return a.est_no < b.est_no ? -1 : 1; });
+
+    var catSel = document.getElementById("repOverviewPoCategoryFilter");
+    catSel.innerHTML = '<option value="">All</option>';
+    Object.keys(PO_CATEGORY_LABELS).forEach(function (c) { var o = el("option", "", PO_CATEGORY_LABELS[c]); o.value = c; catSel.appendChild(o); });
+
+    function filteredProjects() {
+      var catF = catSel.value, statusF = document.getElementById("repOverviewPoStatusFilter").value,
+          projStatusF = document.getElementById("repOverviewPoProjectStatusFilter").value,
+          searchTerm = document.getElementById("repOverviewPoSearch").value.trim().toLowerCase();
+      return projects.filter(function (p) {
+        if (projStatusF && p.contract_status !== projStatusF) return false;
+        if (searchTerm && (p.project_name + " " + p.est_no).toLowerCase().indexOf(searchTerm) === -1) return false;
+        var itemRows = p.rows.filter(function (r) { return (!catF || r.category === catF) && (!statusF || r.po_status === statusF); });
+        return itemRows.length > 0 || (!catF && !statusF);
+      });
+    }
+
+    function renderStatStrip() {
+      var allItems = rows;
+      var counts = _poCountsFromRows(allItems);
+      var wrap = document.getElementById("repOverviewPoStatGrid");
+      wrap.innerHTML = "";
+      [["Total Projects", projects.length, ""], ["PO / Deliverable Items", allItems.length, ""],
+       ["Signed by both parties", counts["signed"] || 0, "excellent"], ["Not Due", counts["not-due"] || 0, ""],
+       ["Pending (Due)", counts["pending-due"] || 0, "needs-action"]].forEach(function (t) {
+        var box = el("div", "rep-po-stat");
+        box.appendChild(el("div", "v " + t[2], String(t[1])));
+        box.appendChild(el("div", "l", t[0]));
+        wrap.appendChild(box);
+      });
+    }
+    function renderConcernsImprovements() {
+      var wrap = document.getElementById("repOverviewPoCiRow");
+      wrap.innerHTML = "";
+      // [Adapted from the reference]: its Concerns/Improvements are computed
+      // from Excel-specific signals (date-source conflicts, historical
+      // model-vs-model comparisons) this app has no equivalent data for --
+      // these instead surface the two most genuinely useful real signals
+      // this app's own data actually supports: which items are overdue
+      // right now, and which category currently has the best signed rate.
+      var overdue = rows.filter(function (r) { return r.po_status === "pending-due"; });
+      var concerns = el("div", "rep-po-concerns");
+      concerns.appendChild(el("h3", "rep-po-ci-title", "&#9888; Concerns"));
+      var cList = el("div", "rep-po-ci-list");
+      if (overdue.length) {
+        var item = el("div", "rep-po-ci-item");
+        item.appendChild(el("div", "rep-po-ci-icon", "&#9888;"));
+        var body = el("div", "rep-po-ci-body");
+        body.appendChild(el("div", "rep-po-ci-item-title", "Overdue PO/Deliverable Items"));
+        body.appendChild(el("div", "rep-po-ci-desc", overdue.length + " item" + (overdue.length === 1 ? "" : "s") + " past due across " +
+          Object.keys(overdue.reduce(function (a, r) { a[r.est_no] = 1; return a; }, {})).length + " project(s)"));
+        item.appendChild(body);
+        cList.appendChild(item);
+      } else {
+        cList.appendChild(el("div", "rep-po-ci-item", '<div class="rep-po-ci-icon">&#10003;</div><div class="rep-po-ci-body"><div class="rep-po-ci-item-title">Nothing overdue</div><div class="rep-po-ci-desc">Every tracked PO/deliverable item is either signed or not yet due.</div></div>'));
+      }
+      concerns.appendChild(cList);
+      wrap.appendChild(concerns);
+
+      var byCat = {};
+      rows.forEach(function (r) { (byCat[r.category] = byCat[r.category] || []).push(r); });
+      var best = null;
+      Object.keys(byCat).forEach(function (cat) {
+        var catRows = byCat[cat];
+        var pct = catRows.length ? (catRows.filter(function (r) { return r.po_status === "signed"; }).length / catRows.length) : 0;
+        if (!best || pct > best.pct) best = { cat: cat, pct: pct, total: catRows.length };
+      });
+      var improvements = el("div", "rep-po-improvements");
+      improvements.appendChild(el("h3", "rep-po-ci-title", "&#10003; Improvements"));
+      var iList = el("div", "rep-po-ci-list");
+      if (best && best.total) {
+        var iItem = el("div", "rep-po-ci-item");
+        iItem.appendChild(el("div", "rep-po-ci-icon", "&#10003;"));
+        var iBody = el("div", "rep-po-ci-body");
+        iBody.appendChild(el("div", "rep-po-ci-item-title", (best.cat.replace(/_/g, " ")) + " Leading on Signed Rate"));
+        iBody.appendChild(el("div", "rep-po-ci-desc", Math.round(best.pct * 100) + "% signed (" + best.total + " item" + (best.total === 1 ? "" : "s") + ")"));
+        iItem.appendChild(iBody);
+        iList.appendChild(iItem);
+      } else {
+        iList.appendChild(el("div", "rep-po-ci-item", '<div class="rep-po-ci-icon">&#10003;</div><div class="rep-po-ci-body"><div class="rep-po-ci-item-title">No data yet</div></div>'));
+      }
+      improvements.appendChild(iList);
+      wrap.appendChild(improvements);
+    }
+    function renderProjectCards() {
+      var filtered = filteredProjects();
+      document.getElementById("repOverviewPoCount").textContent = "Showing " + filtered.length + " of " + projects.length + " projects";
+      var grid = document.getElementById("repOverviewPoGrid");
+      grid.innerHTML = "";
+      if (!filtered.length) { grid.appendChild(el("div", "empty-state", "No matching projects.")); return; }
+      filtered.forEach(function (p) {
+        var counts = _poCountsFromRows(p.rows);
+        var total = p.rows.length;
+        var card = el("div", "rep-po-card");
+        var head = el("div", "rep-po-card-head");
+        head.appendChild(el("div", "rep-po-card-title", p.project_name));
+        head.appendChild(el("span", "rep-po-badge " + (p.contract_status === "Signed" ? "excellent" : "neutral"), p.contract_status || "&#8213;"));
+        card.appendChild(head);
+        card.appendChild(el("div", "rep-po-card-sub", p.est_no));
+        var pmRow = el("div", "rep-po-pm-row");
+        pmRow.appendChild(el("div", "rep-po-pm-label", "Project Manager"));
+        var chips = el("div", "rep-po-pm-chips");
+        var pmEmail = p.project_manager || p.bid_manager;
+        if (pmEmail) {
+          var chip = el("span", "rep-po-pm-chip", pmEmail);
+          chip.dataset.email = pmEmail;
+          chip.title = "Click to copy &middot; " + pmEmail;
+          chips.appendChild(chip);
+        } else {
+          chips.appendChild(el("span", "rep-po-pm-chip-empty", "&#8213;"));
+        }
+        pmRow.appendChild(chips);
+        card.appendChild(pmRow);
+        card.appendChild(_poBar(counts, total));
+        card.appendChild(el("div", "rep-po-progress-label", _poProgressLabel(counts, total)));
+        var statRow = el("div", "rep-po-stat-row cols-3");
+        [["signed", "Signed", "excellent"], ["not-due", "Not Due", ""], ["pending-due", "Pending (Due)", "needs-action"]].forEach(function (t) {
+          var cell = el("div", "cell");
+          cell.appendChild(el("div", "v " + (counts[t[0]] ? t[2] : ""), String(counts[t[0]] || 0)));
+          cell.appendChild(el("div", "l", t[1]));
+          statRow.appendChild(cell);
+        });
+        card.appendChild(statRow);
+        var badgeRow = el("div", "rep-po-badges-row");
+        var b = budgetByProject[p.est_no] || {};
+        badgeRow.appendChild(el("span", "rep-po-badge " + budgetTier(b["6.1"]), "Temp Budget"));
+        badgeRow.appendChild(el("span", "rep-po-badge " + budgetTier(b["6.2"]), "Tendering Budget"));
+        badgeRow.appendChild(el("span", "rep-po-badge " + budgetTier(b["6.3"]), "Locked Budget"));
+        card.appendChild(badgeRow);
+        grid.appendChild(card);
+      });
+      _wirePmChips(grid);
+    }
+    function renderAll() { renderStatStrip(); renderConcernsImprovements(); renderProjectCards(); }
+    [catSel, document.getElementById("repOverviewPoStatusFilter"), document.getElementById("repOverviewPoProjectStatusFilter")]
+      .forEach(function (s) { s.onchange = renderAll; });
+    document.getElementById("repOverviewPoSearch").oninput = renderAll;
+    document.getElementById("repOverviewPoClearFilters").onclick = function () {
+      catSel.value = ""; document.getElementById("repOverviewPoStatusFilter").value = "";
+      document.getElementById("repOverviewPoProjectStatusFilter").value = ""; document.getElementById("repOverviewPoSearch").value = "";
+      renderAll();
+    };
+    renderAll();
+  }
+
+  // [Budget Status report design]: one compact row per project -- a thin
+  // 3-segment bar (6.1/6.2/6.3), reusing the exact slim .rep-po-bar look
+  // Master PO/Overview PO's own cards already use (10px tall, joined
+  // segments) instead of the old label+icon+note boxes, so 30 projects
+  // still fit on a printable page. poSingleStatus (the same function
+  // renderPoLifecycle's own poCard() uses) still decides each segment's
+  // color; full detail (label, status, awaiting-note) moves into a native
+  // title="" tooltip per segment instead of being spelled out inline, and
+  // a single short trailing comment (_budgetRowNote) surfaces just the
+  // one thing that needs attention -- "Next: 6.2" / "Pending 6.3" / an
+  // overdue day-count -- mirroring PO Lifecycle's own terse card language.
+  // Segments stay clickable (openDelivModal), same as before.
+  var _BUDGET_LABELS = { "6.1": "6.1 Temp Budget", "6.2": "6.2 Tendering Budget", "6.3": "6.3 Locked Budget" };
+  function _budgetSegTitle(itemNo, item, tier) {
+    var label = _BUDGET_LABELS[itemNo];
+    if (!item) return label + " — not yet created for this project";
+    var statusText = tier === "done" ? "Completed" : tier === "progress" ? "In Progress" : tier === "blocked" ? "Blocked" : "Pending";
+    if (tier === "blocked" && item.deadline_status === "due" && item.deadline_days !== null && item.deadline_days !== undefined) {
+      statusText = Math.abs(item.deadline_days) + "d overdue";
+    }
+    return label + " — " + statusText + (item.awaiting_note ? " — " + item.awaiting_note : "");
+  }
+  function _budgetRowNote(r) {
+    var keys = ["6.1", "6.2", "6.3"];
+    for (var i = 0; i < keys.length; i++) {
+      var key = keys[i];
+      var item = r.items[key];
+      var tier = item ? poSingleStatus(item) : "pending";
+      if (tier === "done") continue;
+      if (tier === "blocked" && item && item.deadline_status === "due" && item.deadline_days !== null && item.deadline_days !== undefined) {
+        return key + " — " + Math.abs(item.deadline_days) + "d overdue";
+      }
+      if (tier === "progress") return "Next: " + key;
+      return "Pending " + key;
+    }
+    return "Complete";
+  }
+  // [Budget report table]: same tier vocabulary poSingleStatus already
+  // returns (done/progress/blocked/pending) as the old dropdown's own
+  // option labels -- kept identical so the column filter reads the same
+  // way the removed dropdown did.
+  var _BUDGET_TIER_LABEL = { done: "Complete", progress: "In Progress", blocked: "Blocked / Overdue", pending: "Not Due Yet" };
+  var _BUDGET_TIER_BADGE = { done: "excellent", progress: "acceptable", blocked: "needs-action", pending: "neutral" };
+  var _budgetXh = null;
+  var _budgetAllRows = [];
+  function _budgetXhController() {
+    if (_budgetXh) return _budgetXh;
+    function uniq(getter) {
+      return function () {
+        var seen = {}, out = [];
+        _budgetAllRows.forEach(function (r) {
+          var v = getter(r); v = v == null ? "" : String(v);
+          if (!seen[v]) { seen[v] = true; out.push(v); }
+        });
+        return out.sort(function (a, b) { return a.localeCompare(b, undefined, { numeric: true, sensitivity: "base" }); });
+      };
+    }
+    var projectOf = function (r) { return r.est_no + " " + r.project_name; };
+    var statusOf = function (r) { return r.contract_status || ""; };
+    function tierOf(itemNo) {
+      return function (r) { return _BUDGET_TIER_LABEL[r.items[itemNo] ? poSingleStatus(r.items[itemNo]) : "pending"]; };
+    }
+    var columns = [
+      { key: "est_no", get: function (r) { return r.est_no; }, uniqueValues: uniq(function (r) { return r.est_no; }) },
+      { key: "project", get: projectOf, uniqueValues: uniq(projectOf) },
+      { key: "contract_status", get: statusOf, uniqueValues: uniq(statusOf) },
+      { key: "t61", get: tierOf("6.1"), uniqueValues: uniq(tierOf("6.1")) },
+      { key: "t62", get: tierOf("6.2"), uniqueValues: uniq(tierOf("6.2")) },
+      { key: "t63", get: tierOf("6.3"), uniqueValues: uniq(tierOf("6.3")) },
+      { key: "note", get: _budgetRowNote, uniqueValues: uniq(_budgetRowNote) },
+    ];
+    var theadRow = document.getElementById("repBudgetBody").closest("table").querySelector("thead tr");
+    _budgetXh = installExcelHeader(theadRow, columns);
+    return _budgetXh;
+  }
+  async function loadReportBudgetStatus() {
+    var rows = await api("/api/reports/budget-status?actor_role=" + encodeURIComponent(CURRENT_ROLE));
+    _budgetAllRows = rows;
+    var xh = _budgetXhController();
+    xh.onChange(render);
+
+    function render() {
+      var filtered = xh.process(rows);
+      document.getElementById("repBudgetCount").textContent = "Showing " + filtered.length + " of " + rows.length + " projects";
+      var body = document.getElementById("repBudgetBody");
+      body.innerHTML = "";
+      if (!filtered.length) { body.innerHTML = '<tr><td colspan="7" style="text-align:center;color:var(--ink-500);padding:30px;">No matching projects.</td></tr>'; return; }
+      filtered.forEach(function (r) {
+        var tr = el("tr");
+        // Item [Budget L1 identity]: this report is L1-only (Oracle budget
+        // items only ever exist on L1 projects) -- Est-No now carries the
+        // same est-no.l1 green identity color every other L1 table uses,
+        // instead of plain text.
+        tr.appendChild(el("td", "est-no l1", r.est_no));
+        tr.appendChild(el("td", "", '<span class="proj-name">' + r.project_name + '</span>'));
+        tr.appendChild(el("td", "", r.contract_status
+          ? '<span class="pill ' + (r.contract_status === "Signed" ? "good" : "neutral") + '"><span class="dot"></span>' + r.contract_status + "</span>"
+          : "&#8213;"));
+        ["6.1", "6.2", "6.3"].forEach(function (itemNo) {
+          var item = r.items[itemNo];
+          var tier = item ? poSingleStatus(item) : "pending";
+          var td = el("td", "", '<span class="rep-po-badge ' + _BUDGET_TIER_BADGE[tier] + '" title="' +
+            _budgetSegTitle(itemNo, item, tier) + '">' + _BUDGET_TIER_LABEL[tier] + "</span>");
+          if (item && item.submission_id) {
+            td.style.cursor = "pointer";
+            td.addEventListener("click", function () { openDelivModal(item.submission_id); });
+          }
+          tr.appendChild(td);
+        });
+        tr.appendChild(el("td", "", _budgetRowNote(r)));
+        body.appendChild(tr);
+      });
+    }
+    render();
+  }
+
+  /* ================= CUSTOM REPORT BUILDER (item 11) =================
+     Deliberately reuses the platform's own existing, already-correct data
+     endpoints (Projects, Deliverables, Performance, PO Line Items,
+     Requests) instead of a new generic query layer -- every field offered
+     here is a real field one of those endpoints already returns, so
+     there's no risk of this ever showing stale or differently-computed
+     numbers than the dedicated pages for the same data. "Pick columns" is
+     purely a display-time concern: the full row is always fetched, only
+     which fields render as table columns changes. */
+  var RC_ENTITIES = {
+    projects: {
+      label: "Projects (L0/L1)",
+      fields: {
+        est_no: "Est No.", name: "Name", stage: "Stage", status: "Status", contract_status: "Contract Status",
+        bid_manager: "Bid Manager", project_manager: "Project Manager", region: "Region", scope: "Scope",
+        business_units: "Business Units", announcement_date: "Announced", bsd: "BSD",
+        is_international: "International", archived: "Archived",
+      },
+      // Item 11 (redlined): standard status pills/colors, same as used
+      // everywhere else in the platform, instead of plain text.
+      pillFields: { status: function (v) { return [PROJECT_STATUS_CLASS[v] || "neutral", v]; } },
+      defaultFields: ["est_no", "name", "stage", "status", "bid_manager"],
+      fetch: async function () {
+        var rows = await api("/api/projects");
+        return rows.map(function (p) {
+          return {
+            est_no: p.est_no, name: p.name, stage: p.stage, status: p.status, contract_status: p.contract_status || "",
+            bid_manager: p.bid_manager || "", project_manager: p.project_manager || "",
+            region: joinList(p.region), scope: joinList(p.scope), business_units: joinList(p.business_units),
+            announcement_date: fmtDate(p.announcement_date), bsd: fmtDate(p.bsd),
+            is_international: p.is_international ? "Yes" : "No", archived: p.archived ? "Yes" : "No",
+          };
+        });
+      },
+    },
+    deliverables: {
+      label: "Deliverables",
+      fields: {
+        est_no: "Est No.", project_name: "Project", stage: "Stage", department: "Department", item_no: "Item No.",
+        name: "Name", status: "Progress", deadline_status: "Deadline", due_date: "Due Date", owner: "Owner",
+        is_milestone: "Milestone", doc_total: "Docs", points_earned: "Points",
+      },
+      pillFields: {
+        status: function (v) { var m = STATUS_META[v] || ["neutral", v]; return m; },
+        deadline_status: function (v) { var m = DEADLINE_META[v] || ["neutral", v]; return m; },
+      },
+      defaultFields: ["est_no", "item_no", "name", "department", "status", "due_date"],
+      fetch: async function () {
+        var rows = await api("/api/deliverables?actor_role=Admin");
+        return rows.map(function (d) {
+          return {
+            est_no: d.est_no, project_name: d.project_name, stage: d.stage, department: d.department,
+            item_no: d.item_no, name: d.name, status: d.status, deadline_status: d.deadline_status,
+            due_date: fmtDate(d.due_date), owner: d.owner, is_milestone: d.is_milestone ? "Yes" : "No",
+            doc_total: d.doc_total, points_earned: d.points_earned == null ? "" : d.points_earned,
+          };
+        });
+      },
+    },
+    performance: {
+      label: "Performance (by department)",
+      fields: { department: "Department", l0_pct: "L0 %", l0_status: "L0 Status", l1_pct: "L1 %", l1_status: "L1 Status" },
+      pillFields: {
+        l0_status: function (v) { return [perfStatusClass(v), v]; },
+        l1_status: function (v) { return [perfStatusClass(v), v]; },
+      },
+      pillClass: "rep-po-badge",
+      defaultFields: ["department", "l0_pct", "l0_status", "l1_pct", "l1_status"],
+      fetch: async function () {
+        var data = await api("/api/dashboard/performance");
+        return data.departments.map(function (d) {
+          return {
+            department: deptLabel(d.name, d.number),
+            l0_pct: d.l0.percentage === null ? "" : d.l0.percentage + "%", l0_status: d.l0.status,
+            l1_pct: d.l1.percentage === null ? "" : d.l1.percentage + "%", l1_status: d.l1.status,
+          };
+        });
+      },
+    },
+    po: {
+      label: "PO Line Items",
+      fields: {
+        est_no: "Est No.", project_name: "Project", department: "Department", category: "PO Category",
+        name: "PO / Deliverable", po_status: "PO Status", final_due_date: "Final Due Date",
+        actual_or_signed: "Actual / Signed", delay_label: "Delay",
+      },
+      // po_status stays the raw key (e.g. "signed") here, not the display
+      // label, so the pill lookup below has something to key off of.
+      pillFields: { po_status: function (v) { return [_PO_STATUS_BADGE[v] || "neutral", _PO_STATUS_LABEL2[v] || v]; } },
+      pillClass: "rep-po-badge",
+      defaultFields: ["est_no", "category", "name", "po_status", "delay_label"],
+      fetch: async function () {
+        var rows = await api("/api/reports/master-po?actor_role=Admin");
+        return rows.map(function (r) {
+          return {
+            est_no: r.est_no, project_name: r.project_name, department: r.department || "",
+            category: r.category.replace(/_/g, " "), name: r.name, po_status: r.po_status,
+            final_due_date: fmtDate(r.final_due_date), actual_or_signed: r.actual_or_signed ? fmtDate(r.actual_or_signed) : "",
+            delay_label: r.delay_label,
+          };
+        });
+      },
+    },
+    requests: {
+      label: "Requests (all types)",
+      fields: { type: "Type", title: "Request", requested_by: "Requested By", status: "Status", requested_at: "Requested" },
+      pillFields: { status: function (v) { var m = { pending: ["warn", "Pending"], approved: ["good", "Approved"], rejected: ["crit", "Rejected"] }; return m[v] || ["neutral", v]; } },
+      defaultFields: ["type", "title", "requested_by", "status", "requested_at"],
+      fetch: async function () {
+        var results = await Promise.all([
+          api("/api/deliverables/due-date-requests?status="),
+          api("/api/deliverables/reassignment-requests?status="),
+          api("/api/departments/sme-nominations?status="),
+          api("/api/projects/bid-value-requests?status="),
+          api("/api/departments/user-add-requests?status="),
+          api("/api/deliverables/config/formula-change-requests?status="),
+        ]);
+        var rows = [];
+        results[0].forEach(function (r) { rows.push({ type: (r.kind === "extension" ? "Extension" : "Hold"), title: r.item_no + " " + r.name, requested_by: r.requested_by_email, status: r.status, requested_at: fmtDate((r.requested_at || "").slice(0, 10)) }); });
+        results[1].forEach(function (r) { rows.push({ type: "Reassignment", title: r.item_no + " " + r.name, requested_by: r.from_email || "", status: r.status, requested_at: fmtDate((r.requested_at || "").slice(0, 10)) }); });
+        results[2].forEach(function (n) { rows.push({ type: "SME Nomination", title: n.item_no + " " + n.item_name, requested_by: n.email || "", status: n.status, requested_at: fmtDate((n.requested_at || "").slice(0, 10)) }); });
+        results[3].forEach(function (r) { rows.push({ type: "Bid Value Access", title: r.est_no + " " + r.name, requested_by: r.requested_by_email || "", status: r.status, requested_at: fmtDate((r.requested_at || "").slice(0, 10)) }); });
+        results[4].forEach(function (r) { rows.push({ type: "L0-L1 Group Add", title: (r.name || r.email), requested_by: r.email, status: r.status, requested_at: fmtDate((r.requested_at || "").slice(0, 10)) }); });
+        results[5].forEach(function (r) { rows.push({ type: "Formula Change", title: r.department, requested_by: r.requested_by_email || "", status: r.status, requested_at: fmtDate((r.requested_at || "").slice(0, 10)) }); });
+        return rows;
+      },
+    },
+  };
+  var rcEntity = "projects", rcRows = [], rcFields = {};
+  var rcXh = null, rcXhColsKey = null; // Item 4/11/36: Excel header (sort+filter) over the dynamic column set
+  async function loadReportCustom() {
+    var toggle = document.getElementById("rcEntityToggle");
+    toggle.innerHTML = "";
+    Object.keys(RC_ENTITIES).forEach(function (key) {
+      var chip = el("button", "chip" + (key === rcEntity ? " active" : ""), RC_ENTITIES[key].label);
+      chip.addEventListener("click", function () { _rcSelectEntity(key); });
+      toggle.appendChild(chip);
+    });
+    document.getElementById("rcSearch").oninput = _rcRenderTable;
+    await _rcSelectEntity(rcEntity);
+  }
+  async function _rcSelectEntity(key) {
+    rcEntity = key;
+    document.querySelectorAll("#rcEntityToggle .chip").forEach(function (c, i) {
+      c.classList.toggle("active", Object.keys(RC_ENTITIES)[i] === key);
+    });
+    var def = RC_ENTITIES[key];
+    rcFields = {};
+    def.defaultFields.forEach(function (f) { rcFields[f] = true; });
+    rcXh = null; rcXhColsKey = null; // Item 4/36: fresh Excel header for the new entity's fields
+    document.getElementById("rcSearch").value = "";
+    _rcRenderFieldGrid();
+    rcRows = await def.fetch();
+    _rcRenderTable();
+  }
+  function _rcRenderFieldGrid() {
+    var grid = document.getElementById("rcFieldGrid");
+    grid.innerHTML = "";
+    var def = RC_ENTITIES[rcEntity];
+    Object.keys(def.fields).forEach(function (key) {
+      var label = el("label", "rc-field-check");
+      label.innerHTML = '<input type="checkbox" value="' + key + '"' + (rcFields[key] ? " checked" : "") + " /> " + def.fields[key];
+      label.querySelector("input").addEventListener("change", function (e) {
+        if (e.target.checked) rcFields[key] = true; else delete rcFields[key];
+        _rcRenderTable();
+      });
+      grid.appendChild(label);
+    });
+  }
+  // Item 11 (redlined): "fix the same filter issue in item 4, filtering
+  // from headers" -- Custom Report's columns are user-picked and change on
+  // every checkbox toggle, so the Excel header only gets rebuilt (fresh
+  // sort/filter state) when the actual column *set* changes; typing in the
+  // free-text search box or re-paging keeps whatever header state is
+  // already active.
+  function _rcRenderTable() {
+    var def = RC_ENTITIES[rcEntity];
+    var cols = Object.keys(def.fields).filter(function (k) { return rcFields[k]; });
+    var term = document.getElementById("rcSearch").value.trim().toLowerCase();
+    // Searches every field this entity has, not just the visible columns --
+    // "Jeddah" should still find a deliverable row even when Project isn't
+    // one of the currently-checked columns.
+    var allKeys = Object.keys(def.fields);
+    var filtered = !term ? rcRows : rcRows.filter(function (r) {
+      return allKeys.some(function (c) { return String(r[c] == null ? "" : r[c]).toLowerCase().indexOf(term) !== -1; });
+    });
+    var head = document.getElementById("rcTableHead");
+    var colsKey = cols.join("|");
+    if (colsKey !== rcXhColsKey) {
+      head.innerHTML = "";
+      rcXhColsKey = colsKey;
+      if (!cols.length) {
+        head.appendChild(el("th", "", "Pick at least one column above"));
+        rcXh = null;
+      } else {
+        cols.forEach(function (c) { head.appendChild(el("th", "", def.fields[c])); });
+        var xhColumns = cols.map(function (c) {
+          var pf = def.pillFields && def.pillFields[c];
+          var display = function (r) { return pf ? pf(r[c])[1] : r[c]; };
+          return {
+            key: c, get: display,
+            uniqueValues: function () {
+              var seen = {}, out = [];
+              rcRows.forEach(function (r) {
+                var v = display(r); v = v == null ? "" : String(v);
+                if (!seen[v]) { seen[v] = true; out.push(v); }
+              });
+              return out.sort(function (a, b) { return a.localeCompare(b, undefined, { numeric: true, sensitivity: "base" }); });
+            },
+          };
+        });
+        rcXh = installExcelHeader(head, xhColumns);
+        rcXh.onChange(function () { _rcRenderTable(); });
+      }
+    }
+    if (rcXh) filtered = rcXh.process(filtered);
+    document.getElementById("rcCount").textContent = "Showing " + filtered.length + " of " + rcRows.length + " rows";
+    var body = document.getElementById("rcTableBody");
+    body.innerHTML = "";
+    if (!cols.length || !filtered.length) {
+      var tr0 = el("tr");
+      var td0 = el("td", "", cols.length ? "No matching rows." : "");
+      td0.setAttribute("colspan", String(Math.max(cols.length, 1)));
+      tr0.appendChild(td0);
+      body.appendChild(tr0);
+      return;
+    }
+    renderPager(document.getElementById("rcPager"), filtered, 15, function (pageItems) {
+      body.innerHTML = "";
+      pageItems.forEach(function (r) {
+        var tr = el("tr");
+        cols.forEach(function (c) {
+          var pf = def.pillFields && def.pillFields[c];
+          if (pf && r[c] != null && r[c] !== "") {
+            var meta = pf(r[c]);
+            tr.appendChild(el("td", "", '<span class="' + (def.pillClass || "pill") + " " + meta[0] + '">' +
+              (def.pillClass ? "" : '<span class="dot"></span>') + meta[1] + "</span>"));
+          } else {
+            tr.appendChild(el("td", "", r[c] == null || r[c] === "" ? "&#8213;" : String(r[c])));
+          }
+        });
+        body.appendChild(tr);
+      });
+    });
+  }
+  document.getElementById("rcPrintBtn").addEventListener("click", function () { window.print(); });
+  document.getElementById("rcExportBtn").addEventListener("click", function () {
+    var def = RC_ENTITIES[rcEntity];
+    var cols = Object.keys(def.fields).filter(function (k) { return rcFields[k]; });
+    if (!cols.length) { showToast("Pick at least one column first", true); return; }
+    var term = document.getElementById("rcSearch").value.trim().toLowerCase();
+    var allKeys = Object.keys(def.fields);
+    var filtered = !term ? rcRows : rcRows.filter(function (r) {
+      return allKeys.some(function (c) { return String(r[c] == null ? "" : r[c]).toLowerCase().indexOf(term) !== -1; });
+    });
+    if (rcXh) filtered = rcXh.process(filtered);
+    var exportCols = cols.map(function (c) { return { key: c, label: def.fields[c] }; });
+    var pillFields = def.pillFields || {};
+    var exportRows = filtered.map(function (r) {
+      var out = {};
+      cols.forEach(function (c) {
+        var pf = pillFields[c];
+        var v = pf && r[c] != null && r[c] !== "" ? pf(r[c])[1] : r[c];
+        out[c] = v == null ? "" : String(v);
+      });
+      return out;
+    });
+    _postXlsxExport("Custom Report – " + (def.label || rcEntity), exportCols, exportRows);
+  });
+
+  /* ================= JOURNEY / HISTORY ================= */
+  async function loadJourney() {
+    // Item 131 rework: the tab has no reference page of its own anymore --
+    // opens straight into the walkthrough. Fallback content (just the
+    // reopen button) stays underneath for when the modal is closed.
+    openTour();
+  }
+
+  /* ================= ACTIVITY TRAIL (L0 Tenders / L1 Projects tab) ================= */
+  // "Done" marks reuse the exact same checkmark-circle SVG the PO Lifecycle
+  // tab uses (poIcon("done"), defined below -- function declarations are
+  // hoisted, so it's already callable here) instead of a plain emoji, for
+  // one consistent "this is complete" visual across the whole app.
+  var HISTORY_ACTION_ICON = {
+    submitted: "&#128228;", assigned: "&#128100;", review_requested: "&#128269;",
+    approved: poIcon("done"), rejected: "&#10060;", unlocked: "&#128275;",
+    document_added: "&#128206;", document_approved: poIcon("done"), document_rejected: "&#10060;",
+    reopened: "&#128257;", relocked: "&#128274;", auto_done: poIcon("done"),
+    extension_requested: "&#8987;", extension_approved: poIcon("done"), extension_rejected: "&#10060;",
+    hold_requested: "&#9208;", hold_approved: poIcon("done"), hold_rejected: "&#10060;", resumed: "&#9654;",
+    completion_date_edited: "&#128197;",
+    po_selection_updated: "&#128203;",
+  };
+  async function renderActivityTimeline(projectId, timelineId) {
+    var wrap = document.getElementById(timelineId);
+    if (!projectId) { wrap.innerHTML = ""; return; }
+    var events = await api("/api/projects/" + projectId + "/history");
+    wrap.innerHTML = "";
+    if (!events.length) { wrap.appendChild(el("div", "empty-state", "No activity recorded yet.")); return; }
+    events.slice().reverse().forEach(function (ev) {
+      var row = el("div", "journey-event");
+      row.appendChild(el("div", "journey-event-ic", HISTORY_ACTION_ICON[ev.action] || "&#128276;"));
+      var main = el("div", "journey-event-main");
+      var when = new Date(ev.at).toLocaleString("en-GB", { day: "2-digit", month: "short", year: "numeric", hour: "2-digit", minute: "2-digit" });
+      main.appendChild(el("div", "journey-event-top",
+        "<b>" + ev.item_no + "</b> &middot; " + ev.name + '<span class="journey-event-time">' + when + "</span>"));
+      main.appendChild(el("div", "journey-event-sub",
+        ev.action.replace(/_/g, " ") + " by <b>" + (ev.actor || "system") + "</b>" + (ev.note ? " &#8212; " + ev.note : "")));
+      row.appendChild(main);
+      wrap.appendChild(row);
+    });
+  }
+  /* ================= PO LIFECYCLE (read-only) ================= */
+  // All owner input (uploads, checklist ticks, item lists) happens on 1.2/
+  // 4.1/2.11/2.17's own deliverable windows -- see PO_DECLARING_ITEM_NOS
+  // above. This tab only ever displays what's already been approved there.
+  // Layout and metadata ported 1:1 from the approved "PO Lifecycle network"
+  // artifact sketch -- same column order, same card content, same registry
+  // trackers, real data underneath instead of mock examples.
+  var PO_CATEGORY_META = {
+    consultancy: { title: "Consultancy PO", desc: "Design firm — always exactly one" },
+    early_activity_mep: { title: "Early activities & MEP consultancies POs", desc: "one PR/PO cycle per item" },
+    long_lead: { title: "Long lead items POs", desc: "full award cycle, one per item" },
+    sc: { title: "S/C agreements", desc: "per item — which line applies depends on tender scope" },
+  };
+  // No hardcoded dept lists here on purpose -- a project only ever
+  // instantiates the ONE Operation Units BU variant its actual scope
+  // resolves to (rules.is_bu_applicable), so "TBU/PBU/DBU" as three
+  // generic chips would be misleading. poDeptTag() below reads the real
+  // department off the real submission instead.
+  // These `needs` lists are the real conceptual workflow dependencies (per
+  // Yasser, established during PO Lifecycle design) -- NOT always a literal
+  // mirror of the single predecessor_item_no field the due-date engine
+  // uses. The two can genuinely differ: 3.2's own due date is anchored on
+  // 1.3+10 workdays (the confirmed formula in seed.py, unrelated to this
+  // list), but the real thing gating whether 3.2 can *start* is 3.1 (issue
+  // RFQ, the next workday) -- the due-date anchor is a tentative-deadline
+  // ceiling, not the actionable blocker shown here. Don't "correct" these
+  // to match predecessor_item_no 1:1 without checking with Yasser first --
+  // that was tried and was wrong (see conversation).
+  var PO_ITEM_META = {
+    "1.1": { label: "Announcement", needs: [] },
+    "2.3": { label: "PM assigned", needs: ["1.1"] },
+    "1.2": { label: "Mobilization plan", needs: ["1.1"] },
+    "2.1": { label: "Cost center request", needs: ["1.2"] },
+    "2.13": { label: "Cost center request", needs: ["1.2"] },
+    "6.1": { label: "Temp budget", needs: ["2.1"] },
+    "4.3": { label: "Design SOW", needs: ["1.1"] },
+    "3.9": { label: "Share design offers", needs: ["4.3"] },
+    "4.4": { label: "Finalize design selection", needs: ["3.9"] },
+    "4.1": { label: "SC scope for early activities", needs: ["1.1"], note: "declares the early-activity items" },
+    "4.5": { label: "Vendor offers review", needs: ["1.2"] },
+    "2.2": { label: "Long-lead item PRs", needs: ["4.5", "6.1", "2.3"] },
+    "3.12": { label: "Prequalification of new vendors", needs: ["1.2"], note: "per item -- mark complete directly if not needed for that vendor" },
+    "3.1": { label: "Issue RFQ", needs: ["2.2", "3.12 (if required)"] },
+    "3.2": { label: "Negotiation window", needs: ["3.1"], note: "opens 4.6, but can't finish until 4.6 does" },
+    "4.6": { label: "Review SC vendor offers", needs: ["3.2 start"], note: "mutual gate with 3.2" },
+    "1.6": { label: "Contract signing", needs: [], note: "external / client-dependent anchor" },
+    "6.2": { label: "Baseline budget", needs: [], note: "anchored off-cycle via 1.3" },
+    "3.3": { label: "Award approval", needs: ["1.6", "3.2", "6.2"] },
+    "3.4": { label: "Top mgmt approval", needs: ["3.3"] },
+    "3.5": { label: "PO approval (Oracle)", needs: ["3.4"] },
+    "3.6": { label: "Internal PO signature", needs: ["3.5"] },
+    "3.7": { label: "Vendor PO signature", needs: ["3.6"] },
+    "2.6": { label: "Early-activity PRs", needs: ["4.1", "6.1", "2.3"] },
+    // [MEP sequence fix]: was needs: ["4.1", "6.1", "2.3", "2.13"] -- 4.1
+    // declares the EARLY-ACTIVITY items specifically (see 4.1's own note
+    // above), not MEP consultancies -- MEP fans out from 1.2, same as
+    // long-lead (CATEGORY_STEP_SEQUENCE.mep, backend's own
+    // CATEGORY_DECLARING_ITEM_NOS["mep"] == ["1.2"]), so 4.1 was never a
+    // real MEP prerequisite. 2.3 (PM assigned) dropped too -- 2.13 (cost
+    // center request) isn't PM-submitted, so it isn't a real gate on this
+    // step either.
+    "2.14": { label: "MEP consultancy PRs", needs: ["6.1", "2.13"] },
+    "3.11": { label: "Issue POs", needs: ["2.6", "2.14"], note: "one combined step — covers both early-activity and MEP lines" },
+    "2.7": { label: "Design-firm PR", needs: ["4.1", "6.1", "2.3"] },
+    "3.10": { label: "Design-firm PO", needs: ["2.7"] },
+    "2.11": { label: "Subcontract strategy", needs: ["1.2"], note: "declares the S/C items — OHTL/UGC scope" },
+    "2.17": { label: "Subcontract strategy", needs: ["1.2"], note: "declares the S/C items — SS scope" },
+    "3.8": { label: "Subcontract (OHTL/UGC)", needs: ["2.11", "1.6", "6.2"] },
+    "2.18": { label: "Subcontract (SS)", needs: ["1.6", "6.2"] },
+  };
+  // The single/context (project-level, non-fan-out) item_nos -- every
+  // PO_ITEM_META key that never appears in a CATEGORY_STEP_SEQUENCE chain.
+  // poEffectiveNextItemNo only ever drills into these: a fan-out item_no
+  // (e.g. "2.2") isn't resolvable via singleByItemNo (it has N independent
+  // submissions, not one), and its own current_item_no already reflects
+  // that item's real progress through its chain.
+  var PO_ANCHOR_ITEM_NOS = {
+    "1.1": 1, "2.3": 1, "1.2": 1, "2.1": 1, "2.13": 1, "6.1": 1, "4.3": 1, "3.9": 1,
+    "4.4": 1, "4.1": 1, "1.6": 1, "6.2": 1, "2.11": 1, "2.17": 1,
+  };
+  // Mirrors backend/routers/po_line_items.py's CATEGORY_STEP_SEQUENCE -- the
+  // per-item fan-out chain each PoLineItem in a category actually walks.
+  var PO_CATEGORY_STEP_SEQUENCE = {
+    long_lead: ["3.12", "4.5", "2.2", "3.1", "3.2", "4.6", "3.3", "3.4", "3.5", "3.6", "3.7"],
+    early_activity: ["3.12", "2.6", "3.11"],
+    mep: ["3.12", "2.14", "3.11"],
+    consultancy: ["2.7", "3.10"],
+    sc: ["3.12", "3.8", "2.18"],
+  };
+  // A fan-out item's own current_item_no (e.g. "2.6") only tells you where
+  // that item sits in ITS OWN chain -- it says nothing about whether the
+  // single-item prerequisites that chain step itself depends on (temp
+  // budget, cost center, PM assignment...) are actually satisfied yet. This
+  // walks that dependency graph upward and returns the real root blocker,
+  // e.g. "2.1" (cost center) instead of a misleadingly-optimistic "2.6".
+  function poEffectiveNextItemNo(itemNo, singleByItemNo, depth) {
+    depth = depth || 0;
+    var meta = PO_ITEM_META[itemNo];
+    if (!meta || !meta.needs.length || depth > 6) return itemNo;
+    for (var i = 0; i < meta.needs.length; i++) {
+      var token = meta.needs[i];
+      if (!PO_ANCHOR_ITEM_NOS[token] || !(token in singleByItemNo)) continue;
+      if (poSingleStatus(singleByItemNo[token]) !== "done") {
+        return poEffectiveNextItemNo(token, singleByItemNo, depth + 1);
+      }
+    }
+    return itemNo;
+  }
+  // The full real causal chain behind a category's fan-out sequence --
+  // every anchor prerequisite (budget, cost center, PM assignment...)
+  // interleaved ahead of the fan-out step it actually blocks, so the
+  // per-item progress track can show real granular progress instead of a
+  // misleadingly coarse 2-segment bar where "at step 1 of 2" always reads
+  // as roughly 50% even when neither step has actually started.
+  var PO_FULL_CHAIN_CACHE = {};
+  function poFullChainFor(category) {
+    if (PO_FULL_CHAIN_CACHE[category]) return PO_FULL_CHAIN_CACHE[category];
+    var seen = {}, chain = [];
+    function addAnchors(itemNo) {
+      var meta = PO_ITEM_META[itemNo];
+      if (!meta) return;
+      meta.needs.forEach(function (token) {
+        if (PO_ANCHOR_ITEM_NOS[token] && !seen[token]) {
+          addAnchors(token);
+          seen[token] = true;
+          chain.push(token);
+        }
+      });
+    }
+    (PO_CATEGORY_STEP_SEQUENCE[category] || []).forEach(function (itemNo) {
+      addAnchors(itemNo);
+      if (!seen[itemNo]) { seen[itemNo] = true; chain.push(itemNo); }
+    });
+    PO_FULL_CHAIN_CACHE[category] = chain;
+    return chain;
+  }
+  // Exact card order per column, matching the artifact -- single (project-
+  // level) items interleaved with fan-out (per-item) ones exactly as shown.
+  var PO_COLUMN_LAYOUT = {
+    consultancy: ["1.1", "2.3", "1.2", "2.1", "6.1", "4.3", "3.9", "4.4", "2.7", "3.10"],
+    early_activity_mep: ["1.1", "2.3", "1.2", "2.1", "2.13", "6.1", "4.1", "3.12", "2.6", "2.14", "3.11"],
+    long_lead: ["1.1", "2.3", "1.2", "2.1", "3.12", "4.5", "6.1", "2.2", "3.1", "3.2", "4.6", "1.6", "6.2", "3.3", "3.4", "3.5", "3.6", "3.7"],
+    sc: ["1.1", "2.3", "1.2", "2.11", "2.17", "3.12", "1.6", "6.2", "3.8", "2.18"],
+  };
+  function poIcon(status) {
+    var c = { done: "var(--good)", progress: "var(--warn)", blocked: "var(--crit)" }[status] || "var(--ink-500)";
+    if (status === "done") return '<svg width="14" height="14" viewBox="0 0 16 16"><circle cx="8" cy="8" r="7" fill="none" stroke="' + c + '" stroke-width="1.4"/><path d="M5 8.2L7 10.2L11 6" fill="none" stroke="' + c + '" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"/></svg>';
+    if (status === "progress") return '<svg width="14" height="14" viewBox="0 0 16 16"><circle cx="8" cy="8" r="7" fill="none" stroke="' + c + '" stroke-width="1.4"/><path d="M8 4.5V8L10.5 9.5" fill="none" stroke="' + c + '" stroke-width="1.4" stroke-linecap="round"/></svg>';
+    if (status === "blocked") return '<svg width="14" height="14" viewBox="0 0 16 16"><rect x="4" y="7.5" width="8" height="6" rx="1.3" fill="none" stroke="' + c + '" stroke-width="1.4"/><path d="M5.5 7.5V5.3A2.5 2.5 0 0 1 10.5 5.3V7.5" fill="none" stroke="' + c + '" stroke-width="1.4"/></svg>';
+    return '<svg width="14" height="14" viewBox="0 0 16 16"><circle cx="8" cy="8" r="7" fill="none" stroke="' + c + '" stroke-width="1.4" stroke-dasharray="2.2,2.4"/></svg>';
+  }
+  var PO_PILL_MAP = { done: ["good", "Complete"], progress: ["warn", "In progress"], blocked: ["crit", "Blocked"] };
+  function poPill(status) {
+    var m = PO_PILL_MAP[status] || ["neutral", "Not due yet"];
+    return '<span class="pill ' + m[0] + '"><span class="dot"></span>' + m[1] + "</span>";
+  }
+  // Walks the item's FULL chain (anchors + its own fan-out steps) and marks
+  // each segment done/skipped/current/pending -- an anchor's status comes
+  // from its own single submission (shared by every item in the category);
+  // a fan-out step's status comes from this item's own real
+  // approved_item_nos/skipped_item_nos/current_item_no (backend-computed,
+  // handles out-of-order completion correctly since some real predecessor
+  // chains are parallel, not sequential). Matches poRegistryBox's own
+  // "Next"/"Skipped" label so the bar and the label always agree.
+  function poItemTrack(li, category, singleByItemNo) {
+    var chain = poFullChainFor(category);
+    if (!chain.length) return "";
+    var approved = li.approved_item_nos || [];
+    var skipped = li.skipped_item_nos || [];
+    var currentFound = false, dots = "";
+    for (var i = 0; i < chain.length; i++) {
+      var itemNo = chain[i];
+      var cls = "";
+      if (PO_ANCHOR_ITEM_NOS[itemNo]) {
+        // Anchors are plain project-level items -- no out-of-order concept,
+        // strictly "done or not" in chain order.
+        if (poSingleStatus(singleByItemNo[itemNo]) === "done") cls = "done";
+        else if (!currentFound) { cls = "current"; currentFound = true; }
+      } else if (approved.indexOf(itemNo) !== -1) {
+        cls = "done";
+      } else if (skipped.indexOf(itemNo) !== -1) {
+        // [PO Lifecycle out-of-order completion] a later step in this
+        // item's own chain already got approved while this earlier one
+        // didn't -- some real predecessor chains are parallel, not
+        // sequential (2.2 and 3.1 both gate on 4.5 directly, not on each
+        // other), so this can legitimately happen. Reads as "still open,
+        // bypassed" rather than either done or the current blocker.
+        cls = "skipped";
+      } else if (itemNo === li.current_item_no) {
+        // [PO Lifecycle] a rejected step reads as a real problem, not just
+        // "in progress" -- its own segment goes red like a blocked step,
+        // distinct from the normal orange "current" state.
+        cls = li.current_item_status === "rejected" ? "rejected" : "current";
+      }
+      var stateLabel = cls === "done" ? "Done" : cls === "rejected" ? "Rejected" : cls === "skipped" ? "Skipped" : cls === "current" ? "Current" : "Pending";
+      var label = (PO_ITEM_META[itemNo] || {}).label || "";
+      var title = itemNo + (label ? " – " + label : "") + " – " + stateLabel;
+      // [PO Lifecycle clickable items] every segment opens its own real
+      // submission, not just the row's overall current/last one -- an
+      // anchor item_no (1.2/4.1/2.11/2.17 etc.) is one shared project-level
+      // submission (singleByItemNo), everything else is this line item's
+      // own step (li.step_submission_ids).
+      var dotSubId = PO_ANCHOR_ITEM_NOS[itemNo]
+        ? (singleByItemNo[itemNo] ? singleByItemNo[itemNo].id : null)
+        : ((li.step_submission_ids || {})[itemNo] || null);
+      var dotAttr = dotSubId ? ' data-open-submission="' + dotSubId + '"' : "";
+      var dotCls = "dot" + (cls ? " " + cls : "") + (dotSubId ? " clickable" : "");
+      dots += '<span class="' + dotCls + '" data-tooltip="' + title.replace(/"/g, "&quot;") + '"' + dotAttr + '></span>';
+    }
+    return '<div class="po-item-track">' + dots + "</div>";
+  }
+  function poRegistryBox(items, count, sourceLabel, singleByItemNo) {
+    var box = el("div", "po-registry-box");
+    box.innerHTML = '<div class="title">Line items (' + count + ')</div><div class="source">' + sourceLabel + "</div>";
+    if (!items.length) {
+      box.insertAdjacentHTML("beforeend", '<div class="row">None declared yet</div>');
+      return box;
+    }
+    items.forEach(function (li) {
+      // The item's own current_item_no only says where it sits in its own
+      // chain -- drill through any unmet single-item prerequisite (budget,
+      // cost center, PM assignment...) so "Next" names the real blocker.
+      var nextItemNo = li.current_item_no ? poEffectiveNextItemNo(li.current_item_no, singleByItemNo) : null;
+      // [PO Lifecycle] a rejected current step is a real status worth
+      // naming outright, not just "Next X" as if it were still ahead.
+      var isRejected = li.current_item_no === nextItemNo && li.current_item_status === "rejected";
+      // [PO Lifecycle out-of-order completion] a later step already passed
+      // while an earlier one in this item's own chain didn't -- name it
+      // rather than silently hiding that it's still technically open.
+      var skippedPrefix = (li.skipped_item_nos && li.skipped_item_nos.length)
+        ? "Skipped " + li.skipped_item_nos.join(", ") + " / " : "";
+      var stepLabel = isRejected ? skippedPrefix + nextItemNo + " Rejected"
+        : nextItemNo ? skippedPrefix + "Next " + nextItemNo : (li.total_steps ? "Done" : "");
+      var stepStyle = isRejected ? ' style="color:var(--crit);"' : "";
+      // [PO Lifecycle clickable items] each named line item opens the one
+      // submission that's actually worth looking at -- its current blocker,
+      // or its last (approved) step once fully done.
+      var rowCls = "po-item-row" + (li.open_submission_id ? " clickable" : "");
+      var rowAttr = li.open_submission_id ? ' data-open-submission="' + li.open_submission_id + '"' : "";
+      // [PO number]: set on 3.2 (openDelivModal), shown right here once
+      // known -- the PO Lifecycle tab is exactly where "which real PO does
+      // this line item map to" is the natural question to have answered.
+      var poNumHtml = li.po_number ? ' <span class="po-number-tag">PO ' + li.po_number + "</span>" : "";
+      box.insertAdjacentHTML("beforeend",
+        '<div class="' + rowCls + '"' + rowAttr + '><div class="iname">' + li.name + poNumHtml + '<span class="istep"' + stepStyle + '>' + stepLabel + "</span></div>"
+        + poItemTrack(li, li._cat, singleByItemNo) + "</div>");
+    });
+    box.querySelectorAll(".po-item-row[data-open-submission]").forEach(function (rowEl) {
+      rowEl.addEventListener("click", function () { openDelivModal(parseInt(rowEl.dataset.openSubmission, 10)); });
+    });
+    // Each segment of a line item's own progress bar opens its own
+    // submission -- stopPropagation so this doesn't also fire the row's
+    // own click (which would open the row's current/last step instead).
+    box.querySelectorAll(".po-item-track .dot[data-open-submission]").forEach(function (dotEl) {
+      dotEl.addEventListener("click", function (e) {
+        e.stopPropagation();
+        openDelivModal(parseInt(dotEl.dataset.openSubmission, 10));
+      });
+    });
+    return box;
+  }
+  function poFanoutStatus(itemNo, items, counts) {
+    if (!counts || !counts.total) return "pending";
+    if (counts.passed === counts.total) return "done";
+    var atStep = items.filter(function (li) { return li.current_item_no === itemNo; });
+    if (atStep.some(function (li) { return li.status === "blocked"; })) return "blocked";
+    return "progress";
+  }
+  function poSingleStatus(d) {
+    if (!d) return "pending";
+    if (d.status === "approved") return "done";
+    if (d.status === "in_progress" || d.status === "pending_review") return "progress";
+    if (d.awaiting_note || d.deadline_status === "due") return "blocked";
+    return "pending";
+  }
+  // A "needs" token is only ever resolvable against a real anchor when it's
+  // a bare item_no (e.g. "1.2") -- qualified ones like "3.12 (if required)"
+  // or "3.2 start" describe a condition, not a plain predecessor, so they
+  // always stay phrased as "needs". A bare token whose own single-item
+  // status is done reads far more usefully as "predecessor X is completed"
+  // than a stale "needs X" once that predecessor is no longer the blocker.
+  function poNeedsText(needsList, singleByItemNo) {
+    if (!needsList.length) return "anchor";
+    return needsList.map(function (token) {
+      if (/^\d+\.\d+$/.test(token) && poSingleStatus(singleByItemNo[token]) === "done") {
+        return "predecessor " + token + " is completed";
+      }
+      return "Pending " + token + ".";
+    }).join(" · ");
+  }
+  function poCard(itemNo, kind, ctx, fixedCount, singleByItemNo) {
+    var meta = PO_ITEM_META[itemNo] || { label: itemNo, needs: [] };
+    var status, prog = "", score = "", dynamicNote = null;
+    if (kind === "fanout") {
+      status = poFanoutStatus(itemNo, ctx.items, ctx.counts);
+      // A structurally-fixed-at-1 category (Consultancy) has no real "out of
+      // how many" question to answer -- skip the count/score badges, they
+      // only earn their keep once a category can genuinely vary. The "X/N
+      // passed" count itself already signals per-item tracking, so no
+      // separate "per item" label is needed alongside it.
+      if (!fixedCount) {
+        prog = ctx.counts.total ? '<span class="chip" style="color:var(--good);font-weight:500;">' + ctx.counts.passed + "/" + ctx.counts.total + " completed</span>" : "";
+        if (ctx.counts.in_progress) prog += '<span class="chip" style="color:var(--warn);font-weight:500;">' + ctx.counts.in_progress + " in progress</span>";
+        if (ctx.counts.no_progress) prog += '<span class="chip" style="color:var(--ink-500);">' + ctx.counts.no_progress + " no progress</span>";
+        if (ctx.counts.score !== null && ctx.counts.score !== undefined) {
+          score = '<span class="chip" style="color:var(--ink-900);font-weight:500;" title="pro-rata score across this item\'s own due-and-done cohort">' + ctx.counts.score + "%</span>";
+        }
+      }
+    } else {
+      status = poSingleStatus(ctx);
+      if (ctx && ctx.awaiting_note) dynamicNote = ctx.awaiting_note;
+    }
+    var needs = poNeedsText(meta.needs, singleByItemNo);
+    var noteText = dynamicNote || meta.note;
+    var note = noteText ? '<div class="note" style="color:' + (status === "blocked" ? "var(--crit)" : "var(--ink-500)") + ';">&#8617; ' + noteText + "</div>" : "";
+    // [PO Lifecycle clickable items] a "single" card maps to exactly one
+    // real submission (ctx.id) -- a "fanout" card summarizes many line
+    // items at once, so it has no one submission to open; its own items
+    // are individually clickable in the registry box above instead.
+    var openAttr = (kind === "single" && ctx && ctx.id) ? ' data-open-submission="' + ctx.id + '"' : "";
+    var cardCls = "card" + (openAttr ? " clickable" : "");
+    return '<div class="' + cardCls + '"' + openAttr + '>'
+      + '<span class="icon">' + poIcon(status) + "</span>"
+      + '<div class="body">'
+      + '<div class="top"><span class="name"><b>' + itemNo + "</b>" + meta.label + "</span>" + poPill(status) + "</div>"
+      + '<div class="meta">' + needs + prog + score + "</div>"
+      + note
+      + "</div></div>";
+  }
+  async function renderPoLifecycle(projectId, containerId) {
+    var wrap = document.getElementById(containerId);
+    if (!projectId) { wrap.innerHTML = ""; return; }
+    // Item 16: the shared global-loading overlay (see api()) already
+    // covers this -- a second, local "Loading…" text underneath it was
+    // redundant and could itself flash before the fetch below resolves.
+    var summary, allDelivs;
+    try {
+      summary = await api("/api/projects/" + projectId + "/po-line-items/po-cycle-summary");
+      allDelivs = await api("/api/projects/" + projectId + "/deliverables?include_auto_completed=true");
+    } catch (err) {
+      wrap.innerHTML = '<div class="empty-state">Couldn\'t load PO Lifecycle &#8211; ' + apiErrorDetail(err) + "</div>";
+      return;
+    }
+    var singleByItemNo = {};
+    allDelivs.forEach(function (d) { if (!singleByItemNo[d.item_no]) singleByItemNo[d.item_no] = d; });
+
+    wrap.innerHTML = "";
+    // Item 15: split view -- PO categories on the left (mirroring Project
+    // Details' own Departments/Deliverables split), the selected
+    // category's full column on the right, instead of all 4 squeezed
+    // side by side. Every column below still builds exactly as it always
+    // did (same poCard/poRegistryBox/poItemTrack logic, untouched) -- this
+    // just changes where each finished .po-column lands and which one is
+    // visible at a time, purely a layout change.
+    var split = el("div", "split detail-split");
+    var leftCard = el("div", "card");
+    leftCard.appendChild(el("div", "section-title", "PO Categories"));
+    var leftList = el("div", "folder-list");
+    leftCard.appendChild(leftList);
+    var rightCard = el("div", "card");
+    var rightBody = el("div", "po-lifecycle-detail");
+    rightCard.appendChild(rightBody);
+    split.appendChild(leftCard);
+    split.appendChild(rightCard);
+    var categoryCols = []; // {title, col, count, blocked}
+    var registrySource = {
+      consultancy: "fixed — always required, added automatically",
+      early_activity_mep: "early-activity rows from 4.1 · MEP rows from 1.2",
+      long_lead: "from 1.2 — owner-entered list, or auto-parsed from the uploaded Excel",
+      sc: "from 2.11 (OHTL/UGC scope) or 2.17 (SS scope) — whichever applies to this project",
+    };
+    ["consultancy", "early_activity_mep", "long_lead", "sc"].forEach(function (key) {
+      var cats = key === "early_activity_mep" ? ["early_activity", "mep"] : [key];
+      var col = el("div", "po-column");
+      var meta = PO_CATEGORY_META[key];
+      col.innerHTML = "<h2>" + meta.title + '</h2><div class="desc">' + meta.desc + "</div>";
+
+      var statsTotal = { complete: 0, in_progress: 0, blocked: 0 };
+      var allItems = [];
+      var fanoutData = {};
+      cats.forEach(function (c) {
+        var cd = summary[c] || { items: [], step_counts: {}, stats: {} };
+        statsTotal.complete += cd.stats.complete || 0;
+        statsTotal.in_progress += cd.stats.in_progress || 0;
+        statsTotal.blocked += cd.stats.blocked || 0;
+        // early_activity_mep combines two underlying categories -- tag each
+        // item with which one it actually belongs to, so poItemTrack knows
+        // which fan-out chain (and which full causal chain) applies to it.
+        cd.items.forEach(function (it) { it._cat = c; });
+        allItems = allItems.concat(cd.items);
+        Object.keys(cd.step_counts || {}).forEach(function (itemNo) {
+          fanoutData[itemNo] = { items: cd.items, counts: cd.step_counts[itemNo] };
+        });
+      });
+      var fixedCount = key === "consultancy";
+      // Consultancy is always exactly one fixed item -- a Total/Complete/In
+      // progress/Blocked summary answers a question ("out of how many?")
+      // that never applies here, same reasoning as skipping the registry
+      // box below.
+      if (!fixedCount) {
+        col.insertAdjacentHTML("beforeend",
+          '<div class="mini-stats">'
+          + '<div class="mini-stat"><div class="label">Total POs</div><div class="val">' + allItems.length + "</div></div>"
+          + '<div class="mini-stat"><div class="label">Complete</div><div class="val" style="color:var(--good);">' + statsTotal.complete + "</div></div>"
+          + '<div class="mini-stat"><div class="label">In progress</div><div class="val" style="color:var(--warn);">' + statsTotal.in_progress + "</div></div>"
+          + '<div class="mini-stat"><div class="label">Blocked</div><div class="val" style="color:var(--crit);">' + statsTotal.blocked + "</div></div>"
+          + "</div>");
+        col.appendChild(poRegistryBox(allItems, allItems.length, registrySource[key], singleByItemNo));
+      }
+
+      var railHtml = '<div class="rail">';
+      (PO_COLUMN_LAYOUT[key] || []).forEach(function (itemNo) {
+        railHtml += fanoutData[itemNo]
+          ? poCard(itemNo, "fanout", fanoutData[itemNo], fixedCount, singleByItemNo)
+          : poCard(itemNo, "single", singleByItemNo[itemNo], fixedCount, singleByItemNo);
+      });
+      railHtml += "</div>";
+      col.insertAdjacentHTML("beforeend", railHtml);
+      col.querySelectorAll(".card[data-open-submission]").forEach(function (cardEl) {
+        cardEl.addEventListener("click", function () { openDelivModal(parseInt(cardEl.dataset.openSubmission, 10)); });
+      });
+      categoryCols.push({ title: meta.title, col: col, count: allItems.length, blocked: statsTotal.blocked, fixedCount: fixedCount });
+    });
+    categoryCols.forEach(function (c, i) {
+      var frow = el("div", "folder-row" + (i === 0 ? " active" : ""));
+      var countLabel = c.fixedCount ? "1 item" : c.count + " item" + (c.count === 1 ? "" : "s");
+      frow.innerHTML = '<div class="folder-left"><span class="folder-ic">&#128193;</span><div class="folder-name">' + c.title + '</div></div>' +
+        '<div class="folder-right"><span class="folder-pct' + (c.blocked ? " crit" : "") + '">' + countLabel + '</span></div>';
+      frow.addEventListener("click", function () {
+        leftList.querySelectorAll(".folder-row").forEach(function (r) { r.classList.remove("active"); });
+        frow.classList.add("active");
+        rightBody.innerHTML = "";
+        rightBody.appendChild(c.col);
+      });
+      leftList.appendChild(frow);
+    });
+    rightBody.appendChild(categoryCols[0].col);
+    wrap.appendChild(split);
+  }
+
+  // Item 96: Activity Trail lives inside the project detail page itself now,
+  // as a sub-tab next to Deliverables, instead of a picker on the L0/L1 list.
+  document.querySelectorAll("#dSubTabs .chip").forEach(function (btn) {
+    btn.addEventListener("click", function () {
+      document.querySelectorAll("#dSubTabs .chip").forEach(function (b) { b.classList.remove("active"); });
+      btn.classList.add("active");
+      var isTrail = btn.dataset.tab === "trail";
+      var isPo = btn.dataset.tab === "po-lifecycle";
+      // The stepper only ever applies to L1 projects (see openDetail) — don't
+      // let switching back from the trail tab resurrect it for an L0 tender.
+      document.getElementById("dStepperCard").style.display = (isTrail || isPo || currentProjectStage !== "L1") ? "none" : "";
+      document.getElementById("dDeliverablesPane").style.display = (isTrail || isPo) ? "none" : "";
+      document.getElementById("dTrailPane").style.display = isTrail ? "" : "none";
+      document.getElementById("dPoLifecyclePane").style.display = isPo ? "" : "none";
+      if (isTrail) renderActivityTimeline(currentProjectId, "dTrailTimeline");
+      if (isPo) renderPoLifecycle(currentProjectId, "dPoLifecycleBody");
+    });
+  });
+
+  /* ================= SCORES (admin full leaderboard) ================= */
+  var scoresData = { owners: [], smes: [] };
+  async function loadScores() {
+    scoresData = await api("/api/dashboard/top-achievers");
+    renderScores();
+  }
+  // Item [Top Achievers tables]: same Excel-header filter+sort every other
+  // table in the app uses, one controller per table (Owners/SMEs have
+  // different columns) -- department is now a real, filterable column
+  // instead of only reachable via the old dropdown.
+  var _scoresXh = { owner: null, sme: null };
+  function _scoresXhController(kind) {
+    if (_scoresXh[kind]) return _scoresXh[kind];
+    // Reads scoresData live (not a snapshot) so a later loadScores() with
+    // fresh data still offers the right set of unique filter values --
+    // same pattern _budgetAllRows/_masterPoAllRows already use.
+    function uniq(getter) {
+      return function () {
+        var rows = kind === "sme" ? (scoresData.smes || []) : (scoresData.owners || []);
+        var seen = {}, out = [];
+        rows.forEach(function (r) {
+          var v = getter(r); v = v == null || v === "" ? "" : String(v);
+          if (!seen[v]) { seen[v] = true; out.push(v); }
+        });
+        return out.sort(function (a, b) { return a.localeCompare(b, undefined, { numeric: true, sensitivity: "base" }); });
+      };
+    }
+    var nameOf = function (r) { return r.name || ""; };
+    var emailOf = function (r) { return r.email; };
+    var deptOf = function (r) { return r.department || ""; };
+    var columns = kind === "sme"
+      ? [
+          // Never sorted/filtered (rank is purely positional, from the
+          // rows' own current order) -- get() is consequently never
+          // called by installExcelHeader, this is just a placeholder.
+          { key: "rank", get: function () { return ""; }, filterable: false, sortable: false },
+          { key: "name", get: nameOf, uniqueValues: uniq(nameOf) },
+          { key: "email", get: emailOf, uniqueValues: uniq(emailOf) },
+          { key: "department", get: deptOf, uniqueValues: uniq(deptOf) },
+          { key: "reviewed", get: function (r) { return r.reviewed; }, uniqueValues: uniq(function (r) { return r.reviewed; }) },
+          { key: "avg", get: function (r) { return r.avg_label; }, sortValue: function (r) { return r.avg_seconds; }, uniqueValues: uniq(function (r) { return r.avg_label; }) },
+        ]
+      : [
+          // Never sorted/filtered (rank is purely positional, from the
+          // rows' own current order) -- get() is consequently never
+          // called by installExcelHeader, this is just a placeholder.
+          { key: "rank", get: function () { return ""; }, filterable: false, sortable: false },
+          { key: "name", get: nameOf, uniqueValues: uniq(nameOf) },
+          { key: "email", get: emailOf, uniqueValues: uniq(emailOf) },
+          { key: "department", get: deptOf, uniqueValues: uniq(deptOf) },
+          { key: "approved", get: function (r) { return r.approved + " / " + r.total; }, sortValue: function (r) { return r.total ? r.approved / r.total : 0; }, uniqueValues: uniq(function (r) { return r.approved + " / " + r.total; }) },
+          { key: "pct", get: function (r) { return r.pct + "%"; }, sortValue: function (r) { return r.pct; }, uniqueValues: uniq(function (r) { return r.pct + "%"; }) },
+        ];
+    var theadRow = document.getElementById(kind === "sme" ? "scoresSmes" : "scoresOwners").closest("table").querySelector("thead tr");
+    _scoresXh[kind] = installExcelHeader(theadRow, columns);
+    _scoresXh[kind].onChange(renderScores);
+    return _scoresXh[kind];
+  }
+  document.getElementById("scoresOwnersExportBtn").addEventListener("click", function () {
+    exportTableToExcel("Top Achievers – Owners", _scoresXhController("owner"), scoresData.owners || []);
+  });
+  document.getElementById("scoresSmesExportBtn").addEventListener("click", function () {
+    exportTableToExcel("Top Achievers – SME", _scoresXhController("sme"), scoresData.smes || []);
+  });
+  // Item 18: column widths/visibility -- both tables share the same
+  // column shape (rank/Name/Email/Department + 2 metric columns), just
+  // different labels/keys for the last two.
+  var _scoresOwnersColCustom = installColumnCustomizer({
+    storageKey: "scoresownerstable", title: "Top Achievers – Owners",
+    colgroupEl: document.querySelector("#scoresOwnersTable colgroup"),
+    columns: [
+      { key: "rank", label: "Rank", defaultWidth: 6 }, { key: "name", label: "Name", defaultWidth: 22 },
+      { key: "email", label: "Email", defaultWidth: 28 }, { key: "department", label: "Department", defaultWidth: 20 },
+      { key: "approved", label: "Approved", defaultWidth: 12 }, { key: "rate", label: "Rate", defaultWidth: 12 },
+    ],
+  });
+  document.getElementById("scoresOwnersColCustomBtn").addEventListener("click", _scoresOwnersColCustom.open);
+  var _scoresSmesColCustom = installColumnCustomizer({
+    storageKey: "scoressmestable", title: "Top Achievers – SME",
+    colgroupEl: document.querySelector("#scoresSmesTable colgroup"),
+    columns: [
+      { key: "rank", label: "Rank", defaultWidth: 6 }, { key: "name", label: "Name", defaultWidth: 22 },
+      { key: "email", label: "Email", defaultWidth: 28 }, { key: "department", label: "Department", defaultWidth: 20 },
+      { key: "reviews", label: "Reviews", defaultWidth: 12 }, { key: "avg_response", label: "Avg Response", defaultWidth: 12 },
+    ],
+  });
+  document.getElementById("scoresSmesColCustomBtn").addEventListener("click", _scoresSmesColCustom.open);
+  function renderAchieversTable(containerId, rows, kind) {
+    var wrap = document.getElementById(containerId);
+    wrap.innerHTML = "";
+    if (!rows.length) {
+      var tr0 = el("tr");
+      var td0 = el("td", "", "Not enough data yet.");
+      td0.setAttribute("colspan", "6");
+      tr0.appendChild(td0);
+      wrap.appendChild(tr0);
+      return;
+    }
+    var medals = ["&#129351;", "&#129352;", "&#129353;"];
+    rows.forEach(function (r, i) {
+      var tr = el("tr");
+      tr.appendChild(el("td", "achiever-rank", medals[i] || String(i + 1)));
+      tr.appendChild(el("td", "", (r.name || "&#8213;") + (r.sample ? ' <span class="sample-tag">Sample</span>' : "")));
+      tr.appendChild(el("td", "", r.email));
+      tr.appendChild(el("td", "", r.department || "&#8213;"));
+      if (kind === "sme") {
+        tr.appendChild(el("td", "num", String(r.reviewed)));
+        tr.appendChild(el("td", "num", r.avg_label));
+      } else {
+        tr.appendChild(el("td", "num", r.approved + " / " + r.total));
+        tr.appendChild(el("td", "num", r.pct + "%"));
+      }
+      wrap.appendChild(tr);
+    });
+  }
+  function renderScores() {
+    var ownersXh = _scoresXhController("owner"), smesXh = _scoresXhController("sme");
+    renderAchieversTable("scoresOwners", ownersXh.process(scoresData.owners || []), "owner");
+    renderAchieversTable("scoresSmes", smesXh.process(scoresData.smes || []), "sme");
+  }
+
+  /* ================= FOCAL POINTS (admin) ================= */
+  var fpTab = "L0";
+  document.querySelectorAll("#fpSubTabs .chip").forEach(function (btn) {
+    btn.addEventListener("click", function () {
+      document.querySelectorAll("#fpSubTabs .chip").forEach(function (b) { b.classList.remove("active"); });
+      btn.classList.add("active");
+      fpTab = btn.dataset.fp;
+      loadFocalPoints();
+    });
+  });
+
+  async function loadFocalPoints() {
+    document.getElementById("fpDeliverablePanel").hidden = (fpTab !== "L0" && fpTab !== "L1" && fpTab !== "intl");
+    document.getElementById("fpBmPanel").hidden = fpTab !== "bm";
+    document.getElementById("fpGroupPanel").hidden = fpTab !== "group";
+    // [L0 International]: its own subtab, but reuses the exact same
+    // deliverable-focal table -- always stage=L0, international=true.
+    if (fpTab === "intl") return loadFocalDeliverables("L0", true);
+    if (fpTab === "L0" || fpTab === "L1") return loadFocalDeliverables(fpTab, false);
+    if (fpTab === "bm") return loadBidManagers();
+    return loadSystemGroup();
+  }
+
+  // Item [multi-SME]: roster-only, multi-value picker -- chips for each
+  // already-picked email plus a typeahead input that only ever offers real
+  // L0-L1 Group members (filtered by role when one's given), never free
+  // text. Returns {getValues} so the caller's Save button can read the
+  // current selection without keeping its own state.
+  var _rosterCache = null;
+  async function _getRoster() {
+    if (!_rosterCache) _rosterCache = await api("/api/departments/users");
+    return _rosterCache;
+  }
+  function renderRosterPicker(container, selected, rosterPool, placeholder) {
+    container.innerHTML = "";
+    container.className = "roster-picker";
+    var current = (selected || []).slice();
+    var chips = el("div", "roster-picker-chips");
+    function renderChips() {
+      chips.innerHTML = "";
+      current.forEach(function (email) {
+        var chip = el("span", "roster-picker-chip", "");
+        chip.appendChild(document.createTextNode(email));
+        var x = el("span", "roster-picker-chip-x", "&#10005;");
+        x.addEventListener("click", function () {
+          current = current.filter(function (e) { return e !== email; });
+          renderChips();
+        });
+        chip.appendChild(x);
+        chips.appendChild(chip);
+      });
+    }
+    renderChips();
+    var input = el("input", "roster-picker-input"); input.type = "text"; input.placeholder = placeholder;
+    var dropdown = el("div", "roster-picker-dropdown"); dropdown.hidden = true;
+    function showMatches() {
+      var term = input.value.trim().toLowerCase();
+      dropdown.innerHTML = "";
+      if (!term) { dropdown.hidden = true; return; }
+      var matches = rosterPool.filter(function (u) {
+        if (current.indexOf(u.email) !== -1) return false;
+        return u.email.toLowerCase().indexOf(term) === 0 || (u.name || "").toLowerCase().indexOf(term) === 0;
+      }).slice(0, 8);
+      if (!matches.length) { dropdown.hidden = true; return; }
+      matches.forEach(function (u) {
+        var opt = el("div", "roster-picker-option", (u.name ? u.name + " " : "") + "&#8211; " + u.email);
+        opt.addEventListener("mousedown", function (e) {
+          e.preventDefault();
+          current.push(u.email);
+          renderChips();
+          input.value = "";
+          dropdown.hidden = true;
+        });
+        dropdown.appendChild(opt);
+      });
+      dropdown.hidden = false;
+    }
+    input.addEventListener("input", showMatches);
+    input.addEventListener("focus", showMatches);
+    input.addEventListener("blur", function () { setTimeout(function () { dropdown.hidden = true; }, 150); });
+    var inputWrap = el("div", "roster-picker-input-wrap");
+    inputWrap.appendChild(input); inputWrap.appendChild(dropdown);
+    container.appendChild(chips); container.appendChild(inputWrap);
+    return { getValues: function () { return current.slice(); } };
+  }
+
+  var _fpRows = [];
+  var _fpRoster = [];
+  // Item [Focal Points header filters]: same Excel-header pattern as every
+  // other table -- Owner/SME are genuinely multi-value (a deliverable can
+  // have more than one of each via the roster picker), so their filter/
+  // sort column uses the joined "a@x.com, b@x.com" string, same value the
+  // cell displays as plain text before you click into its picker. That's
+  // a real (documented) simplification vs the old dropdown's per-email
+  // "any of the picked owners" match -- reads correctly for the common
+  // single-owner/single-SME case, and multi-owner rows still show up as
+  // their own filterable combination rather than silently not matching.
+  var _fpXh = null;
+  function _fpXhController() {
+    if (_fpXh) return _fpXh;
+    function uniq(getter) {
+      return function () {
+        var seen = {}, out = [];
+        _fpRows.forEach(function (r) {
+          var v = getter(r); v = v == null || v === "" ? "" : String(v);
+          if (!seen[v]) { seen[v] = true; out.push(v); }
+        });
+        return out.sort(function (a, b) { return a.localeCompare(b, undefined, { numeric: true, sensitivity: "base" }); });
+      };
+    }
+    var itemOf = function (r) { return r.item_no; };
+    var nameOf = function (r) { return r.name; };
+    var deptOf = function (r) { return r.department || ""; };
+    var ownerOf = function (r) { return r.is_tendering_bm ? "" : (r.owner_emails || []).join(", "); };
+    var smeOf = function (r) { return (r.default_sme_emails || []).join(", "); };
+    var columns = [
+      { key: "item", get: itemOf, uniqueValues: uniq(itemOf) },
+      { key: "name", get: nameOf, uniqueValues: uniq(nameOf) },
+      { key: "department", get: deptOf, uniqueValues: uniq(deptOf) },
+      { key: "owner", get: ownerOf, uniqueValues: uniq(ownerOf) },
+      { key: "sme", get: smeOf, uniqueValues: uniq(smeOf) },
+      { key: "save", get: function () { return ""; }, filterable: false, sortable: false },
+    ];
+    var theadRow = document.getElementById("focalPointsBody").closest("table").querySelector("thead tr");
+    _fpXh = installExcelHeader(theadRow, columns);
+    _fpXh.onChange(function () { _fpRenderRows(_fpXh.process(_fpRows)); });
+    return _fpXh;
+  }
+  document.getElementById("fpExportBtn").addEventListener("click", function () {
+    exportTableToExcel("Focal Points", _fpXhController(), _fpRows);
+  });
+  // Item 18: column widths/visibility.
+  var _fpColCustom = installColumnCustomizer({
+    storageKey: "focalpointstable", title: "Focal Points",
+    colgroupEl: document.querySelector("#fpTable colgroup"),
+    columns: [
+      { key: "item", label: "Item", defaultWidth: 6 }, { key: "deliverable", label: "Deliverable", defaultWidth: 28 },
+      { key: "department", label: "Department", defaultWidth: 16 }, { key: "owner", label: "Deliverable's Owner Email", defaultWidth: 22 },
+      { key: "sme", label: "SME Email", defaultWidth: 22 }, { key: "actions", label: "Actions", defaultWidth: 6 },
+    ],
+  });
+  document.getElementById("fpColCustomBtn").addEventListener("click", _fpColCustom.open);
+  function _fpRenderStats(rows) {
+    var owners = {}, smes = {};
+    rows.forEach(function (d) {
+      (d.owner_emails || []).forEach(function (e) { owners[e] = true; });
+      (d.default_sme_emails || []).forEach(function (e) { smes[e] = true; });
+    });
+    document.getElementById("fpStats").innerHTML =
+      "<span><b>" + Object.keys(owners).length + "</b> Owner(s) assigned</span>" +
+      "<span><b>" + Object.keys(smes).length + "</b> SME(s) assigned</span>" +
+      "<span><b>" + rows.length + "</b> deliverable(s) shown</span>";
+  }
+  function _fpRenderRows(rows) {
+    var smeRoster = _fpRoster.filter(function (u) { return u.role === "SME"; });
+    var ownerRoster = _fpRoster.filter(function (u) { return u.role === "Owner"; });
+    var tbody = document.getElementById("focalPointsBody");
+    tbody.innerHTML = "";
+    if (!rows.length) {
+      var emptyTr = el("tr");
+      var emptyTd = el("td", "empty-state", "No deliverables match this filter.");
+      emptyTd.setAttribute("colspan", "6");
+      emptyTr.appendChild(emptyTd);
+      tbody.appendChild(emptyTr);
+      _fpRenderStats(rows);
+      return;
+    }
+    // [Focal Points header filters]: the department-header divider rows
+    // this used to insert (d.department !== lastDept) assumed the rows
+    // arrived pre-grouped by department -- once any column is sortable,
+    // that assumption no longer holds (sorting by Item/Deliverable/Owner
+    // interleaves departments), and Department is now its own filterable
+    // column anyway, so a flat row list replaces the grouped one.
+    rows.forEach(function (d) {
+      var tr = el("tr");
+      tr.appendChild(el("td", "", d.item_no));
+      var nameCell = el("td", "fp-deliv-name", d.name);
+      nameCell.title = d.name; // item 135: column is narrowed with ellipsis, full text on hover
+      tr.appendChild(nameCell);
+      tr.appendChild(el("td", "", d.department));
+      // Item 134 rework: SME is editable here for every row including
+      // Tendering (unlike the Owner email, which Tendering always routes to
+      // that project's own Bid Manager instead) -- no per-project popup
+      // edit anymore, this catalog default is the one place for it.
+      // Item [multi-SME]: both pickers are roster-only and multi-value --
+      // any of the picked SMEs can approve/reject a submission of this item.
+      var ownerPicker = null;
+      if (d.is_tendering_bm) {
+        var noteCell = el("td", "muted", "Defaults to the project's Bid Manager");
+        tr.appendChild(noteCell);
+      } else {
+        var ownerCell = el("td");
+        ownerPicker = renderRosterPicker(ownerCell, d.owner_emails, ownerRoster,
+          d.department_focal_email ? "Defaults to " + d.department_focal_email : "Add an owner…");
+        tr.appendChild(ownerCell);
+      }
+      var smeCell = el("td");
+      var smePicker = renderRosterPicker(smeCell, d.default_sme_emails, smeRoster, "Add an SME…");
+      tr.appendChild(smeCell);
+      var saveBtn = el("button", "btn", "Save");
+      saveBtn.addEventListener("click", async function () {
+        var body = { default_sme_emails: smePicker.getValues() };
+        if (ownerPicker) body.default_owner_emails = ownerPicker.getValues();
+        try {
+          await api("/api/departments/deliverable-focal/" + d.id, {
+            method: "PATCH", headers: { "Content-Type": "application/json" },
+            body: JSON.stringify(body),
+          });
+        } catch (err) {
+          showToast("Could not save &#8211; " + apiErrorDetail(err), true);
+          return;
+        }
+        // Keep the in-memory rows (and therefore stats/filters) in sync
+        // with what was just saved, without a full re-fetch.
+        d.default_sme_emails = smePicker.getValues();
+        if (ownerPicker) d.owner_emails = ownerPicker.getValues();
+        _fpRenderStats(_fpXhController().process(_fpRows));
+        showToast("Updated for " + d.item_no);
+      });
+      var tdSave = el("td"); tdSave.appendChild(saveBtn);
+      tr.appendChild(tdSave);
+      tbody.appendChild(tr);
+    });
+    _fpRenderStats(rows);
+  }
+  async function loadFocalDeliverables(stage, international) {
+    _fpRows = await api("/api/departments/deliverable-focal?stage=" + stage + (international ? "&international=true" : ""));
+    _fpRoster = await _getRoster();
+    _fpRenderRows(_fpXhController().process(_fpRows));
+  }
+
+  async function loadBidManagers() {
+    var bms = await api("/api/departments/bid-managers");
+    var tbody = document.getElementById("bmBody");
+    tbody.innerHTML = "";
+    bms.filter(function (b) { return b.active; }).forEach(function (b) {
+      var tr = el("tr");
+      var nameInput = el("input"); nameInput.setAttribute("type", "text"); nameInput.value = b.name || ""; nameInput.placeholder = "Name";
+      var saveBtn = el("button", "btn", "Save");
+      saveBtn.addEventListener("click", async function () {
+        try {
+          await api("/api/departments/bid-managers/" + b.id, {
+            method: "PATCH", headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ name: nameInput.value.trim() }),
+          });
+        } catch (err) {
+          showToast("Could not save &#8211; " + apiErrorDetail(err), true);
+          return;
+        }
+        showToast("Updated " + b.email);
+      });
+      var tdName = el("td"); tdName.appendChild(nameInput);
+      tr.appendChild(tdName);
+      tr.appendChild(el("td", "", b.email));
+      var removeBtn = el("button", "btn ghost-crit", "Remove");
+      removeBtn.addEventListener("click", async function () {
+        await api("/api/departments/bid-managers/" + b.id, { method: "DELETE" });
+        showToast("Removed " + b.email + " from the Bid Manager roster");
+        loadBidManagers();
+      });
+      var tdActions = el("td"); tdActions.appendChild(saveBtn); tdActions.appendChild(removeBtn);
+      tr.appendChild(tdActions);
+      tbody.appendChild(tr);
+    });
+    document.getElementById("bmAddBtn").onclick = async function () {
+      var email = document.getElementById("bmNewEmail").value.trim();
+      var name = document.getElementById("bmNewName").value.trim();
+      if (!email) { showToast("Email is required", true); return; }
+      try {
+        await api("/api/departments/bid-managers", {
+          method: "POST", headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ email: email, name: name || null }),
+        });
+      } catch (err) {
+        showToast("Could not add &#8211; " + apiErrorDetail(err), true);
+        return;
+      }
+      document.getElementById("bmNewEmail").value = "";
+      document.getElementById("bmNewName").value = "";
+      showToast("Bid Manager added");
+      loadBidManagers();
+    };
+  }
+
+  async function loadSystemGroup() {
+    var users = await api("/api/departments/users");
+    var tbody = document.getElementById("groupBody");
+    tbody.innerHTML = "";
+    users.forEach(function (u) {
+      var tr = el("tr");
+      tr.appendChild(el("td", "", u.name));
+      tr.appendChild(el("td", "", u.email));
+      var roleSel = document.createElement("select");
+      ["Viewer", "Owner", "SME", "Admin"].forEach(function (r) {
+        var o = el("option", "", r); o.value = r; if (r === u.role) o.selected = true;
+        roleSel.appendChild(o);
+      });
+      roleSel.addEventListener("change", async function () {
+        var nextRole = roleSel.value;
+        try {
+          await api("/api/departments/users", {
+            method: "POST", headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ name: u.name, email: u.email, role: nextRole, manager_email: u.manager_email || null }),
+          });
+        } catch (err) {
+          showToast("Could not update role &#8211; " + apiErrorDetail(err), true);
+          roleSel.value = u.role;
+          return;
+        }
+        showToast(u.email + " is now " + nextRole);
+        u.role = nextRole;
+      });
+      var roleTd = el("td"); roleTd.appendChild(roleSel);
+      tr.appendChild(roleTd);
+      tr.appendChild(el("td", "", u.manager_email || "&#8213;"));
+      var removeBtn = el("button", "btn ghost-crit", "Remove");
+      removeBtn.addEventListener("click", async function () {
+        await api("/api/departments/users/" + u.id, { method: "DELETE" });
+        showToast("Removed " + u.email + " from the group");
+        loadSystemGroup();
+      });
+      var tdRemove = el("td"); tdRemove.appendChild(removeBtn);
+      tr.appendChild(tdRemove);
+      tbody.appendChild(tr);
+    });
+    document.getElementById("groupAddBtn").onclick = async function () {
+      var name = document.getElementById("groupNewName").value.trim();
+      var email = document.getElementById("groupNewEmail").value.trim();
+      var role = document.getElementById("groupNewRole").value;
+      var managerEmail = document.getElementById("groupNewManager").value.trim();
+      if (!name || !email) { showToast("Name and email are required", true); return; }
+      try {
+        await api("/api/departments/users", {
+          method: "POST", headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ name: name, email: email, role: role, manager_email: managerEmail || null }),
+        });
+      } catch (err) {
+        showToast("Could not add &#8211; " + apiErrorDetail(err), true);
+        return;
+      }
+      document.getElementById("groupNewName").value = "";
+      document.getElementById("groupNewEmail").value = "";
+      document.getElementById("groupNewManager").value = "";
+      showToast("Added to the L0-L1 Group");
+      loadSystemGroup();
+    };
+  }
+
+  /* ================= FOLLOW UP (admin) ================= */
+  // Item [Follow Up detail modal]: every request row across the 6 panels
+  // below was decide-only-from-the-compact-row -- fine for a one-line
+  // reassignment, not enough to actually evaluate a formula change (whose
+  // full proposed branches never fit inline) or anything else that
+  // deserves a second look before Approve/Reject. Clicking a row now opens
+  // this one shared modal with every field the request has, plus the same
+  // Approve/Reject actions the row itself already wires up (passed straight
+  // through, so there's exactly one place each decision's real logic lives).
+  function openFuDetailModal(opts) {
+    document.getElementById("fuDetailEyebrow").innerHTML = opts.eyebrow || "";
+    document.getElementById("fuDetailTitle").innerHTML = opts.title || "";
+    var body = document.getElementById("fuDetailBody");
+    body.innerHTML = "";
+    opts.fields.forEach(function (f) {
+      if (!f[1]) return;
+      var row = el("div", "meta-item");
+      row.appendChild(el("div", "mk", f[0]));
+      row.appendChild(el("div", "mv", f[1]));
+      body.appendChild(row);
+    });
+    var actions = document.getElementById("fuDetailActions");
+    actions.innerHTML = "";
+    if (opts.onApprove) {
+      var appr = el("button", "btn primary", opts.approveLabel || "Approve");
+      appr.addEventListener("click", function () { closeFuDetailModal(); opts.onApprove(); });
+      actions.appendChild(appr);
+    }
+    if (opts.onReject) {
+      var rej = el("button", "btn ghost-crit", opts.rejectLabel || "Reject");
+      rej.addEventListener("click", function () { closeFuDetailModal(); opts.onReject(); });
+      actions.appendChild(rej);
+    }
+    document.getElementById("fuDetailOverlay").hidden = false;
+  }
+  function closeFuDetailModal() { document.getElementById("fuDetailOverlay").hidden = true; }
+  document.getElementById("fuDetailClose").addEventListener("click", closeFuDetailModal);
+  document.getElementById("fuDetailOverlay").addEventListener("click", function (e) { if (e.target === this) closeFuDetailModal(); });
+
+  // [Requests/Follow Up split]: this page used to be one function covering
+  // both the 6 pending-approval queues (Due-Date/Reassignment/SME
+  // Nomination/Bid Value/Group Add/Formula Change) and the Due & Overdue
+  // Deliverables bulk-reminder tool -- two genuinely different jobs living
+  // on one page. loadRequests() now owns the 6 queues (view-requests);
+  // loadFollowUp() further below owns just the reminder tool
+  // (view-followup). Both still call refreshNavBadges() at the end since
+  // either page's approve/reject can change counts the OTHER page's nav
+  // badge shows.
+  async function loadRequests() {
+    // Item [due-date requests]: same .aq-row list pattern as Reassignment
+    // Requests right below it, covering both extension and hold kinds.
+    var ddReqs = await api("/api/deliverables/due-date-requests?status=pending");
+    var ddWrap = document.getElementById("dueDateReqList");
+    document.getElementById("dueDateReqCount").textContent = ddReqs.length ? "(" + ddReqs.length + ")" : "";
+    ddWrap.innerHTML = "";
+    if (!ddReqs.length) {
+      ddWrap.appendChild(el("div", "empty-state", "No pending extension/hold requests."));
+    } else {
+      ddReqs.forEach(function (r) {
+        var row = el("div", "aq-row");
+        var main = el("div", "aq-main");
+        var kindLabel = r.kind === "extension" ? "Extension" : "Hold";
+        main.appendChild(el("div", "aq-title", kindLabel + " &middot; " + r.item_no + " &middot; " + r.name));
+        main.appendChild(el("div", "aq-sub",
+          '<span>' + r.est_no + '</span><span class="sep">&middot;</span>' +
+          '<span>' + r.requested_by_email + '</span>' +
+          (r.kind === "extension" ? '<span class="sep">&middot;</span><span>' + fmtDate(r.current_due_date) + ' &#8594; ' + fmtDate(r.requested_due_date) + '</span>' : "") +
+          '<span class="sep">&middot;</span><span>' + r.reason + '</span>'));
+        row.appendChild(main);
+        var actions = el("div", "deliv-actions");
+        var doApprove = async function () {
+          await api("/api/deliverables/due-date-requests/" + r.id + "/decide", {
+            method: "POST", headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ approved: true, comment: "", actor_role: CURRENT_ROLE, actor_email: actingEmail() }),
+          });
+          showToast(kindLabel + " approved");
+          loadRequests();
+        };
+        var doReject = async function () {
+          await api("/api/deliverables/due-date-requests/" + r.id + "/decide", {
+            method: "POST", headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ approved: false, comment: "", actor_role: CURRENT_ROLE, actor_email: actingEmail() }),
+          });
+          showToast(kindLabel + " rejected");
+          loadRequests();
+        };
+        row.style.cursor = "pointer";
+        row.addEventListener("click", function () {
+          openFuDetailModal({
+            eyebrow: kindLabel + " Request", title: r.item_no + " &middot; " + r.name,
+            fields: [
+              ["Project", r.est_no], ["Requested by", r.requested_by_email],
+              ["Change", r.kind === "extension" ? (fmtDate(r.current_due_date) + " &#8594; " + fmtDate(r.requested_due_date)) : "Put this item on hold"],
+              ["Reason", r.reason],
+            ],
+            onApprove: doApprove, onReject: doReject,
+          });
+        });
+        var appr = el("button", "btn primary", "Approve");
+        appr.addEventListener("click", function (e) { e.stopPropagation(); doApprove(); });
+        var rej = el("button", "btn ghost-crit", "Reject");
+        rej.addEventListener("click", function (e) { e.stopPropagation(); doReject(); });
+        actions.appendChild(appr); actions.appendChild(rej);
+        row.appendChild(actions);
+        ddWrap.appendChild(row);
+      });
+    }
+
+    var reqs = await api("/api/deliverables/reassignment-requests?status=pending");
+    var reassignWrap = document.getElementById("reassignList");
+    document.getElementById("reassignCount").textContent = reqs.length ? "(" + reqs.length + ")" : "";
+    reassignWrap.innerHTML = "";
+    if (!reqs.length) {
+      reassignWrap.appendChild(el("div", "empty-state", "No pending reassignment requests."));
+    } else {
+      reqs.forEach(function (r) {
+        var row = el("div", "aq-row");
+        var main = el("div", "aq-main");
+        main.appendChild(el("div", "aq-title", r.item_no + " &middot; " + r.name));
+        main.appendChild(el("div", "aq-sub",
+          '<span>' + r.est_no + '</span><span class="sep">&middot;</span>' +
+          '<span>' + (r.from_email || "Unassigned") + ' &#8594; ' + r.to_email + '</span>' +
+          (r.reason ? '<span class="sep">&middot;</span><span>' + r.reason + '</span>' : "")));
+        row.appendChild(main);
+        var actions = el("div", "deliv-actions");
+        var doApprove = async function () {
+          await api("/api/deliverables/reassignment-requests/" + r.id + "/decide", {
+            method: "POST", headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ approved: true, actor_role: CURRENT_ROLE }),
+          });
+          showToast("Reassigned to " + r.to_email);
+          loadRequests();
+        };
+        var doReject = async function () {
+          await api("/api/deliverables/reassignment-requests/" + r.id + "/decide", {
+            method: "POST", headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ approved: false, actor_role: CURRENT_ROLE }),
+          });
+          showToast("Reassignment rejected");
+          loadRequests();
+        };
+        row.style.cursor = "pointer";
+        row.addEventListener("click", function () {
+          openFuDetailModal({
+            eyebrow: "Reassignment Request", title: r.item_no + " &middot; " + r.name,
+            fields: [
+              ["Project", r.est_no], ["From", r.from_email || "Unassigned"], ["To", r.to_email],
+              ["Reason", r.reason],
+            ],
+            onApprove: doApprove, onReject: doReject,
+          });
+        });
+        var appr = el("button", "btn primary", "Approve");
+        appr.addEventListener("click", function (e) { e.stopPropagation(); doApprove(); });
+        var rej = el("button", "btn ghost-crit", "Reject");
+        rej.addEventListener("click", function (e) { e.stopPropagation(); doReject(); });
+        actions.appendChild(appr); actions.appendChild(rej);
+        row.appendChild(actions);
+        reassignWrap.appendChild(row);
+      });
+    }
+
+    // Grouped by nominee (fu-dept-group, same collapsed-accordion pattern
+    // as the overdue-deliverables list below) since one person can have
+    // several pending item picks at once -- each item still gets its own
+    // Approve/Reject, decided independently.
+    var smeNoms = await api("/api/departments/sme-nominations?status=pending");
+    var smeNomWrap = document.getElementById("smeNomList");
+    document.getElementById("smeNomCount").textContent = smeNoms.length ? "(" + smeNoms.length + ")" : "";
+    smeNomWrap.innerHTML = "";
+    if (!smeNoms.length) {
+      smeNomWrap.appendChild(el("div", "empty-state", "No pending SME nominations."));
+    } else {
+      var byNominee = {};
+      smeNoms.forEach(function (n) { (byNominee[n.email] = byNominee[n.email] || []).push(n); });
+      Object.keys(byNominee).sort().forEach(function (email) {
+        var noms = byNominee[email];
+        var group = document.createElement("details");
+        group.className = "fu-dept-group";
+        group.open = true;
+        var summary = document.createElement("summary");
+        summary.appendChild(el("span", "fu-dept-name", (noms[0].name || email) + (noms[0].name ? " (" + email + ")" : "")));
+        summary.appendChild(el("span", "fu-dept-tags",
+          '<span class="fu-dept-count">' + noms.length + " item" + (noms.length === 1 ? "" : "s") + '</span>'));
+        group.appendChild(summary);
+        noms.forEach(function (n) {
+          var row = el("div", "aq-row");
+          var main = el("div", "aq-main");
+          main.appendChild(el("div", "aq-title", n.item_no + " &middot; " + n.item_name));
+          main.appendChild(el("div", "aq-sub",
+            '<span>' + n.stage + '</span><span class="sep">&middot;</span><span>' + deptLabel(n.department, n.department_number) + '</span>'));
+          row.appendChild(main);
+          var actions = el("div", "deliv-actions");
+          var doApprove = async function () {
+            await api("/api/departments/sme-nominations/" + n.id + "/decide", {
+              method: "POST", headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({ approved: true, comment: "", actor_role: CURRENT_ROLE, actor_email: actingEmail() }),
+            });
+            showToast(email + " is now the SME for " + n.item_no);
+            loadRequests();
+          };
+          var doReject = function () {
+            openChecklistEditModal({
+              type: "text",
+              title: "Decline Nomination",
+              eyebrow: "Reason for declining " + n.item_no + " for " + (n.name || email) + " (optional)",
+              selected: "",
+              onSave: async function (comment) {
+                closeChecklistEditModal();
+                await api("/api/departments/sme-nominations/" + n.id + "/decide", {
+                  method: "POST", headers: { "Content-Type": "application/json" },
+                  body: JSON.stringify({ approved: false, comment: comment, actor_role: CURRENT_ROLE, actor_email: actingEmail() }),
+                });
+                showToast("Nomination declined");
+                loadRequests();
+              },
+            });
+          };
+          row.style.cursor = "pointer";
+          row.addEventListener("click", function () {
+            openFuDetailModal({
+              eyebrow: "SME Nomination", title: n.item_no + " &middot; " + n.item_name,
+              fields: [
+                ["Nominee", (n.name || email) + (n.name ? " (" + email + ")" : "")],
+                ["Stage", n.stage], ["Department", deptLabel(n.department, n.department_number)],
+              ],
+              onApprove: doApprove, onReject: doReject,
+            });
+          });
+          var appr = el("button", "btn primary", "Approve");
+          appr.addEventListener("click", function (e) { e.stopPropagation(); doApprove(); });
+          var rej = el("button", "btn ghost-crit", "Reject");
+          rej.addEventListener("click", function (e) { e.stopPropagation(); doReject(); });
+          actions.appendChild(appr); actions.appendChild(rej);
+          row.appendChild(actions);
+          group.appendChild(row);
+        });
+        smeNomWrap.appendChild(group);
+      });
+    }
+
+    var bvReqs = await api("/api/projects/bid-value-requests?status=pending");
+    var bvReqWrap = document.getElementById("bidValueReqList");
+    document.getElementById("bidValueReqCount").textContent = bvReqs.length ? "(" + bvReqs.length + ")" : "";
+    bvReqWrap.innerHTML = "";
+    if (!bvReqs.length) {
+      bvReqWrap.appendChild(el("div", "empty-state", "No pending Bid Value access requests."));
+    } else {
+      bvReqs.forEach(function (r) {
+        var row = el("div", "aq-row");
+        var main = el("div", "aq-main");
+        main.appendChild(el("div", "aq-title", r.est_no + " &middot; " + r.name));
+        main.appendChild(el("div", "aq-sub",
+          '<span>' + (r.requested_by_name ? r.requested_by_name + " (" + r.requested_by_email + ")" : r.requested_by_email) + '</span>'));
+        row.appendChild(main);
+        var actions = el("div", "deliv-actions");
+        var doApprove = async function () {
+          await api("/api/projects/bid-value-requests/" + r.id + "/decide", {
+            method: "POST", headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ approved: true, actor_role: CURRENT_ROLE }),
+          });
+          showToast("Access approved for " + r.requested_by_email);
+          loadRequests();
+        };
+        var doReject = async function () {
+          await api("/api/projects/bid-value-requests/" + r.id + "/decide", {
+            method: "POST", headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ approved: false, actor_role: CURRENT_ROLE }),
+          });
+          showToast("Request rejected");
+          loadRequests();
+        };
+        row.style.cursor = "pointer";
+        row.addEventListener("click", function () {
+          openFuDetailModal({
+            eyebrow: "Bid Value Access Request", title: r.est_no + " &middot; " + r.name,
+            fields: [["Requested by", r.requested_by_name ? r.requested_by_name + " (" + r.requested_by_email + ")" : r.requested_by_email]],
+            onApprove: doApprove, onReject: doReject,
+          });
+        });
+        var appr = el("button", "btn primary", "Approve");
+        appr.addEventListener("click", function (e) { e.stopPropagation(); doApprove(); });
+        var rej = el("button", "btn ghost-crit", "Reject");
+        rej.addEventListener("click", function (e) { e.stopPropagation(); doReject(); });
+        actions.appendChild(appr); actions.appendChild(rej);
+        row.appendChild(actions);
+        bvReqWrap.appendChild(row);
+      });
+    }
+
+    var coReqs = await api("/api/deliverables/comm-offer-requests?status=pending");
+    var coReqWrap = document.getElementById("commOfferReqList");
+    document.getElementById("commOfferReqCount").textContent = coReqs.length ? "(" + coReqs.length + ")" : "";
+    coReqWrap.innerHTML = "";
+    if (!coReqs.length) {
+      coReqWrap.appendChild(el("div", "empty-state", "No pending Commercial Offers access requests."));
+    } else {
+      coReqs.forEach(function (r) {
+        var row = el("div", "aq-row");
+        var main = el("div", "aq-main");
+        main.appendChild(el("div", "aq-title", r.est_no + " &middot; " + r.project_name));
+        main.appendChild(el("div", "aq-sub",
+          '<span>' + (r.requested_by_name ? r.requested_by_name + " (" + r.requested_by_email + ")" : r.requested_by_email) + '</span>'));
+        row.appendChild(main);
+        var actions = el("div", "deliv-actions");
+        var doApprove = async function () {
+          await api("/api/deliverables/comm-offer-requests/" + r.id + "/decide", {
+            method: "POST", headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ approved: true, actor_role: CURRENT_ROLE }),
+          });
+          showToast("Access approved for " + r.requested_by_email);
+          loadRequests();
+        };
+        var doReject = async function () {
+          await api("/api/deliverables/comm-offer-requests/" + r.id + "/decide", {
+            method: "POST", headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ approved: false, actor_role: CURRENT_ROLE }),
+          });
+          showToast("Request rejected");
+          loadRequests();
+        };
+        row.style.cursor = "pointer";
+        row.addEventListener("click", function () {
+          openFuDetailModal({
+            eyebrow: "Commercial Offers Access Request", title: r.est_no + " &middot; " + r.project_name,
+            fields: [["Requested by", r.requested_by_name ? r.requested_by_name + " (" + r.requested_by_email + ")" : r.requested_by_email]],
+            onApprove: doApprove, onReject: doReject,
+          });
+        });
+        var appr = el("button", "btn primary", "Approve");
+        appr.addEventListener("click", function (e) { e.stopPropagation(); doApprove(); });
+        var rej = el("button", "btn ghost-crit", "Reject");
+        rej.addEventListener("click", function (e) { e.stopPropagation(); doReject(); });
+        actions.appendChild(appr); actions.appendChild(rej);
+        row.appendChild(actions);
+        coReqWrap.appendChild(row);
+      });
+    }
+
+    var groupReqs = await api("/api/departments/user-add-requests?status=pending");
+    var groupReqWrap = document.getElementById("groupAddReqList");
+    document.getElementById("groupAddReqCount").textContent = groupReqs.length ? "(" + groupReqs.length + ")" : "";
+    groupReqWrap.innerHTML = "";
+    if (!groupReqs.length) {
+      groupReqWrap.appendChild(el("div", "empty-state", "No pending group add requests."));
+    } else {
+      groupReqs.forEach(function (r) {
+        var row = el("div", "aq-row");
+        var main = el("div", "aq-main");
+        main.appendChild(el("div", "aq-title", (r.name || r.email) + " &middot; " + r.role));
+        main.appendChild(el("div", "aq-sub",
+          '<span>' + r.email + '</span><span class="sep">&middot;</span>' +
+          '<span>Requested by ' + (r.requested_by_name ? r.requested_by_name + " (" + r.requested_by_email + ")" : r.requested_by_email) + '</span>'));
+        row.appendChild(main);
+        var actions = el("div", "deliv-actions");
+        var doApprove = async function () {
+          await api("/api/departments/user-add-requests/" + r.id + "/decide", {
+            method: "POST", headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ approved: true, comment: "", actor_role: CURRENT_ROLE, actor_email: actingEmail() }),
+          });
+          showToast(r.email + " added to the L0-L1 Group");
+          loadRequests();
+        };
+        var doReject = async function () {
+          await api("/api/departments/user-add-requests/" + r.id + "/decide", {
+            method: "POST", headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ approved: false, comment: "", actor_role: CURRENT_ROLE, actor_email: actingEmail() }),
+          });
+          showToast("Request rejected");
+          loadRequests();
+        };
+        row.style.cursor = "pointer";
+        row.addEventListener("click", function () {
+          openFuDetailModal({
+            eyebrow: "Group Add Request", title: (r.name || r.email) + " &middot; " + r.role,
+            fields: [
+              ["Email", r.email], ["Role", r.role],
+              ["Requested by", r.requested_by_name ? r.requested_by_name + " (" + r.requested_by_email + ")" : r.requested_by_email],
+            ],
+            onApprove: doApprove, onReject: doReject,
+          });
+        });
+        var appr = el("button", "btn primary", "Approve");
+        appr.addEventListener("click", function (e) { e.stopPropagation(); doApprove(); });
+        var rej = el("button", "btn ghost-crit", "Reject");
+        rej.addEventListener("click", function (e) { e.stopPropagation(); doReject(); });
+        actions.appendChild(appr); actions.appendChild(rej);
+        row.appendChild(actions);
+        groupReqWrap.appendChild(row);
+      });
+    }
+
+    var formulaReqs = await api("/api/deliverables/config/formula-change-requests?status=pending");
+    var formulaReqWrap = document.getElementById("formulaReqList");
+    document.getElementById("formulaReqCount").textContent = formulaReqs.length ? "(" + formulaReqs.length + ")" : "";
+    formulaReqWrap.innerHTML = "";
+    if (!formulaReqs.length) {
+      formulaReqWrap.appendChild(el("div", "empty-state", "No pending formula change requests."));
+    } else {
+      formulaReqs.forEach(function (r) {
+        var row = el("div", "aq-row");
+        var main = el("div", "aq-main");
+        main.appendChild(el("div", "aq-title", r.item_no + " &middot; " + r.item_name));
+        main.appendChild(el("div", "aq-sub",
+          '<span>' + (r.requested_by_name ? r.requested_by_name + " (" + r.requested_by_email + ")" : r.requested_by_email) + '</span>' +
+          '<span class="sep">&middot;</span><span>Currently: ' + r.current_summary + '</span>' +
+          '<span class="sep">&middot;</span><span>&#8220;' + r.comment + '&#8221;</span>'));
+        row.appendChild(main);
+        var actions = el("div", "deliv-actions");
+        var doApprove = async function () {
+          await api("/api/deliverables/config/formula-change-requests/" + r.id + "/decide", {
+            method: "POST", headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ approved: true, comment: "", actor_role: CURRENT_ROLE, actor_email: actingEmail(), actor_name: passiveIdentity() }),
+          });
+          showToast("Formula updated for " + r.item_no);
+          loadRequests();
+        };
+        var doReject = function () {
+          openChecklistEditModal({
+            type: "text",
+            title: "Decline Suggestion",
+            eyebrow: "Reason for declining the " + r.item_no + " formula change (optional)",
+            selected: "",
+            onSave: async function (comment) {
+              closeChecklistEditModal();
+              await api("/api/deliverables/config/formula-change-requests/" + r.id + "/decide", {
+                method: "POST", headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ approved: false, comment: comment, actor_role: CURRENT_ROLE, actor_email: actingEmail() }),
+              });
+              showToast("Suggestion declined");
+              loadRequests();
+            },
+          });
+        };
+        row.style.cursor = "pointer";
+        row.addEventListener("click", function () {
+          // [Formula request detail]: current_summary alone (what it IS
+          // today) never showed what the suggestion would actually change
+          // it TO -- proposed_formula_text (rules.describe_proposed_branches,
+          // same wording engine the live formula pages use) is the field
+          // that was actually missing for an admin to decide this.
+          var reqFields = [
+            ["Department", r.department],
+            ["Requested by", r.requested_by_name ? r.requested_by_name + " (" + r.requested_by_email + ")" : r.requested_by_email],
+            ["Currently", r.current_summary],
+          ];
+          if (r.formula_changed) reqFields.push(["Proposed change", r.proposed_formula_text]);
+          if (r.proposed_weight != null) reqFields.push(["Scoring weight", _formatWeightSuggestion(r)]);
+          reqFields.push(["Reason", r.comment]);
+          openFuDetailModal({
+            eyebrow: "Formula Change Request", title: r.item_no + " &middot; " + r.item_name,
+            fields: reqFields,
+            onApprove: doApprove, onReject: doReject,
+          });
+        });
+        var appr = el("button", "btn primary", "Approve");
+        appr.addEventListener("click", function (e) { e.stopPropagation(); doApprove(); });
+        var rej = el("button", "btn ghost-crit", "Reject");
+        rej.addEventListener("click", function (e) { e.stopPropagation(); doReject(); });
+        actions.appendChild(appr); actions.appendChild(rej);
+        row.appendChild(actions);
+        formulaReqWrap.appendChild(row);
+      });
+    }
+    refreshNavBadges();
+    // Item [Requests history default-visible]: history for all 6
+    // categories loads right alongside their pending lists now (no more
+    // lazy per-category "Show History" click) -- also re-runs on every
+    // decision (loadRequests() itself is what approve/reject already
+    // calls to refresh), so a just-decided item moves from Pending into
+    // History immediately instead of needing a manual reopen.
+    loadRequestsHistory();
+  }
+  // Item 24: split view -- wired once (not inside loadRequests, which
+  // reruns on every load/decision) since this is pure show/hide, the same
+  // 6 panels and their #xxxCount spans stay exactly where loadRequests()
+  // already knows to find them, nothing about that function changed.
+  document.querySelectorAll("#requestsCatList .folder-row").forEach(function (row) {
+    row.addEventListener("click", function () {
+      var cat = row.dataset.cat;
+      document.querySelectorAll("#requestsCatList .folder-row").forEach(function (r) { r.classList.toggle("active", r === row); });
+      document.querySelectorAll(".req-cat-panel").forEach(function (p) { p.hidden = p.dataset.cat !== cat; });
+    });
+  });
+
+  async function loadFollowUp() {
+    // Item [follow-up redesign]: was one flat, unsorted, ungrouped list --
+    // confusing once more than a handful of items are overdue at once. Now
+    // grouped by Department (collapsed accordion, so the page opens calm
+    // instead of a wall of rows), each row leads with a colored days-overdue
+    // badge instead of a generic status pill, and a Severity filter +
+    // Critical/15+-day threshold surfaces what actually needs attention
+    // first. days_overdue itself now comes pre-computed from the backend.
+    var FU_CRITICAL_DAYS = 15;
+    // Item 33 (doc redline): selection now lives on the rows themselves (a
+    // checkbox next to each Remind pill, right there in the split screen)
+    // instead of only appearing after Send Reminders... was already
+    // clicked -- checked by default, id -> false only once explicitly
+    // unchecked, persists across filtering/paging/department switches
+    // within this one visit to the page.
+    var fuSelected = {};
+    var items = await api("/api/deliverables/follow-up");
+    var estSel = document.getElementById("fuEstFilter");
+    var focalSel = document.getElementById("fuFocalFilter");
+    var severitySel = document.getElementById("fuSeverityFilter");
+    var sortSel = document.getElementById("fuSortBy");
+    var deptListEl = document.getElementById("fuDeptList");
+    var selectedDept = ""; // "" = All Departments
+    var seenEsts = {}, seenFocals = {};
+    items.forEach(function (d) {
+      seenEsts[d.est_no] = true;
+      // Item 27: focal_emails is a real per-person list now (see
+      // deliverable_focal/resolve_focal_emails on the backend) -- each
+      // co-focal gets their own filterable option instead of the whole
+      // deliverable only matching an exact "john@x, jane@y" string.
+      (d.focal_emails && d.focal_emails.length ? d.focal_emails : (d.focal ? [d.focal] : [])).forEach(function (f) { seenFocals[f] = true; });
+    });
+    estSel.innerHTML = '<option value="">All Est Numbers</option>';
+    Object.keys(seenEsts).sort().forEach(function (n) { var o = el("option", "", n); o.value = n; estSel.appendChild(o); });
+    focalSel.innerHTML = '<option value="">All Focal Points</option>';
+    Object.keys(seenFocals).sort().forEach(function (n) { var o = el("option", "", n); o.value = n; focalSel.appendChild(o); });
+
+    function fuSeverity(d) { return d.days_overdue >= FU_CRITICAL_DAYS ? "critical" : "overdue"; }
+    function fuMatchesFocal(d, focal) {
+      if (!focal) return true;
+      var emails = d.focal_emails && d.focal_emails.length ? d.focal_emails : (d.focal ? [d.focal] : []);
+      return emails.indexOf(focal) !== -1;
+    }
+
+    function renderFollowUpList() {
+      var estNo = estSel.value, focal = focalSel.value, severity = severitySel.value;
+      var filtered = items.filter(function (d) {
+        return (!estNo || d.est_no === estNo) && fuMatchesFocal(d, focal) && (!severity || fuSeverity(d) === severity);
+      });
+
+      var statsWrap = document.getElementById("fuStats");
+      statsWrap.innerHTML = "";
+      var criticalCount = items.filter(function (d) { return fuSeverity(d) === "critical"; }).length;
+      var deptCount = Object.keys(items.reduce(function (acc, d) { acc[d.department] = true; return acc; }, {})).length;
+      [
+        ["Overdue Total", items.length, false],
+        ["Critical &#8211; 15+ Days", criticalCount, true],
+        ["Departments Affected", deptCount, false],
+      ].forEach(function (s) {
+        statsWrap.appendChild(el("div", "fu-stat" + (s[2] ? " critical" : ""),
+          '<span class="fu-stat-num">' + s[1] + '</span><span class="fu-stat-lbl">' + s[0] + '</span>'));
+      });
+
+      // Item 26: split view -- the left column lists every department
+      // that still has a filtered item, each showing its own overdue
+      // count; picking one narrows the right-hand list the same way the
+      // old dropdown did, "All Departments" (default) shows everything.
+      var byDept = {};
+      filtered.forEach(function (d) { (byDept[d.department] = byDept[d.department] || []).push(d); });
+      var deptNames = Object.keys(byDept);
+      deptNames.forEach(function (n) { byDept[n].sort(function (a, b) { return b.days_overdue - a.days_overdue; }); });
+      if (sortSel.value === "dept") {
+        deptNames.sort();
+      } else {
+        deptNames.sort(function (a, b) { return byDept[b][0].days_overdue - byDept[a][0].days_overdue; });
+      }
+      if (selectedDept && deptNames.indexOf(selectedDept) === -1) selectedDept = "";
+
+      deptListEl.innerHTML = "";
+      var allRow = el("div", "folder-row" + (!selectedDept ? " active" : ""));
+      allRow.innerHTML = '<div class="folder-left"><span class="folder-ic">&#128193;</span><div class="folder-name">All Departments</div></div>' +
+        '<div class="folder-right"><span class="folder-pct">' + filtered.length + '</span></div>';
+      allRow.addEventListener("click", function () { selectedDept = ""; renderFollowUpList(); });
+      deptListEl.appendChild(allRow);
+      deptNames.forEach(function (deptName) {
+        var rows = byDept[deptName];
+        var hasCritical = rows.some(function (d) { return fuSeverity(d) === "critical"; });
+        var row = el("div", "folder-row" + (selectedDept === deptName ? " active" : ""));
+        row.innerHTML = '<div class="folder-left"><span class="folder-ic">&#128193;</span><div class="folder-name">' + deptLabel(deptName, null) + '</div></div>' +
+          '<div class="folder-right"><span class="folder-pct' + (hasCritical ? " crit" : "") + '">' + rows.length + '</span></div>';
+        row.addEventListener("click", function () { selectedDept = deptName; renderFollowUpList(); });
+        deptListEl.appendChild(row);
+      });
+
+      var deptFiltered = selectedDept ? (byDept[selectedDept] || []) : filtered.slice().sort(function (a, b) { return b.days_overdue - a.days_overdue; });
+      document.getElementById("fuDeptDetailTitle").textContent = selectedDept ? deptLabel(selectedDept, null) : "All Departments";
+
+      var wrap = document.getElementById("followUpList");
+      var pager = document.getElementById("fuPager");
+      // Item 33: how many of the currently-filtered items (across every
+      // page, not just the one on screen) are still checked -- shown right
+      // on the button so it's clear before clicking exactly how many will
+      // actually go out.
+      function _fuUpdateRemindAllLabel() {
+        var n = deptFiltered.filter(function (d) { return fuSelected[d.id] !== false; }).length;
+        document.getElementById("fuRemindAll").textContent = "Send Reminders… (" + n + " selected)";
+      }
+      function fuRowEl(d) {
+        var sev = fuSeverity(d);
+        var row = el("div", "fu-row");
+        var main = el("div", "fu-row-main");
+        main.appendChild(el("div", "fu-row-title", d.item_no + " &middot; " + d.name));
+        main.appendChild(el("div", "fu-row-sub",
+          '<span>' + d.est_no + ' &#8211; ' + d.project_name + '</span><span class="sep">&middot;</span>' +
+          '<span>Owner: ' + d.owner + '</span><span class="sep">&middot;</span>' +
+          '<span>Focal: ' + d.focal + '</span><span class="sep">&middot;</span>' +
+          '<span>Due ' + fmtDate(d.due_date) + '</span>'));
+        row.appendChild(main);
+        var side = el("div", "fu-row-side");
+        var cb = document.createElement("input");
+        cb.type = "checkbox";
+        cb.className = "fu-row-check";
+        cb.title = "Include in Send Reminders…";
+        cb.checked = fuSelected[d.id] !== false;
+        cb.addEventListener("click", function (e) {
+          e.stopPropagation();
+          fuSelected[d.id] = cb.checked;
+          _fuUpdateRemindAllLabel();
+        });
+        side.appendChild(cb);
+        side.appendChild(el("span", "fu-overdue-badge " + sev, d.days_overdue + " day" + (d.days_overdue === 1 ? "" : "s") + " overdue"));
+        var remindBtn = el("button", "btn", "Remind");
+        remindBtn.addEventListener("click", function (e) { e.stopPropagation(); openRemindModal([d]); });
+        side.appendChild(remindBtn);
+        row.appendChild(side);
+        return row;
+      }
+      if (!deptFiltered.length) {
+        wrap.innerHTML = "";
+        wrap.appendChild(el("div", "empty-state", "Nothing due or overdue right now."));
+        pager.innerHTML = "";
+      } else {
+        renderPager(pager, deptFiltered, 8, function (pageItems) {
+          wrap.innerHTML = "";
+          pageItems.forEach(function (d) { wrap.appendChild(fuRowEl(d)); });
+        });
+      }
+      _fuUpdateRemindAllLabel();
+
+      document.getElementById("fuRemindAll").onclick = function () {
+        var toSend = deptFiltered.filter(function (d) { return fuSelected[d.id] !== false; });
+        if (!toSend.length) { showToast("Nothing selected to remind", true); return; }
+        openRemindModal(toSend);
+      };
+    }
+    estSel.onchange = renderFollowUpList;
+    focalSel.onchange = renderFollowUpList;
+    severitySel.onchange = renderFollowUpList;
+    sortSel.onchange = renderFollowUpList;
+    renderFollowUpList();
+    // This page has no approve/reject of its own (see loadRequests for
+    // that), but still refreshes every nav badge on load -- e.g. sending a
+    // reminder here doesn't change any badge count today, but keeping this
+    // consistent with every other page-load means a badge never goes stale
+    // just because the last thing the admin did happened to be here.
+    refreshNavBadges();
+  }
+
+  // Decision history for the three Follow Up queues above -- lazily
+  // fetched only when the toggle is opened (a "Show History" click, not on
+  // every page load, since past decisions only grow over time). All three
+  // list endpoints already support an unfiltered fetch (an empty/omitted
+  // `status` skips their own status filter), so this needs no new endpoint
+  // -- just fetch everything and keep the non-pending rows.
+  function _historyStatusPill(status) {
+    return '<span class="pill ' + (status === "approved" ? "good" : "crit") + '"><span class="dot"></span>' +
+      (status === "approved" ? "Approved" : "Rejected") + '</span>';
+  }
+  // [Requests history default-visible]: all 6 categories' history loads
+  // eagerly now (called from loadRequests() itself), each paginated
+  // (renderPager, same widget the Dashboard's Concerns cards use) since a
+  // category's full decided history can run long -- was previously lazy
+  // per-category behind a "Show History" click. Row-building per category
+  // is unchanged from before; only the load-and-render wrapper changed.
+  function _loadRequestHistory(containerId, pagerId, fetchUrl, emptyMsg, rowFn) {
+    return api(fetchUrl).then(function (all) {
+      var decided = all.filter(function (r) { return r.status !== "pending"; });
+      var container = document.getElementById(containerId);
+      var pager = document.getElementById(pagerId);
+      if (!decided.length) {
+        container.innerHTML = "";
+        container.appendChild(el("div", "empty-state", emptyMsg));
+        pager.innerHTML = "";
+        return;
+      }
+      renderPager(pager, decided, 8, function (pageItems) {
+        container.innerHTML = "";
+        pageItems.forEach(function (r) { container.appendChild(rowFn(r)); });
+      });
+    });
+  }
+  function _loadDueDateHistory() {
+    return _loadRequestHistory("dueDateReqHistory", "dueDateReqHistoryPager",
+      "/api/deliverables/due-date-requests?status=", "No decided requests yet.", function (r) {
+        var row = el("div", "aq-row");
+        var main = el("div", "aq-main");
+        var kindLabel = r.kind === "extension" ? "Extension" : "Hold";
+        main.appendChild(el("div", "aq-title", kindLabel + " &middot; " + r.item_no + " &middot; " + r.name));
+        main.appendChild(el("div", "aq-sub",
+          '<span>' + r.est_no + '</span><span class="sep">&middot;</span><span>' + r.requested_by_email + '</span>' +
+          (r.decided_at ? '<span class="sep">&middot;</span><span>' + fmtDate(r.decided_at.slice(0, 10)) + '</span>' : "") +
+          (r.decision_comment ? '<span class="sep">&middot;</span><span>&#8220;' + r.decision_comment + '&#8221;</span>' : "")));
+        row.appendChild(main);
+        row.appendChild(el("div", "", _historyStatusPill(r.status)));
+        // Redlined: history rows had no click-through at all -- same detail
+        // popup as the live pending queue, just without Approve/Reject.
+        row.style.cursor = "pointer";
+        row.addEventListener("click", function () {
+          openFuDetailModal({
+            eyebrow: kindLabel + " Request &#8211; " + _historyStatusPill(r.status), title: r.item_no + " &middot; " + r.name,
+            fields: [
+              ["Project", r.est_no], ["Requested by", r.requested_by_email],
+              ["Change", r.kind === "extension" ? (fmtDate(r.current_due_date) + " &#8594; " + fmtDate(r.requested_due_date)) : "Put this item on hold"],
+              ["Reason", r.reason], ["Decided", r.decided_at ? fmtDate(r.decided_at.slice(0, 10)) : ""],
+              ["Decision comment", r.decision_comment],
+            ],
+          });
+        });
+        return row;
+      });
+  }
+  function _loadReassignHistory() {
+    return _loadRequestHistory("reassignHistory", "reassignHistoryPager",
+      "/api/deliverables/reassignment-requests?status=", "No decided requests yet.", function (r) {
+        var row = el("div", "aq-row");
+        var main = el("div", "aq-main");
+        main.appendChild(el("div", "aq-title", r.item_no + " &middot; " + r.name));
+        main.appendChild(el("div", "aq-sub",
+          '<span>' + r.est_no + '</span><span class="sep">&middot;</span>' +
+          '<span>' + (r.from_email || "Unassigned") + ' &#8594; ' + r.to_email + '</span>' +
+          (r.decided_at ? '<span class="sep">&middot;</span><span>' + fmtDate(r.decided_at.slice(0, 10)) + '</span>' : "")));
+        row.appendChild(main);
+        row.appendChild(el("div", "", _historyStatusPill(r.status)));
+        row.style.cursor = "pointer";
+        row.addEventListener("click", function () {
+          openFuDetailModal({
+            eyebrow: "Reassignment Request &#8211; " + _historyStatusPill(r.status), title: r.item_no + " &middot; " + r.name,
+            fields: [
+              ["Project", r.est_no], ["From", r.from_email || "Unassigned"], ["To", r.to_email],
+              ["Reason", r.reason], ["Decided", r.decided_at ? fmtDate(r.decided_at.slice(0, 10)) : ""],
+            ],
+          });
+        });
+        return row;
+      });
+  }
+  function _loadSmeNomHistory() {
+    return _loadRequestHistory("smeNomHistory", "smeNomHistoryPager",
+      "/api/departments/sme-nominations", "No decided nominations yet.", function (n) {
+        var row = el("div", "aq-row");
+        var main = el("div", "aq-main");
+        main.appendChild(el("div", "aq-title", n.item_no + " &middot; " + n.item_name));
+        main.appendChild(el("div", "aq-sub",
+          '<span>' + (n.name || n.email) + '</span><span class="sep">&middot;</span><span>' + n.stage + '</span>' +
+          (n.decided_at ? '<span class="sep">&middot;</span><span>' + fmtDate(n.decided_at.slice(0, 10)) + '</span>' : "") +
+          (n.decision_comment ? '<span class="sep">&middot;</span><span>&#8220;' + n.decision_comment + '&#8221;</span>' : "")));
+        row.appendChild(main);
+        row.appendChild(el("div", "", _historyStatusPill(n.status)));
+        row.style.cursor = "pointer";
+        row.addEventListener("click", function () {
+          openFuDetailModal({
+            eyebrow: "SME Nomination &#8211; " + _historyStatusPill(n.status), title: n.item_no + " &middot; " + n.item_name,
+            fields: [
+              ["Nominee", (n.name || n.email)], ["Stage", n.stage], ["Department", deptLabel(n.department, n.department_number)],
+              ["Decided", n.decided_at ? fmtDate(n.decided_at.slice(0, 10)) : ""], ["Decision comment", n.decision_comment],
+            ],
+          });
+        });
+        return row;
+      });
+  }
+  function _loadGroupAddHistory() {
+    return _loadRequestHistory("groupAddReqHistory", "groupAddReqHistoryPager",
+      "/api/departments/user-add-requests?status=", "No decided requests yet.", function (r) {
+        var row = el("div", "aq-row");
+        var main = el("div", "aq-main");
+        main.appendChild(el("div", "aq-title", (r.name || r.email) + " &middot; " + r.role));
+        main.appendChild(el("div", "aq-sub",
+          '<span>' + r.email + '</span><span class="sep">&middot;</span>' +
+          '<span>Requested by ' + (r.requested_by_name || r.requested_by_email) + '</span>' +
+          (r.decided_at ? '<span class="sep">&middot;</span><span>' + fmtDate(r.decided_at.slice(0, 10)) + '</span>' : "")));
+        row.appendChild(main);
+        row.appendChild(el("div", "", _historyStatusPill(r.status)));
+        row.style.cursor = "pointer";
+        row.addEventListener("click", function () {
+          openFuDetailModal({
+            eyebrow: "Group Add Request &#8211; " + _historyStatusPill(r.status), title: (r.name || r.email) + " &middot; " + r.role,
+            fields: [
+              ["Email", r.email], ["Role", r.role],
+              ["Requested by", r.requested_by_name || r.requested_by_email],
+              ["Decided", r.decided_at ? fmtDate(r.decided_at.slice(0, 10)) : ""],
+            ],
+          });
+        });
+        return row;
+      });
+  }
+  function _loadFormulaHistory() {
+    return _loadRequestHistory("formulaReqHistory", "formulaReqHistoryPager",
+      "/api/deliverables/config/formula-change-requests?status=", "No decided requests yet.", function (r) {
+        var row = el("div", "aq-row");
+        var main = el("div", "aq-main");
+        main.appendChild(el("div", "aq-title", r.item_no + " &middot; " + r.item_name));
+        main.appendChild(el("div", "aq-sub",
+          '<span>' + (r.requested_by_name || r.requested_by_email) + '</span>' +
+          (r.decided_at ? '<span class="sep">&middot;</span><span>' + fmtDate(r.decided_at.slice(0, 10)) + '</span>' : "") +
+          (r.decision_comment ? '<span class="sep">&middot;</span><span>&#8220;' + r.decision_comment + '&#8221;</span>' : "")));
+        row.appendChild(main);
+        row.appendChild(el("div", "", _historyStatusPill(r.status)));
+        row.style.cursor = "pointer";
+        row.addEventListener("click", function () {
+          openFuDetailModal({
+            eyebrow: "Formula Change Suggestion &#8211; " + _historyStatusPill(r.status), title: r.item_no + " &middot; " + r.item_name,
+            fields: [
+              ["Requested by", r.requested_by_name || r.requested_by_email], ["Currently", r.current_summary],
+              ["Comment", r.comment], ["Decided", r.decided_at ? fmtDate(r.decided_at.slice(0, 10)) : ""],
+              ["Decision comment", r.decision_comment],
+            ],
+          });
+        });
+        return row;
+      });
+  }
+  function _loadBidValueHistory() {
+    return _loadRequestHistory("bidValueReqHistory", "bidValueReqHistoryPager",
+      "/api/projects/bid-value-requests?status=", "No decided requests yet.", function (r) {
+        var row = el("div", "aq-row");
+        var main = el("div", "aq-main");
+        main.appendChild(el("div", "aq-title", r.est_no + " &middot; " + r.name));
+        main.appendChild(el("div", "aq-sub",
+          '<span>' + (r.requested_by_name ? r.requested_by_name + " (" + r.requested_by_email + ")" : r.requested_by_email) + '</span>' +
+          (r.decided_at ? '<span class="sep">&middot;</span><span>' + fmtDate(r.decided_at.slice(0, 10)) + '</span>' : "")));
+        row.appendChild(main);
+        row.appendChild(el("div", "", _historyStatusPill(r.status)));
+        row.style.cursor = "pointer";
+        row.addEventListener("click", function () {
+          openFuDetailModal({
+            eyebrow: "Bid Value Access Request &#8211; " + _historyStatusPill(r.status), title: r.est_no + " &middot; " + r.name,
+            fields: [
+              ["Requested by", r.requested_by_name ? r.requested_by_name + " (" + r.requested_by_email + ")" : r.requested_by_email],
+              ["Decided", r.decided_at ? fmtDate(r.decided_at.slice(0, 10)) : ""],
+            ],
+          });
+        });
+        return row;
+      });
+  }
+  function _loadCommOfferHistory() {
+    return _loadRequestHistory("commOfferReqHistory", "commOfferReqHistoryPager",
+      "/api/deliverables/comm-offer-requests?status=", "No decided requests yet.", function (r) {
+        var row = el("div", "aq-row");
+        var main = el("div", "aq-main");
+        main.appendChild(el("div", "aq-title", r.est_no + " &middot; " + r.project_name));
+        main.appendChild(el("div", "aq-sub",
+          '<span>' + (r.requested_by_name ? r.requested_by_name + " (" + r.requested_by_email + ")" : r.requested_by_email) + '</span>' +
+          (r.decided_at ? '<span class="sep">&middot;</span><span>' + fmtDate(r.decided_at.slice(0, 10)) + '</span>' : "")));
+        row.appendChild(main);
+        row.appendChild(el("div", "", _historyStatusPill(r.status)));
+        row.style.cursor = "pointer";
+        row.addEventListener("click", function () {
+          openFuDetailModal({
+            eyebrow: "Commercial Offers Access Request &#8211; " + _historyStatusPill(r.status), title: r.est_no + " &middot; " + r.project_name,
+            fields: [
+              ["Requested by", r.requested_by_name ? r.requested_by_name + " (" + r.requested_by_email + ")" : r.requested_by_email],
+              ["Decided", r.decided_at ? fmtDate(r.decided_at.slice(0, 10)) : ""],
+            ],
+          });
+        });
+        return row;
+      });
+  }
+  function loadRequestsHistory() {
+    _loadDueDateHistory(); _loadReassignHistory(); _loadSmeNomHistory();
+    _loadGroupAddHistory(); _loadFormulaHistory(); _loadBidValueHistory(); _loadCommOfferHistory();
+  }
+
+  /* ================= DELIVERABLES CONFIGURATION (branch editor + admin/SME pages) ================= */
+  // Shared branch-editor widget, reused verbatim by the admin definition
+  // modal and the Owner/SME suggestion modal -- see renderBranchEditorRows()/
+  // collectBranchesFromEditor() below and their two call sites.
+  var _FE_CONDITION_TYPES = [
+    { value: "always", label: "Always" },
+    { value: "scope_contains_pbu", label: "If PBU scope" },
+    { value: "site_visit_unset", label: "If no Site Visit Date" },
+    { value: "tender_window_lt_days", label: "If tender window < N days" },
+  ];
+  var _FE_ANCHOR_TYPES = [
+    { value: "announcement", label: "Announcement (M1)" },
+    { value: "bsd", label: "BSD" },
+    { value: "site_visit", label: "Site Visit Date" },
+    { value: "pre_bid", label: "Pre-bid Deadline" },
+    { value: "predecessor", label: "Predecessor item" },
+  ];
+  var _FE_TIE_BREAKS = [
+    { value: "", label: "No tie-break" },
+    { value: "earliest_of_siblings", label: "Earliest of siblings" },
+    { value: "latest_of_siblings", label: "Latest of siblings" },
+  ];
+  function _feBuildSelect(options, selected) {
+    var sel = document.createElement("select");
+    options.forEach(function (o) {
+      var opt = document.createElement("option");
+      opt.value = o.value; opt.textContent = o.label;
+      if (o.value === (selected || "")) opt.selected = true;
+      sel.appendChild(opt);
+    });
+    return sel;
+  }
+  function _feBuildBranchRow(branch) {
+    branch = branch || { condition_type: "always", anchor_type: "predecessor", offset_days: 0, offset_direction: "after" };
+    var row = el("div", "fe-branch-row");
+
+    var condSel = _feBuildSelect(_FE_CONDITION_TYPES, branch.condition_type);
+    condSel.className = "fe-condition-type";
+    row.appendChild(condSel);
+
+    var condVal = document.createElement("input");
+    condVal.type = "number"; condVal.className = "fe-condition-value"; condVal.placeholder = "days";
+    condVal.value = branch.condition_value || "";
+    condVal.style.display = branch.condition_type === "tender_window_lt_days" ? "" : "none";
+    row.appendChild(condVal);
+
+    var anchorSel = _feBuildSelect(_FE_ANCHOR_TYPES, branch.anchor_type);
+    anchorSel.className = "fe-anchor-type";
+    row.appendChild(anchorSel);
+
+    var predInput = document.createElement("input");
+    predInput.type = "text"; predInput.className = "fe-predecessor"; predInput.placeholder = "item no e.g. 1.1";
+    predInput.value = branch.predecessor_item_no || "";
+    predInput.style.display = branch.anchor_type === "predecessor" ? "" : "none";
+    row.appendChild(predInput);
+
+    var offsetInput = document.createElement("input");
+    offsetInput.type = "number"; offsetInput.className = "fe-offset-days"; offsetInput.value = branch.offset_days || 0;
+    row.appendChild(offsetInput);
+
+    var dirSel = _feBuildSelect([{ value: "after", label: "days after" }, { value: "before", label: "days before" }], branch.offset_direction);
+    dirSel.className = "fe-offset-direction";
+    row.appendChild(dirSel);
+
+    var wdLabel = el("label", "", "");
+    wdLabel.style.fontSize = "11.5px"; wdLabel.style.display = (branch.anchor_type === "announcement" || branch.anchor_type === "site_visit") ? "inline-flex" : "none";
+    wdLabel.style.alignItems = "center"; wdLabel.style.gap = "3px"; wdLabel.title = "Workday-duration math instead of a simple calendar-day add";
+    var wdCheck = document.createElement("input");
+    wdCheck.type = "checkbox"; wdCheck.className = "fe-workday-duration"; wdCheck.checked = !!branch.workday_duration;
+    wdLabel.appendChild(wdCheck);
+    wdLabel.appendChild(document.createTextNode("workdays"));
+    row.appendChild(wdLabel);
+
+    var tieSel = _feBuildSelect(_FE_TIE_BREAKS, branch.tie_break || "");
+    tieSel.className = "fe-tie-break";
+    tieSel.title = "Branches sharing a tie-break race each other -- the earliest/latest one that resolves wins, instead of a data condition";
+    row.appendChild(tieSel);
+
+    var removeBtn = el("button", "btn ghost-crit fe-remove-branch", "&#10005;");
+    removeBtn.type = "button";
+    removeBtn.addEventListener("click", function () { row.remove(); });
+    row.appendChild(removeBtn);
+
+    condSel.addEventListener("change", function () {
+      condVal.style.display = condSel.value === "tender_window_lt_days" ? "" : "none";
+    });
+    anchorSel.addEventListener("change", function () {
+      predInput.style.display = anchorSel.value === "predecessor" ? "" : "none";
+      wdLabel.style.display = (anchorSel.value === "announcement" || anchorSel.value === "site_visit") ? "inline-flex" : "none";
+    });
+
+    return row;
+  }
+  function renderBranchEditorRows(container, branches) {
+    container.innerHTML = "";
+    (branches && branches.length ? branches : [null]).forEach(function (b) {
+      container.appendChild(_feBuildBranchRow(b));
+    });
+  }
+  function collectBranchesFromEditor(container) {
+    var rows = Array.from(container.querySelectorAll(".fe-branch-row"));
+    return rows.map(function (row, idx) {
+      var conditionType = row.querySelector(".fe-condition-type").value;
+      var conditionValueRaw = row.querySelector(".fe-condition-value").value;
+      return {
+        branch_order: idx,
+        condition_type: conditionType,
+        condition_value: conditionType === "tender_window_lt_days" ? (parseInt(conditionValueRaw, 10) || null) : null,
+        anchor_type: row.querySelector(".fe-anchor-type").value,
+        predecessor_item_no: row.querySelector(".fe-predecessor").value.trim() || null,
+        offset_days: parseInt(row.querySelector(".fe-offset-days").value, 10) || 0,
+        offset_direction: row.querySelector(".fe-offset-direction").value,
+        workday_duration: row.querySelector(".fe-workday-duration").checked,
+        tie_break: row.querySelector(".fe-tie-break").value || null,
+      };
+    });
+  }
+
+  // --- Non-admin "Deliverable Formulas": browse + suggest a change ---
+  var dfStage = "L0", dfItems = [], dfMySuggestions = [];
+  async function loadDeliverableFormulas() {
+    document.querySelectorAll("#dfStageToggle .chip").forEach(function (b) { b.classList.toggle("active", b.dataset.stage === dfStage); });
+    var qs = "stage=" + (dfStage === "L0intl" ? "L0" : dfStage) +
+      (dfStage === "L0intl" ? "&international=true" : (dfStage === "L0" ? "&international=false" : ""));
+    dfItems = await api("/api/deliverables/config/formulas?" + qs);
+    _populateDeptFilter(document.getElementById("dfDeptFilter"), dfItems);
+    renderDfItems();
+    var email = passiveIdentity();
+    dfMySuggestions = email
+      ? await api("/api/deliverables/config/formula-change-requests?status=&requested_by_email=" + encodeURIComponent(email))
+      : [];
+    renderDfMySuggestions();
+  }
+  document.querySelectorAll("#dfStageToggle .chip").forEach(function (btn) {
+    btn.addEventListener("click", function () {
+      if (btn.dataset.stage === dfStage) return;
+      dfStage = btn.dataset.stage;
+      loadDeliverableFormulas();
+    });
+  });
+  document.getElementById("dfFilter").addEventListener("input", renderDfItems);
+  document.getElementById("dfDeptFilter").addEventListener("change", renderDfItems);
+  // Items 4/36: Excel header sort+filter on Item No/Department/Name/Weight,
+  // on top of the existing text/department filters above the table.
+  var _dfXh = null;
+  function _getDfXh() {
+    if (_dfXh) return _dfXh;
+    function uniq(getter) {
+      return function () {
+        var seen = {}, out = [];
+        dfItems.forEach(function (d) {
+          var v = getter(d); v = v == null ? "" : String(v);
+          if (!seen[v]) { seen[v] = true; out.push(v); }
+        });
+        return out.sort(function (a, b) { return a.localeCompare(b, undefined, { numeric: true, sensitivity: "base" }); });
+      };
+    }
+    var deptOf = function (d) { return deptLabel(d.department, d.department_number); };
+    var weightOf = function (d) { return d.kpi_weight_pct != null ? "≈ " + d.kpi_weight_pct + "%" : "—"; };
+    var columns = [
+      { key: "item_no", get: function (d) { return d.item_no; }, uniqueValues: uniq(function (d) { return d.item_no; }) },
+      { key: "dept", get: deptOf, uniqueValues: uniq(deptOf) },
+      { key: "name", get: function (d) { return d.name; }, uniqueValues: uniq(function (d) { return d.name; }) },
+      // Formula: not a meaningful sort/filter dimension (free text), but a
+      // real get() so exportTableToExcel still carries it -- the single
+      // most useful column in an actual export of this table.
+      { key: "formula", get: function (d) { return d.formula_text || ""; }, sortable: false, filterable: false },
+      { key: "weight", get: weightOf, sortValue: function (d) { return d.kpi_weight_pct == null ? -1 : d.kpi_weight_pct; }, uniqueValues: uniq(weightOf) },
+      null,
+    ];
+    var theadRow = document.getElementById("dfItemList").closest("table").querySelector("thead tr");
+    _dfXh = installExcelHeader(theadRow, columns);
+    _dfXh.onChange(function () { renderDfItems(); });
+    return _dfXh;
+  }
+  function _dfPreFiltered() {
+    var filterText = document.getElementById("dfFilter").value.trim().toLowerCase();
+    var deptFilter = document.getElementById("dfDeptFilter").value;
+    return dfItems.filter(function (d) {
+      if (deptFilter && String(d.department_id) !== deptFilter) return false;
+      return !filterText || (d.item_no + " " + d.name).toLowerCase().indexOf(filterText) !== -1;
+    });
+  }
+  document.getElementById("dfExportBtn").addEventListener("click", function () {
+    exportTableToExcel("Deliverables Catalog – " + dfStage, _getDfXh(), _dfPreFiltered());
+  });
+  // Item 18: column widths/visibility.
+  var _dfColCustom = installColumnCustomizer({
+    storageKey: "dftable", title: "Deliverables Catalog",
+    colgroupEl: document.querySelector("#dfTable colgroup"),
+    columns: [
+      { key: "item_no", label: "Item No", defaultWidth: 6 }, { key: "department", label: "Department", defaultWidth: 14 },
+      { key: "name", label: "Name", defaultWidth: 31 }, { key: "formula", label: "Formula", defaultWidth: 31 },
+      { key: "weight", label: "Weight", defaultWidth: 9 }, { key: "actions", label: "Actions", defaultWidth: 9 },
+    ],
+  });
+  document.getElementById("dfColCustomBtn").addEventListener("click", _dfColCustom.open);
+  function renderDfItems() {
+    var wrap = document.getElementById("dfItemList");
+    wrap.innerHTML = "";
+    var filtered = _dfPreFiltered();
+    // Excel-header filters always apply; its sort only overrides the
+    // natural department/item_no order once a column header is actually
+    // clicked -- process() itself only sorts when a sortKey is set, so the
+    // default order just needs re-asserting afterward when it isn't.
+    var xh = _getDfXh();
+    filtered = xh.process(filtered);
+    if (!xh.state.sortKey) {
+      filtered = filtered.slice().sort(function (a, b) {
+        if (a.department_number !== b.department_number) return (a.department_number || 0) - (b.department_number || 0);
+        if (a.department !== b.department) return a.department < b.department ? -1 : 1;
+        return _itemSortKey(a.item_no) < _itemSortKey(b.item_no) ? -1 : 1;
+      });
+    }
+    if (!filtered.length) {
+      wrap.innerHTML = '<tr><td colspan="6" style="text-align:center;color:var(--ink-500);padding:24px;">No items match the current filters.</td></tr>';
+      return;
+    }
+    filtered.forEach(function (d) {
+      var tr = document.createElement("tr");
+      tr.innerHTML =
+        "<td>" + d.item_no + "</td>" +
+        "<td>" + deptLabel(d.department, d.department_number) + "</td>" +
+        "<td>" + d.name + "</td>" +
+        '<td><span style="font-size:11.5px;color:var(--ink-500);">' + d.formula_text + "</span></td>" +
+        '<td class="dc-weight-cell">' + (d.kpi_weight_pct != null ? "&asymp; " + d.kpi_weight_pct + "%" : "&mdash;") + "</td>" +
+        "<td></td>";
+      var btn = el("button", "btn", "Suggest a Change");
+      btn.addEventListener("click", function () { openSuggestFormulaModal(d); });
+      tr.lastElementChild.appendChild(btn);
+      wrap.appendChild(tr);
+    });
+  }
+  function renderDfMySuggestions() {
+    var wrap = document.getElementById("dfMySuggestions");
+    wrap.innerHTML = "";
+    if (!dfMySuggestions.length) { wrap.appendChild(el("div", "empty-state", "You haven't suggested any changes yet.")); return; }
+    dfMySuggestions.slice().reverse().forEach(function (r) {
+      var row = el("div", "aq-row");
+      var main = el("div", "aq-main");
+      main.appendChild(el("div", "aq-title", r.item_no + " &middot; " + r.item_name +
+        (r.proposed_weight != null ? ' <span style="color:var(--ink-500);font-size:11px;">&middot; weight: ' +
+          (r.current_weight_pct != null ? "≈" + r.current_weight_pct + "%" : (r.current_weight || "1 (default)")) + " &rarr; " +
+          (r.proposed_weight_pct != null ? "≈" + r.proposed_weight_pct + "%" : r.proposed_weight) + '</span>' : "")));
+      main.appendChild(el("div", "aq-sub", '<span>&#8220;' + r.comment + '&#8221;</span>'));
+      row.appendChild(main);
+      row.appendChild(el("div", "", r.status === "pending"
+        ? '<span class="pill neutral"><span class="dot"></span>Pending</span>'
+        : _historyStatusPill(r.status)));
+      wrap.appendChild(row);
+    });
+  }
+
+  // [Suggest formula/weight/both]: a target percentage is the only thing a
+  // non-admin can reason about ("this should count for about a quarter of
+  // the department's score") -- the raw kpi_weight number the backend
+  // actually stores is meaningless without knowing every sibling's own
+  // weight. _otherSiblingsWeightSum/_pctToWeight solve the same equation
+  // _normalized_weight_pct (deliverables_config.py) computes forward, in
+  // reverse: given a target % and everyone else's weight held fixed, what
+  // weight would THIS item need? dfItems already carries every sibling's
+  // live kpi_weight (and kpi_relevant, matching the backend's own cohort
+  // filter) for whichever stage tab is loaded.
+  function _otherSiblingsWeightSum(d) {
+    return dfItems
+      .filter(function (it) { return it.department_id === d.department_id && it.id !== d.id && it.kpi_relevant !== false; })
+      .reduce(function (sum, it) { return sum + (it.kpi_weight || 1.0); }, 0);
+  }
+  function _pctToWeight(targetPct, othersSum) {
+    var frac = targetPct / 100;
+    if (frac <= 0 || frac >= 1 || othersSum <= 0) return null;
+    return (frac * othersSum) / (1 - frac);
+  }
+  // Shared by the Follow Up detail modal and My Requests -- shows the
+  // percentage first (what the requester actually reasoned about), with
+  // the raw weight number as parenthetical detail for an admin who wants
+  // it, instead of leading with a bare number nobody asked for.
+  function _formatWeightSuggestion(r) {
+    var before = r.current_weight_pct != null ? "≈" + r.current_weight_pct + "%" : (r.current_weight != null ? r.current_weight : "1 (default)");
+    var after = r.proposed_weight_pct != null ? "≈" + r.proposed_weight_pct + "%" : String(r.proposed_weight);
+    return before + " &rarr; " + after + " of department score <span class=\"muted\">(raw weight " +
+      (r.current_weight != null ? r.current_weight : "1") + " &rarr; " + r.proposed_weight + ")</span>";
+  }
+
+  var _suggestFormulaTarget = null;
+  var _suggestFormulaKind = "formula";
+  function _setSuggestFormulaKind(kind) {
+    _suggestFormulaKind = kind;
+    document.querySelectorAll("#suggestFormulaKind .chip").forEach(function (b) { b.classList.toggle("active", b.dataset.kind === kind); });
+    document.getElementById("suggestFormulaFormulaSection").style.display = (kind === "formula" || kind === "both") ? "" : "none";
+    document.getElementById("suggestFormulaWeightSection").style.display = (kind === "weight" || kind === "both") ? "" : "none";
+  }
+  document.querySelectorAll("#suggestFormulaKind .chip").forEach(function (btn) {
+    btn.addEventListener("click", function () { _setSuggestFormulaKind(btn.dataset.kind); });
+  });
+  function openSuggestFormulaModal(d) {
+    _suggestFormulaTarget = d;
+    document.getElementById("suggestFormulaTitle").textContent = d.item_no + " · " + d.name;
+    document.getElementById("suggestFormulaCurrent").textContent = "Currently: " + d.formula_text;
+    renderBranchEditorRows(document.getElementById("suggestFormulaBranchList"), d.branches);
+    document.getElementById("suggestFormulaWeightDept").textContent = d.department;
+    document.getElementById("suggestFormulaWeightPct").value = "";
+    document.getElementById("suggestFormulaWeightCurrent").textContent =
+      d.kpi_weight_pct != null ? "(currently ≈ " + d.kpi_weight_pct + "%)" : "";
+    document.getElementById("suggestFormulaReason").value = "";
+    _setSuggestFormulaKind("formula");
+    document.getElementById("suggestFormulaOverlay").hidden = false;
+  }
+  function closeSuggestFormulaModal() { document.getElementById("suggestFormulaOverlay").hidden = true; }
+  document.getElementById("suggestFormulaClose").addEventListener("click", closeSuggestFormulaModal);
+  document.getElementById("suggestFormulaCancel").addEventListener("click", closeSuggestFormulaModal);
+  document.getElementById("suggestFormulaAddBranch").addEventListener("click", function () {
+    document.getElementById("suggestFormulaBranchList").appendChild(_feBuildBranchRow(null));
+  });
+  document.getElementById("suggestFormulaSubmit").addEventListener("click", async function () {
+    var reason = document.getElementById("suggestFormulaReason").value.trim();
+    if (!reason) { showToast("A reason is required", true); return; }
+    var branches = collectBranchesFromEditor(document.getElementById("suggestFormulaBranchList"));
+    if (!branches.length) { showToast("At least one branch is required", true); return; }
+
+    var proposedWeight = null;
+    if (_suggestFormulaKind === "weight" || _suggestFormulaKind === "both") {
+      var pctRaw = document.getElementById("suggestFormulaWeightPct").value.trim();
+      if (_suggestFormulaKind === "weight" && pctRaw === "") {
+        showToast('Enter a target percentage, or switch to "Formula"', true); return;
+      }
+      if (pctRaw !== "") {
+        var pct = parseFloat(pctRaw);
+        if (!isFinite(pct) || pct <= 0 || pct >= 100) { showToast("Percentage must be between 1 and 99", true); return; }
+        var othersSum = _otherSiblingsWeightSum(_suggestFormulaTarget);
+        if (othersSum <= 0) { showToast("This item has no sibling items in its department to weigh against", true); return; }
+        proposedWeight = Math.round(_pctToWeight(pct, othersSum) * 100) / 100;
+      }
+    }
+
+    var email = passiveIdentity();
+    if (!email) { showToast("Enter your acting email first", true); return; }
+    try {
+      await api("/api/deliverables/config/formula-change-requests", {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          deliverable_definition_id: _suggestFormulaTarget.id, proposed_branches: branches,
+          proposed_weight: proposedWeight,
+          comment: reason, actor_email: email, actor_name: passiveIdentity(),
+        }),
+      });
+    } catch (err) {
+      showToast("Could not submit &#8211; " + apiErrorDetail(err), true);
+      return;
+    }
+    closeSuggestFormulaModal();
+    showToast("Suggestion submitted &#8212; pending admin approval");
+    loadDeliverableFormulas();
+  });
+
+  // --- Admin "Deliverables Configuration": formulas / departments / history ---
+  var dcTab = "L0", dcItems = [], dcDepartments = [];
+  document.querySelectorAll("#dcSubTabs .chip").forEach(function (btn) {
+    btn.addEventListener("click", function () {
+      if (btn.dataset.dc === dcTab) return;
+      document.querySelectorAll("#dcSubTabs .chip").forEach(function (b) { b.classList.remove("active"); });
+      btn.classList.add("active");
+      dcTab = btn.dataset.dc;
+      loadDeliverablesConfig();
+    });
+  });
+  document.getElementById("dcFilter").addEventListener("input", renderDcFormulas);
+  document.getElementById("dcDeptFilter").addEventListener("change", renderDcFormulas);
+  document.getElementById("dcAddDeliverableBtn").addEventListener("click", function () { openAdminDefModal(null); });
+
+  function _populateDeptFilter(selectEl, items) {
+    var prev = selectEl.value;
+    var seen = {}, depts = [];
+    items.forEach(function (d) {
+      if (!seen[d.department_id]) { seen[d.department_id] = true; depts.push({ id: d.department_id, name: d.department, number: d.department_number }); }
+    });
+    depts.sort(function (a, b) { return (a.number || 0) - (b.number || 0); });
+    selectEl.innerHTML = '<option value="">All Departments</option>';
+    depts.forEach(function (dep) {
+      var o = document.createElement("option");
+      o.value = dep.id; o.textContent = deptLabel(dep.name, dep.number);
+      selectEl.appendChild(o);
+    });
+    if (depts.some(function (d) { return String(d.id) === prev; })) selectEl.value = prev;
+  }
+
+  async function loadDeliverablesConfig() {
+    var isFormulas = dcTab === "L0" || dcTab === "L1" || dcTab === "L0intl";
+    document.getElementById("dcFormulasPanel").hidden = !isFormulas;
+    document.getElementById("dcDepartmentsPanel").hidden = dcTab !== "departments";
+    document.getElementById("dcHistoryPanel").hidden = dcTab !== "history";
+    document.getElementById("dcFilterRow").style.display = isFormulas ? "" : "none";
+    document.getElementById("dcAddDeliverableBtn").style.display = isFormulas ? "" : "none";
+    if (isFormulas) {
+      var stage = dcTab === "L1" ? "L1" : "L0";
+      var qs = "stage=" + stage + "&include_inactive=true" +
+        (dcTab === "L0intl" ? "&international=true" : (dcTab === "L0" ? "&international=false" : ""));
+      dcItems = await api("/api/deliverables/admin/definitions?" + qs);
+      _populateDeptFilter(document.getElementById("dcDeptFilter"), dcItems);
+      renderDcFormulas();
+    } else if (dcTab === "departments") {
+      dcDepartments = await api("/api/departments?include_inactive=true");
+      renderDcDepartments();
+    } else {
+      var defRows = (await api("/api/deliverables/admin/change-history?limit=200"))
+        .map(function (r) { return Object.assign({ kind: "definition" }, r); });
+      var deptRows = (await api("/api/departments/change-history?limit=200"))
+        .map(function (r) { return Object.assign({ kind: "department" }, r); });
+      var merged = defRows.concat(deptRows).sort(function (a, b) {
+        return (b.changed_at || "").localeCompare(a.changed_at || "");
+      });
+      renderDcHistory(merged);
+    }
+  }
+  // Items 4/36: same Excel header treatment as Deliverables Catalog's
+  // near-identical table (_getDfXh), separate instance since it's a
+  // different dataset (dcItems includes inactive definitions too).
+  var _dcXh = null;
+  function _getDcXh() {
+    if (_dcXh) return _dcXh;
+    function uniq(getter) {
+      return function () {
+        var seen = {}, out = [];
+        dcItems.forEach(function (d) {
+          var v = getter(d); v = v == null ? "" : String(v);
+          if (!seen[v]) { seen[v] = true; out.push(v); }
+        });
+        return out.sort(function (a, b) { return a.localeCompare(b, undefined, { numeric: true, sensitivity: "base" }); });
+      };
+    }
+    var deptOf = function (d) { return deptLabel(d.department, d.department_number); };
+    var weightOf = function (d) { return d.kpi_weight_pct != null ? "≈ " + d.kpi_weight_pct + "%" : "—"; };
+    var columns = [
+      { key: "item_no", get: function (d) { return d.item_no; }, uniqueValues: uniq(function (d) { return d.item_no; }) },
+      { key: "dept", get: deptOf, uniqueValues: uniq(deptOf) },
+      { key: "name", get: function (d) { return d.name; }, uniqueValues: uniq(function (d) { return d.name; }) },
+      null,
+      { key: "weight", get: weightOf, sortValue: function (d) { return d.kpi_weight_pct == null ? -1 : d.kpi_weight_pct; }, uniqueValues: uniq(weightOf) },
+      null,
+    ];
+    var theadRow = document.getElementById("dcFormulasBody").closest("table").querySelector("thead tr");
+    _dcXh = installExcelHeader(theadRow, columns);
+    _dcXh.onChange(function () { renderDcFormulas(); });
+    return _dcXh;
+  }
+  function renderDcFormulas() {
+    var filterText = document.getElementById("dcFilter").value.trim().toLowerCase();
+    var deptFilter = document.getElementById("dcDeptFilter").value;
+    var wrap = document.getElementById("dcFormulasBody");
+    wrap.innerHTML = "";
+    var filtered = dcItems.filter(function (d) {
+      if (deptFilter && String(d.department_id) !== deptFilter) return false;
+      return !filterText || (d.item_no + " " + d.name).toLowerCase().indexOf(filterText) !== -1;
+    });
+    var xh = _getDcXh();
+    filtered = xh.process(filtered);
+    if (!xh.state.sortKey) {
+      filtered = filtered.slice().sort(function (a, b) {
+        if (a.department_number !== b.department_number) return (a.department_number || 0) - (b.department_number || 0);
+        if (a.department !== b.department) return a.department < b.department ? -1 : 1;
+        return _itemSortKey(a.item_no) < _itemSortKey(b.item_no) ? -1 : 1;
+      });
+    }
+    if (!filtered.length) {
+      wrap.innerHTML = '<tr><td colspan="6" style="text-align:center;color:var(--ink-500);padding:24px;">No items match the current filters.</td></tr>';
+      return;
+    }
+    filtered.forEach(function (d) {
+      var tr = document.createElement("tr");
+      if (!d.active) tr.style.opacity = "0.55";
+      tr.innerHTML =
+        "<td>" + d.item_no + "</td>" +
+        "<td>" + deptLabel(d.department, d.department_number) + "</td>" +
+        "<td>" + d.name +
+          (d.is_customized ? ' <span style="color:var(--ink-500);font-size:11px;">(customized)</span>' : "") +
+          (!d.active ? ' <span style="color:var(--crit);font-size:11px;">(inactive)</span>' : "") + "</td>" +
+        '<td><span style="font-size:11.5px;color:var(--ink-500);">' + d.formula_text + "</span></td>" +
+        '<td class="dc-weight-cell">' + (d.kpi_weight_pct != null ? "&asymp; " + d.kpi_weight_pct + "%" : "&mdash;") + "</td>" +
+        "<td></td>";
+      var btn = el("button", "btn", "Edit");
+      btn.addEventListener("click", function () { openAdminDefModal(d); });
+      tr.lastElementChild.appendChild(btn);
+      wrap.appendChild(tr);
+    });
+  }
+
+  // [Stage/department scoping]: L0 has real domestic vs. international
+  // catalogs (Manage Tracking's own L0 International tab, Overview's
+  // merged-but-still-separately-toggleable L0 score); L1 has never had an
+  // international variant anywhere in the app (confirmed against the real
+  // catalog -- 0 of 113 L1 items sit on an international department). The
+  // Add/Edit modal's Department dropdown used to list all 40 departments
+  // unfiltered regardless of which of the three formula tabs you were on,
+  // so nothing stopped an L1 item from being pointed at an international
+  // department that no other L1 view would ever recognize. _dcStageLabel/
+  // _dcApplicableDepts scope the dropdown (and the modal's own title) to
+  // whichever tab you're actually adding/editing from.
+  function _dcStageLabel() {
+    return dcTab === "L1" ? "L1" : (dcTab === "L0intl" ? "L0 International" : "L0");
+  }
+  function _dcApplicableDepts(allDepts) {
+    var wantIntl = dcTab === "L0intl";
+    return allDepts.filter(function (dep) { return !!dep.is_international === wantIntl; });
+  }
+  // [Item No auto-numbering]: item numbers are always "<department
+  // number>.<minor>" (1.1, 6.3, 19.2, ...) and the sequence is scoped per
+  // department PER STAGE -- the same department has its own independent
+  // L0 sequence and L1 sequence. dcItems already holds the full list for
+  // whichever stage tab is active, so "next number for this department"
+  // is just its current max minor + 1.
+  function _nextItemNo(deptId, deptNumber) {
+    var maxMinor = 0;
+    dcItems.forEach(function (it) {
+      if (it.department_id !== deptId) return;
+      var parts = String(it.item_no).split(".");
+      if (parts.length !== 2) return;
+      var minor = parseInt(parts[1], 10);
+      if (!isNaN(minor) && minor > maxMinor) maxMinor = minor;
+    });
+    return deptNumber + "." + (maxMinor + 1);
+  }
+  var _adminDefTarget = null;
+  var _adminDefDepts = [];
+  // Locked, not just pre-filled: a free-text Item No on Add let an admin
+  // hand-pick a number that skipped or duplicated the department's real
+  // next slot, leaving gaps in the sequence. Add always takes the
+  // department's actual next number with no way to override it; Edit still
+  // allows changing item_no (renumbering an existing item is a real,
+  // separate need this doesn't touch).
+  function _refreshAdminDefItemNoSuggestion() {
+    if (_adminDefTarget) return; // never auto-fill while editing an existing item
+    var deptSel = document.getElementById("adminDefDept");
+    var dep = _adminDefDepts.find(function (d) { return String(d.id) === deptSel.value; });
+    if (!dep) return;
+    document.getElementById("adminDefItemNo").value = _nextItemNo(dep.id, dep.number);
+  }
+  document.getElementById("adminDefDept").addEventListener("change", _refreshAdminDefItemNoSuggestion);
+  async function openAdminDefModal(d) {
+    _adminDefTarget = d;
+    var deptSel = document.getElementById("adminDefDept");
+    deptSel.innerHTML = "";
+    var allDepts = dcDepartments.length ? dcDepartments : await api("/api/departments?include_inactive=true");
+    _adminDefDepts = _dcApplicableDepts(allDepts);
+    _adminDefDepts.forEach(function (dep) {
+      var opt = document.createElement("option");
+      opt.value = dep.id; opt.textContent = deptLabel(dep.name, dep.number);
+      deptSel.appendChild(opt);
+    });
+    var stageLabel = _dcStageLabel();
+    if (d) {
+      document.getElementById("adminDefEyebrow").textContent = "Edit Deliverable · " + stageLabel;
+      document.getElementById("adminDefTitle").textContent = d.item_no + " · " + d.name;
+      document.getElementById("adminDefItemNo").value = d.item_no;
+      document.getElementById("adminDefItemNo").readOnly = false;
+      document.getElementById("adminDefItemNoHint").style.display = "none";
+      document.getElementById("adminDefName").value = d.name;
+      deptSel.value = d.department_id;
+      document.getElementById("adminDefType").value = d.deliverable_type;
+      document.getElementById("adminDefMilestone").checked = d.is_milestone;
+      document.getElementById("adminDefMilestoneCode").value = d.milestone_code || "";
+      document.getElementById("adminDefWeight").value = d.kpi_weight != null ? d.kpi_weight : "";
+      renderBranchEditorRows(document.getElementById("adminDefBranchList"), d.branches);
+      document.getElementById("adminDefRestoreBtn").style.display = d.can_restore ? "" : "none";
+      document.getElementById("adminDefDeactivateBtn").style.display = "";
+      document.getElementById("adminDefDeactivateBtn").textContent = d.active ? "Deactivate" : "Reactivate";
+      document.getElementById("adminDefApplySection").style.display = "none";
+    } else {
+      document.getElementById("adminDefEyebrow").textContent = "Deliverables Configuration";
+      document.getElementById("adminDefTitle").textContent = "Add " + stageLabel + " Deliverable";
+      document.getElementById("adminDefItemNo").value = "";
+      document.getElementById("adminDefItemNo").readOnly = true;
+      document.getElementById("adminDefItemNoHint").style.display = "";
+      document.getElementById("adminDefName").value = "";
+      document.getElementById("adminDefType").value = "date_driven";
+      document.getElementById("adminDefMilestone").checked = false;
+      document.getElementById("adminDefMilestoneCode").value = "";
+      document.getElementById("adminDefWeight").value = "";
+      renderBranchEditorRows(document.getElementById("adminDefBranchList"), []);
+      document.getElementById("adminDefRestoreBtn").style.display = "none";
+      document.getElementById("adminDefDeactivateBtn").style.display = "none";
+      document.getElementById("adminDefApplySection").style.display = "";
+      document.querySelector('input[name="adminDefScope"][value="all_active"]').checked = true;
+      document.querySelector('input[name="adminDefReoccur"][value="yes"]').checked = true;
+      document.getElementById("adminDefProjectPicker").style.display = "none";
+      await _populateAdminDefProjectPicker();
+    }
+    _refreshAdminDefItemNoSuggestion();
+    updateAdminDefWeightReadout();
+    document.getElementById("adminDefModalOverlay").hidden = false;
+  }
+  // Item [request 9/10]: the "Certain projects" checklist -- every
+  // currently open (non-archived, non-terminal) project of whatever stage
+  // dcTab is currently showing, so picking it stays scoped to the same
+  // catalog the admin is already looking at.
+  async function _populateAdminDefProjectPicker() {
+    var wrap = document.getElementById("adminDefProjectPicker");
+    wrap.innerHTML = "Loading&#8230;";
+    var stage = dcTab === "L1" ? "L1" : "L0";
+    var rows = await api("/api/projects?stage=" + stage);
+    var TERMINAL_L0 = ["Submitted", "Cancelled"], TERMINAL_L1 = ["Completed"];
+    var open = rows.filter(function (p) {
+      if (p.archived) return false;
+      var terminal = stage === "L1" ? TERMINAL_L1 : TERMINAL_L0;
+      return terminal.indexOf(p.status) === -1;
+    });
+    wrap.innerHTML = "";
+    if (!open.length) { wrap.appendChild(el("div", "muted", "No open " + stage + " projects.")); return; }
+    open.forEach(function (p) {
+      var label = el("label", "", "");
+      label.style.cssText = "display:block;font-weight:400;font-size:12.5px;margin:2px 0;";
+      var cb = document.createElement("input");
+      cb.type = "checkbox"; cb.value = p.id; cb.className = "adminDefProjectCb";
+      cb.style.marginRight = "6px";
+      label.appendChild(cb);
+      label.appendChild(document.createTextNode(p.est_no + " – " + p.name));
+      wrap.appendChild(label);
+    });
+  }
+  document.querySelectorAll('input[name="adminDefScope"]').forEach(function (r) {
+    r.addEventListener("change", function () {
+      document.getElementById("adminDefProjectPicker").style.display =
+        document.querySelector('input[name="adminDefScope"]:checked').value === "certain" ? "" : "none";
+    });
+  });
+  function _adminDefWeightSiblings(deptId, excludeId) {
+    return dcItems.filter(function (it) {
+      return it.department_id === deptId && it.id !== excludeId &&
+        it.active !== false && it.kpi_relevant !== false;
+    });
+  }
+  function updateAdminDefWeightReadout() {
+    var out = document.getElementById("adminDefWeightPct");
+    var deptId = parseInt(document.getElementById("adminDefDept").value, 10);
+    var raw = document.getElementById("adminDefWeight").value.trim();
+    var w = raw === "" ? 1.0 : parseFloat(raw);
+    if (!deptId || !isFinite(w) || w <= 0) { out.textContent = ""; return; }
+    var excludeId = _adminDefTarget ? _adminDefTarget.id : null;
+    var siblings = _adminDefWeightSiblings(deptId, excludeId);
+    var total = w + siblings.reduce(function (sum, it) { return sum + (it.kpi_weight || 1.0); }, 0);
+    out.textContent = "(≈ " + (Math.round((w / total) * 1000) / 10) + "% of department score)";
+  }
+  document.getElementById("adminDefWeight").addEventListener("input", updateAdminDefWeightReadout);
+  document.getElementById("adminDefDept").addEventListener("change", updateAdminDefWeightReadout);
+  function closeAdminDefModal() { document.getElementById("adminDefModalOverlay").hidden = true; }
+  document.getElementById("adminDefClose").addEventListener("click", closeAdminDefModal);
+  document.getElementById("adminDefCancel").addEventListener("click", closeAdminDefModal);
+  document.getElementById("adminDefAddBranch").addEventListener("click", function () {
+    document.getElementById("adminDefBranchList").appendChild(_feBuildBranchRow(null));
+  });
+  document.getElementById("adminDefSave").addEventListener("click", async function () {
+    var itemNo = document.getElementById("adminDefItemNo").value.trim();
+    var name = document.getElementById("adminDefName").value.trim();
+    var deptId = parseInt(document.getElementById("adminDefDept").value, 10);
+    var dtype = document.getElementById("adminDefType").value;
+    var isMs = document.getElementById("adminDefMilestone").checked;
+    var msCode = document.getElementById("adminDefMilestoneCode").value.trim() || null;
+    var weightRaw = document.getElementById("adminDefWeight").value.trim();
+    // Blank field means "no custom weight" -- send 1.0 explicitly (not null,
+    // which the backend PATCH endpoint treats as "field omitted, leave
+    // unchanged") so clearing a previously-customized weight actually
+    // resets it, matching what the live "≈X%" readout already implied.
+    var weight = weightRaw === "" ? 1.0 : parseFloat(weightRaw);
+    var branches = collectBranchesFromEditor(document.getElementById("adminDefBranchList"));
+    if (!itemNo || !name) { showToast("Item number and name are required", true); return; }
+    if (!isFinite(weight) || weight <= 0) { showToast("Weight must be a number greater than 0", true); return; }
+    try {
+      if (_adminDefTarget) {
+        await api("/api/deliverables/admin/definitions/" + _adminDefTarget.id, {
+          method: "PATCH", headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            item_no: itemNo, name: name, department_id: deptId, deliverable_type: dtype,
+            is_milestone: isMs, milestone_code: msCode, kpi_weight: weight,
+            actor_role: CURRENT_ROLE, actor_email: actingEmail(), actor_name: passiveIdentity(),
+          }),
+        });
+        if (dtype === "date_driven" && branches.length) {
+          await api("/api/deliverables/admin/definitions/" + _adminDefTarget.id + "/branches", {
+            method: "PUT", headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ branches: branches, actor_role: CURRENT_ROLE, actor_email: actingEmail(), actor_name: passiveIdentity() }),
+          });
+        }
+      } else {
+        var scope = document.querySelector('input[name="adminDefScope"]:checked').value;
+        var reoccur = document.querySelector('input[name="adminDefReoccur"]:checked').value === "yes";
+        var pickedIds = Array.from(document.querySelectorAll(".adminDefProjectCb:checked")).map(function (cb) { return parseInt(cb.value, 10); });
+        if (scope === "certain" && !pickedIds.length) {
+          showToast('Select at least one project, or choose "All active projects"', true);
+          return;
+        }
+        var createRes = await api("/api/deliverables/admin/definitions", {
+          method: "POST", headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            stage: (dcTab === "L1" ? "L1" : "L0"), item_no: itemNo, name: name, department_id: deptId,
+            deliverable_type: dtype, is_milestone: isMs, milestone_code: msCode, branches: branches,
+            reoccurring: reoccur, applicability_scope: scope, applicability_project_ids: pickedIds,
+            actor_role: CURRENT_ROLE, actor_email: actingEmail(), actor_name: passiveIdentity(),
+          }),
+        });
+        closeAdminDefModal();
+        var retro = createRes.retrofitted_count || 0;
+        showToast("Saved" + (retro ? " &#8211; added to " + retro + " active project" + (retro === 1 ? "" : "s") : ""));
+        loadDeliverablesConfig();
+        return;
+      }
+    } catch (err) {
+      showToast("Could not save &#8211; " + apiErrorDetail(err), true);
+      return;
+    }
+    closeAdminDefModal();
+    showToast("Saved");
+    loadDeliverablesConfig();
+  });
+  document.getElementById("adminDefRestoreBtn").addEventListener("click", async function () {
+    if (!_adminDefTarget) return;
+    if (!(await customConfirm("Restore " + _adminDefTarget.item_no + " to its default formula? This clears any customization.", { danger: true, okLabel: "Restore" }))) return;
+    try {
+      await api("/api/deliverables/admin/definitions/" + _adminDefTarget.id + "/restore-default", {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ actor_role: CURRENT_ROLE, actor_email: actingEmail(), actor_name: passiveIdentity() }),
+      });
+    } catch (err) {
+      showToast("Could not restore &#8211; " + apiErrorDetail(err), true);
+      return;
+    }
+    closeAdminDefModal();
+    showToast("Restored to default");
+    loadDeliverablesConfig();
+  });
+  document.getElementById("adminDefDeactivateBtn").addEventListener("click", async function () {
+    if (!_adminDefTarget) return;
+    var nowActive = !_adminDefTarget.active;
+    await api("/api/deliverables/admin/definitions/" + _adminDefTarget.id + "/active", {
+      method: "PATCH", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ active: nowActive, actor_role: CURRENT_ROLE, actor_email: actingEmail(), actor_name: passiveIdentity() }),
+    });
+    closeAdminDefModal();
+    showToast(nowActive ? "Reactivated" : "Deactivated");
+    loadDeliverablesConfig();
+  });
+
+  function renderDcDepartments() {
+    var wrap = document.getElementById("dcDepartmentsBody");
+    wrap.innerHTML = "";
+    dcDepartments.forEach(function (dep) {
+      var tr = el("tr");
+      if (!dep.active) tr.style.opacity = "0.5";
+      var nameInput = document.createElement("input"); nameInput.type = "text"; nameInput.value = dep.name; nameInput.style.width = "100%";
+      var tdName = el("td"); tdName.appendChild(nameInput); tr.appendChild(tdName);
+      var numberInput = document.createElement("input"); numberInput.type = "number"; numberInput.value = dep.number || ""; numberInput.style.width = "60px";
+      var tdNumber = el("td"); tdNumber.appendChild(numberInput); tr.appendChild(tdNumber);
+      var intlCheck = document.createElement("input"); intlCheck.type = "checkbox"; intlCheck.checked = dep.is_international;
+      var tdIntl = el("td"); tdIntl.appendChild(intlCheck); tr.appendChild(tdIntl);
+      tr.appendChild(el("td", "", dep.active
+        ? '<span class="pill good"><span class="dot"></span>Active</span>'
+        : '<span class="pill neutral"><span class="dot"></span>Removed</span>'));
+      var actions = el("td");
+      var saveBtn = el("button", "btn", "Save");
+      saveBtn.addEventListener("click", async function () {
+        try {
+          await api("/api/departments/" + dep.id, {
+            method: "PATCH", headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              name: nameInput.value.trim(),
+              number: numberInput.value ? parseInt(numberInput.value, 10) : null, is_international: intlCheck.checked,
+              actor_role: CURRENT_ROLE, actor_email: actingEmail(), actor_name: passiveIdentity(),
+            }),
+          });
+        } catch (err) { showToast("Could not save &#8211; " + apiErrorDetail(err), true); return; }
+        showToast("Saved");
+        loadDeliverablesConfig();
+      });
+      actions.appendChild(saveBtn);
+      if (dep.active) {
+        var delBtn = el("button", "btn ghost-crit", "Remove");
+        delBtn.style.marginLeft = "6px";
+        delBtn.addEventListener("click", async function () {
+          if (!(await customConfirm("Remove department \"" + dep.name + "\"? Its own deliverables will be deactivated with it.", { danger: true, okLabel: "Remove" }))) return;
+          await api("/api/departments/" + dep.id, {
+            method: "DELETE", headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ actor_role: CURRENT_ROLE, actor_email: actingEmail(), actor_name: passiveIdentity() }),
+          });
+          showToast("Department removed");
+          loadDeliverablesConfig();
+        });
+        actions.appendChild(delBtn);
+      }
+      tr.appendChild(actions);
+      wrap.appendChild(tr);
+    });
+    document.getElementById("dcDeptAddBtn").onclick = async function () {
+      var name = document.getElementById("dcDeptNewName").value.trim();
+      if (!name) { showToast("Name is required", true); return; }
+      try {
+        await api("/api/departments", {
+          method: "POST", headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            name: name,
+            number: document.getElementById("dcDeptNewNumber").value ? parseInt(document.getElementById("dcDeptNewNumber").value, 10) : null,
+            is_international: document.getElementById("dcDeptNewIntl").checked,
+            actor_role: CURRENT_ROLE, actor_email: actingEmail(), actor_name: passiveIdentity(),
+          }),
+        });
+      } catch (err) { showToast("Could not add &#8211; " + apiErrorDetail(err), true); return; }
+      document.getElementById("dcDeptNewName").value = "";
+      document.getElementById("dcDeptNewNumber").value = "";
+      document.getElementById("dcDeptNewIntl").checked = false;
+      showToast("Department added");
+      loadDeliverablesConfig();
+    };
+  }
+
+  function renderDcHistory(rows) {
+    var wrap = document.getElementById("dcHistoryBody");
+    wrap.innerHTML = "";
+    if (!rows.length) {
+      wrap.innerHTML = '<tr><td colspan="5" style="text-align:center;color:var(--ink-500);padding:24px;">No changes yet.</td></tr>';
+      return;
+    }
+    rows.forEach(function (r) {
+      var tr = document.createElement("tr");
+      var titleText = r.kind === "department" ? (r.department_name || r.summary) : (r.item_no + " &middot; " + r.item_name);
+      var whatChangedHtml = '<div>' + r.summary + '</div>';
+      if (r.field_changes && r.field_changes.length) {
+        whatChangedHtml += '<ul class="dc-history-diff">' + r.field_changes.map(function (fc) {
+          return "<li><b>" + fc.field + ":</b> " + fc.before + " &rarr; " + fc.after + "</li>";
+        }).join("") + '</ul>';
+      }
+      tr.innerHTML =
+        "<td>" + titleText + "</td>" +
+        "<td>" + whatChangedHtml + "</td>" +
+        "<td>" + (r.actor_name || r.actor_email || "system") + "</td>" +
+        "<td>" + fmtDate((r.changed_at || "").slice(0, 10)) + "</td>" +
+        "<td></td>";
+      var revertBtn = el("button", "btn", "Revert");
+      revertBtn.addEventListener("click", async function () {
+        if (!(await customConfirm("Revert this change?"))) return;
+        var revertPath = r.kind === "department"
+          ? "/api/departments/change-history/" + r.id + "/revert"
+          : "/api/deliverables/admin/change-history/" + r.id + "/revert";
+        try {
+          await api(revertPath, {
+            method: "POST", headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ actor_role: CURRENT_ROLE, actor_email: actingEmail(), actor_name: passiveIdentity() }),
+          });
+        } catch (err) { showToast("Could not revert &#8211; " + apiErrorDetail(err), true); return; }
+        showToast("Reverted");
+        loadDeliverablesConfig();
+      });
+      tr.lastElementChild.appendChild(revertBtn);
+      wrap.appendChild(tr);
+    });
+  }
+
+  /* ================= ARCHIVED PROJECTS (admin) ================= */
+  // Item 12: filter/sort added -- same Excel-header controller and
+  // cache-then-re-render split every other table in the app already
+  // uses (see _projectsXh), built once and reused across reloads.
+  var _archivedCache = [];
+  var _archivedXhInst = null;
+  function _archivedXh() {
+    if (_archivedXhInst) return _archivedXhInst;
+    function uniq(getter) {
+      return function () {
+        var seen = {}, out = [];
+        _archivedCache.forEach(function (p) {
+          var v = getter(p); v = v == null || v === "" ? "" : String(v);
+          if (!seen[v]) { seen[v] = true; out.push(v); }
+        });
+        return out.sort(function (a, b) { return a.localeCompare(b, undefined, { numeric: true, sensitivity: "base" }); });
+      };
+    }
+    var archivedAtOf = function (p) { return p.archived_at ? fmtDate(p.archived_at.slice(0, 10)) : ""; };
+    var columns = [
+      { key: "est_no", get: function (p) { return p.est_no; }, uniqueValues: uniq(function (p) { return p.est_no; }) },
+      { key: "name", get: function (p) { return p.name; }, uniqueValues: uniq(function (p) { return p.name; }) },
+      { key: "stage", get: function (p) { return p.stage; }, uniqueValues: uniq(function (p) { return p.stage; }) },
+      { key: "status", get: function (p) { return p.status; }, uniqueValues: uniq(function (p) { return p.status; }) },
+      { key: "archived_at", get: archivedAtOf, sortValue: function (p) { return p.archived_at || ""; }, uniqueValues: uniq(archivedAtOf) },
+      { key: "actions", sortable: false, filterable: false },
+    ];
+    var theadRow = document.querySelector("#archivedProjectsHead tr");
+    _archivedXhInst = installExcelHeader(theadRow, columns);
+    _archivedXhInst.onChange(_renderArchivedProjects);
+    return _archivedXhInst;
+  }
+  // Item 18: column widths/visibility -- matches the colgroup in
+  // index.html; the trailing Actions column is deliberately left out of
+  // the customizable set (View/Restore buttons, not real data).
+  var _archivedColCustom = installColumnCustomizer({
+    storageKey: "archivedtable", title: "Archived Projects",
+    colgroupEl: document.querySelector("#view-archivedprojects colgroup"),
+    columns: [
+      { key: "est_no", label: "Est-No", defaultWidth: 15 }, { key: "name", label: "Name", defaultWidth: 34 },
+      { key: "stage", label: "Stage", defaultWidth: 9 }, { key: "status", label: "Status", defaultWidth: 14 },
+      { key: "archived_at", label: "Archived", defaultWidth: 13 }, { key: "actions", label: "Actions", defaultWidth: 15 },
+    ],
+  });
+  document.getElementById("archivedColCustomBtn").addEventListener("click", _archivedColCustom.open);
+  async function loadArchivedProjects() {
+    _archivedCache = await api("/api/projects?archived=true");
+    _renderArchivedProjects();
+  }
+  function _renderArchivedProjects() {
+    var projects = _archivedXh().process(_archivedCache);
+    var tbody = document.getElementById("archivedProjectsBody");
+    tbody.innerHTML = "";
+    if (!projects.length) {
+      var tr = el("tr");
+      var msg = _archivedCache.length ? "No archived projects match the current column filters." : "No archived projects.";
+      tr.innerHTML = '<td colspan="6" style="text-align:center;color:var(--ink-500);padding:30px;">' + msg + '</td>';
+      tbody.appendChild(tr);
+      return;
+    }
+    projects.forEach(function (p) {
+      var tr2 = el("tr");
+      var estClass = "est-no " + p.stage.toLowerCase();
+      var statusPill = '<span class="pill ' + (PROJECT_STATUS_CLASS[p.status] || "neutral") + '"><span class="dot"></span>' + p.status + '</span>';
+      // Item 12: International badge -- matches L0/L1's own Est cell.
+      var intlPill = p.is_international ? ' <span class="pill neutral"><span class="dot"></span>International</span>' : "";
+      tr2.appendChild(el("td", estClass, p.est_no + intlPill));
+      tr2.appendChild(el("td", "", '<span class="proj-name">' + p.name + '</span>'));
+      tr2.appendChild(el("td", "", p.stage));
+      tr2.appendChild(el("td", "", statusPill));
+      tr2.appendChild(el("td", "", p.archived_at ? fmtDate(p.archived_at.slice(0, 10)) : "&#8213;"));
+      var actions = el("td");
+      var viewBtn = el("button", "btn", "View");
+      viewBtn.addEventListener("click", function (e) { e.stopPropagation(); openDetail(p.id); });
+      actions.appendChild(viewBtn);
+      var restoreBtn = el("button", "btn primary", "Restore");
+      restoreBtn.style.marginLeft = "6px";
+      restoreBtn.addEventListener("click", async function (e) {
+        e.stopPropagation();
+        try {
+          await api("/api/projects/" + p.id + "/archive", {
+            method: "PATCH", headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ archived: false, actor_role: CURRENT_ROLE, actor_email: actingEmail() }),
+          });
+        } catch (err) { showToast("Could not restore &#8211; " + apiErrorDetail(err), true); return; }
+        showToast("Project restored");
+        loadArchivedProjects();
+      });
+      actions.appendChild(restoreBtn);
+      tr2.appendChild(actions);
+      tr2.addEventListener("click", function () { openDetail(p.id); });
+      tbody.appendChild(tr2);
+    });
+  }
+
+  /* ================= MY REQUESTS (all roles) ================= */
+  // One unified, read-only view across every request type in the app --
+  // Deliverable Formulas already had its own scoped "My Suggestions" panel
+  // for formula requests specifically; this is the general version Yasser
+  // asked for, covering all 6 request types the app has (Due-Date,
+  // Reassignment, SME Nomination, Bid Value Access, L0-L1 Group Add,
+  // Formula Change), reusing the same openFuDetailModal Follow Up already
+  // built rather than a second detail-view implementation.
+  // Item [My Requests filters]: same Excel-header filter+sort every other
+  // table in the app uses.
+  var _myRequestsXh = null;
+  var _myRequestsAll = [];
+  function _myRequestsStatusLabel(status) {
+    return status === "pending" ? "Pending" : status === "approved" ? "Approved" : "Rejected";
+  }
+  function _myRequestsXhController() {
+    if (_myRequestsXh) return _myRequestsXh;
+    function uniq(getter) {
+      return function () {
+        var seen = {}, out = [];
+        _myRequestsAll.forEach(function (r) {
+          var v = getter(r); v = v == null || v === "" ? "" : String(v);
+          if (!seen[v]) { seen[v] = true; out.push(v); }
+        });
+        return out.sort(function (a, b) { return a.localeCompare(b, undefined, { numeric: true, sensitivity: "base" }); });
+      };
+    }
+    var typeOf = function (r) { return r.type; };
+    var titleOf = function (r) { return r.title; };
+    var statusOf = function (r) { return _myRequestsStatusLabel(r.status); };
+    var atLabelOf = function (r) { return fmtDate((r.at || "").slice(0, 10)); };
+    var columns = [
+      { key: "type", get: typeOf, uniqueValues: uniq(typeOf) },
+      { key: "title", get: titleOf, uniqueValues: uniq(titleOf) },
+      { key: "status", get: statusOf, uniqueValues: uniq(statusOf) },
+      // Filter values match the displayed dd-Mon-yyyy label (same idiom as
+      // Assigned Deliverables' Due Date column), sort still uses the real
+      // timestamp so newest-first/oldest-first stays chronologically correct.
+      { key: "at", get: atLabelOf, sortValue: function (r) { return r.at || ""; }, uniqueValues: uniq(atLabelOf) },
+    ];
+    var theadRow = document.getElementById("myRequestsBody").closest("table").querySelector("thead tr");
+    _myRequestsXh = installExcelHeader(theadRow, columns);
+    _myRequestsXh.onChange(function () { _renderMyRequests(_myRequestsXh.process(_myRequestsAll)); });
+    document.getElementById("myRequestsExportBtn").addEventListener("click", function () {
+      exportTableToExcel("My Requests", _myRequestsXh, _myRequestsAll);
+    });
+    return _myRequestsXh;
+  }
+  // Item 18: column widths/visibility -- top-level, not inside
+  // _myRequestsXhController above, since that function (and its own
+  // Export button wiring) only ever runs once loadMyRequests() gets past
+  // its "set your acting email" early-return. A viewer with no acting
+  // email set yet would otherwise see a Columns button that silently did
+  // nothing -- customizing columns needs no data loaded at all.
+  var _myRequestsColCustom = installColumnCustomizer({
+    storageKey: "myrequeststable", title: "My Requests",
+    colgroupEl: document.querySelector("#myRequestsTable colgroup"),
+    columns: [
+      { key: "type", label: "Type", defaultWidth: 13 }, { key: "request", label: "Request", defaultWidth: 67 },
+      { key: "status", label: "Status", defaultWidth: 12 }, { key: "requested", label: "Requested", defaultWidth: 8 },
+    ],
+  });
+  document.getElementById("myRequestsColCustomBtn").addEventListener("click", _myRequestsColCustom.open);
+  function _renderMyRequests(rows) {
+    var tbody = document.getElementById("myRequestsBody");
+    tbody.innerHTML = "";
+    if (!rows.length) {
+      tbody.innerHTML = '<tr><td colspan="4" style="text-align:center;color:var(--ink-500);padding:30px;">' +
+        (_myRequestsAll.length ? "No requests match the current filters." : "You haven\'t sent any requests yet.") + '</td></tr>';
+      return;
+    }
+    rows.forEach(function (r) {
+      var tr = el("tr");
+      tr.style.cursor = "pointer";
+      var statusPill = r.status === "pending"
+        ? '<span class="pill neutral"><span class="dot"></span>Pending</span>'
+        : _historyStatusPill(r.status);
+      tr.appendChild(el("td", "", r.type));
+      tr.appendChild(el("td", "", r.title));
+      tr.appendChild(el("td", "", statusPill));
+      tr.appendChild(el("td", "", fmtDate((r.at || "").slice(0, 10))));
+      tr.addEventListener("click", function () {
+        openFuDetailModal({ eyebrow: r.type + " &middot; " + (r.status === "pending" ? "Pending" : (r.status === "approved" ? "Approved" : "Rejected")), title: r.title, fields: r.fields });
+      });
+      tbody.appendChild(tr);
+    });
+  }
+  async function loadMyRequests() {
+    var email = passiveIdentity();
+    var tbody = document.getElementById("myRequestsBody");
+    tbody.innerHTML = "";
+    if (!email) {
+      tbody.innerHTML = '<tr><td colspan="4" style="text-align:center;color:var(--ink-500);padding:30px;">Set your acting email to see your requests.</td></tr>';
+      return;
+    }
+    var qs = "status=&requested_by_email=" + encodeURIComponent(email);
+    var results = await Promise.all([
+      api("/api/deliverables/due-date-requests?" + qs),
+      api("/api/deliverables/reassignment-requests?" + qs),
+      api("/api/departments/sme-nominations?" + qs),
+      api("/api/projects/bid-value-requests?" + qs),
+      api("/api/departments/user-add-requests?" + qs),
+      api("/api/deliverables/config/formula-change-requests?" + qs),
+    ]);
+    var dueDateReqs = results[0], reassignReqs = results[1], smeNoms = results[2],
+        bvReqs = results[3], groupReqs = results[4], formulaReqs = results[5];
+
+    var rows = [];
+    dueDateReqs.forEach(function (r) {
+      var kindLabel = r.kind === "extension" ? "Extension" : "Hold";
+      rows.push({
+        type: "Due-Date " + kindLabel, title: r.item_no + " &middot; " + r.name, status: r.status, at: r.requested_at,
+        fields: [
+          ["Project", r.est_no],
+          ["Change", r.kind === "extension" ? (fmtDate(r.current_due_date) + " &#8594; " + fmtDate(r.requested_due_date)) : "Put this item on hold"],
+          ["Reason", r.reason], ["Decision note", r.decision_comment],
+        ],
+      });
+    });
+    reassignReqs.forEach(function (r) {
+      rows.push({
+        type: "Reassignment", title: r.item_no + " &middot; " + r.name, status: r.status, at: r.requested_at,
+        fields: [["Project", r.est_no], ["From", r.from_email || "Unassigned"], ["To", r.to_email], ["Reason", r.reason]],
+      });
+    });
+    smeNoms.forEach(function (n) {
+      rows.push({
+        type: "SME Nomination", title: n.item_no + " &middot; " + n.item_name, status: n.status, at: n.requested_at,
+        fields: [["Stage", n.stage], ["Department", deptLabel(n.department, n.department_number)]],
+      });
+    });
+    bvReqs.forEach(function (r) {
+      rows.push({
+        type: "Bid Value Access", title: r.est_no + " &middot; " + r.name, status: r.status, at: r.requested_at,
+        fields: [],
+      });
+    });
+    groupReqs.forEach(function (r) {
+      rows.push({
+        type: "L0-L1 Group Add", title: (r.name || r.email) + " &middot; " + r.role, status: r.status, at: r.requested_at,
+        fields: [["Email", r.email], ["Role", r.role]],
+      });
+    });
+    formulaReqs.forEach(function (r) {
+      var fields = [["Department", r.department], ["Currently", r.current_summary]];
+      if (r.formula_changed) fields.push(["Proposed change", r.proposed_formula_text]);
+      if (r.proposed_weight != null) fields.push(["Scoring weight", _formatWeightSuggestion(r)]);
+      fields.push(["Reason", r.comment], ["Decision note", r.decision_comment]);
+      rows.push({
+        type: "Formula Change", title: r.item_no + " &middot; " + r.item_name, status: r.status, at: r.requested_at,
+        fields: fields,
+      });
+    });
+    rows.sort(function (a, b) { return new Date(b.at) - new Date(a.at); });
+    _myRequestsAll = rows;
+    _renderMyRequests(_myRequestsXhController().process(rows));
+  }
+
+  /* ================= BM TRIAGE STATUS (admin) ================= */
+  var BM_TRIAGE_STATUS_META = {
+    done: ["good", "Done"], reminded: ["warn", "Reminded"], pending: ["crit", "Pending"],
+  };
+  var _bmTriageCache = [];
+  async function loadBmTriageStatus() {
+    // Item 110: a Bid Manager (not just Admin) can load this, but the
+    // backend scopes the rows to just their own tenders when non-admin.
+    _bmTriageCache = await api("/api/projects/bm-triage-status?actor_role=" + CURRENT_ROLE +
+      "&actor_email=" + encodeURIComponent(actingEmail()));
+    document.getElementById("bmTriageSub").textContent = can("create")
+      ? "Every active L0 tender's Bid Manager triage progress — pending, reminded, or done."
+      : "Your own active L0 tenders' triage progress — pending, reminded, or done.";
+    _renderBmTriageStatus();
+  }
+  // Items 4/36: Excel header (sort + filter) on Est-No/Tender/Bid Manager/
+  // Status; the Triage progress and Action columns stay plain.
+  var _bmTriageXh = null;
+  function _getBmTriageXh() {
+    if (_bmTriageXh) return _bmTriageXh;
+    function uniq(getter) {
+      return function () {
+        var seen = {}, out = [];
+        _bmTriageCache.forEach(function (r) {
+          var v = getter(r); v = v == null ? "" : String(v);
+          if (!seen[v]) { seen[v] = true; out.push(v); }
+        });
+        return out.sort(function (a, b) { return a.localeCompare(b, undefined, { numeric: true, sensitivity: "base" }); });
+      };
+    }
+    var statusGet = function (r) { return (BM_TRIAGE_STATUS_META[r.status] || ["", r.status])[1]; };
+    var columns = [
+      { key: "est_no", get: function (r) { return r.est_no; }, uniqueValues: uniq(function (r) { return r.est_no; }) },
+      { key: "name", get: function (r) { return r.name; }, uniqueValues: uniq(function (r) { return r.name; }) },
+      { key: "bm", get: function (r) { return r.bid_manager || ""; }, uniqueValues: uniq(function (r) { return r.bid_manager || ""; }) },
+      null,
+      { key: "status", get: statusGet, uniqueValues: uniq(statusGet) },
+      null,
+    ];
+    var theadRow = document.getElementById("bmTriageBody").closest("table").querySelector("thead tr");
+    _bmTriageXh = installExcelHeader(theadRow, columns);
+    _bmTriageXh.onChange(function () { _renderBmTriageStatus(); });
+    return _bmTriageXh;
+  }
+  function _renderBmTriageStatus() {
+    var term = document.getElementById("bmTriageSearch").value.trim().toLowerCase();
+    var rows = _bmTriageCache.filter(function (r) {
+      if (!term) return true;
+      return [r.est_no, r.name, r.bid_manager].filter(Boolean).join(" ").toLowerCase().indexOf(term) !== -1;
+    });
+    rows = _getBmTriageXh().process(rows);
+    var tbody = document.getElementById("bmTriageBody");
+    tbody.innerHTML = "";
+    if (!rows.length) {
+      var tr = el("tr");
+      var td = el("td", "", term ? "No tenders match &#8220;" + term + "&#8221;." : "No active L0 tenders right now.");
+      td.setAttribute("colspan", "6");
+      tr.appendChild(td);
+      tbody.appendChild(tr);
+      return;
+    }
+    rows.forEach(function (r) {
+      var tr = el("tr");
+      // Item [BM Triage Est color]: every other Est-No column in the app
+      // (L0/L1 Tenders, Dashboard's recent-tenders rows...) colors the Est
+      // number in that stage's identity color -- this table only ever
+      // lists active L0 tenders, so it's always the "l0" variant, but it
+      // was rendering as plain text instead of picking that up.
+      tr.appendChild(el("td", "est-no l0", r.est_no));
+      tr.appendChild(el("td", "", '<span class="proj-name">' + r.name + '</span>'));
+      tr.appendChild(el("td", "", r.bid_manager || "&#8213;"));
+      tr.appendChild(el("td", "", r.total_count ? (r.total_count - r.pending_count) + " / " + r.total_count : "&#8213;"));
+      var sm = BM_TRIAGE_STATUS_META[r.status] || ["neutral", r.status];
+      tr.appendChild(el("td", "", '<span class="pill ' + sm[0] + '"><span class="dot"></span>' + sm[1] + "</span>"));
+      var tdAction = el("td");
+      if (r.status !== "done" && can("create")) {
+        var remindBtn = el("button", "btn", r.status === "reminded" ? "Remind Again" : "Remind BM");
+        remindBtn.addEventListener("click", async function () {
+          try {
+            await api("/api/projects/" + r.id + "/triage-reminder?actor_role=" + CURRENT_ROLE, { method: "POST" });
+          } catch (err) {
+            showToast("Could not send reminder &#8211; " + apiErrorDetail(err), true);
+            return;
+          }
+          showToast("Reminder sent to " + (r.bid_manager || "the Bid Manager"));
+          loadBmTriageStatus();
+        });
+        tdAction.appendChild(remindBtn);
+      }
+      tr.appendChild(tdAction);
+      tbody.appendChild(tr);
+    });
+  }
+
+  document.getElementById("bmTriageSearch").addEventListener("input", _renderBmTriageStatus);
+  document.getElementById("bmTriageExportBtn").addEventListener("click", function () {
+    var term = document.getElementById("bmTriageSearch").value.trim().toLowerCase();
+    var rows = _bmTriageCache.filter(function (r) {
+      if (!term) return true;
+      return [r.est_no, r.name, r.bid_manager].filter(Boolean).join(" ").toLowerCase().indexOf(term) !== -1;
+    });
+    exportTableToExcel("BM Triage Status", _getBmTriageXh(), rows);
+  });
+  // Item 18: column widths/visibility.
+  var _bmTriageColCustom = installColumnCustomizer({
+    storageKey: "bmtriagetable", title: "BM Triage Status",
+    colgroupEl: document.querySelector("#bmTriageTable colgroup"),
+    columns: [
+      { key: "est_no", label: "Est-No", defaultWidth: 9 }, { key: "tender", label: "Tender", defaultWidth: 50 },
+      { key: "bm", label: "Bid Manager", defaultWidth: 17 }, { key: "triage", label: "Triage", defaultWidth: 5 },
+      { key: "status", label: "Status", defaultWidth: 8 }, { key: "actions", label: "Actions", defaultWidth: 11 },
+    ],
+  });
+  document.getElementById("bmTriageColCustomBtn").addEventListener("click", _bmTriageColCustom.open);
+  var _perfTriageColCustom = installColumnCustomizer({
+    storageKey: "perftriagetable", title: "Manage Tracking",
+    colgroupEl: document.querySelector("#perfTriageTable colgroup"),
+    columns: [
+      { key: "item", label: "Item", defaultWidth: 7 }, { key: "name", label: "Name", defaultWidth: 63 },
+      { key: "department", label: "Department", defaultWidth: 15 }, { key: "counts", label: "Counts in Performance", defaultWidth: 15 },
+    ],
+  });
+  document.getElementById("perfTriageColCustomBtn").addEventListener("click", _perfTriageColCustom.open);
+  document.getElementById("perfTriageSearch").addEventListener("input", _renderPerfTriage);
+  document.getElementById("matrixSearch").addEventListener("input", _renderMatrix);
+  document.getElementById("matrixEstFilter").addEventListener("input", _renderMatrix);
+
+  /* ================= ASK THE TEAM ================= */
+  // Item 146: read-only identity lookup -- acting-email field, else the
+  // cached prompted email, never a fresh prompt. Anything that just needs
+  // to know "who (if anyone) is already known" -- e.g. deciding whether a
+  // deliverable should show as Followed -- must use this, not actingEmail()
+  // alone, or it silently disagrees with myIdentity() (used by the actual
+  // Follow toggle) any time someone follows via a cached identity with the
+  // acting-email field left blank: the toggle records it under the cached
+  // email, but a bare actingEmail() check for "am I following this" comes
+  // back empty and always renders "Follow" again on the next open.
+  function passiveIdentity() {
+    return (actingEmail() || localStorage.getItem("myEmail") || "").trim();
+  }
+  /* Identity for "Ask the Team" (item 77): reuses the acting-email field
+     that's already how this pilot tracks "who's doing this" everywhere else
+     (no real login exists) — falls back to a one-time prompt cached in
+     localStorage, so the asker is never made to type it twice.
+  */
+  function myIdentity() {
+    var known = passiveIdentity();
+    if (known) return known;
+    var entered = (prompt("Your email, so the team knows who's asking:") || "").trim();
+    if (entered) localStorage.setItem("myEmail", entered);
+    return entered;
+  }
+
+  async function _populateSupEstNo() {
+    var stage = document.getElementById("supStage").value;
+    var projects = await api("/api/projects" + (stage ? "?stage=" + stage : ""));
+    var sel = document.getElementById("supEstNo");
+    sel.innerHTML = '<option value="">Not specific to a tender/project</option>';
+    projects.forEach(function (p) {
+      var opt = document.createElement("option");
+      opt.value = p.id; opt.textContent = p.est_no + " — " + p.name;
+      sel.appendChild(opt);
+    });
+    _populateSupDeliverable();
+  }
+  async function _populateSupDeliverable() {
+    var sel = document.getElementById("supDeliverable");
+    sel.innerHTML = '<option value="">Not specific to a deliverable</option>';
+    var pid = document.getElementById("supEstNo").value;
+    if (!pid) return;
+    var delivs = await api("/api/projects/" + pid + "/deliverables");
+    // The question is only ever routed to Admins (blank target) or a real
+    // SME email (never a name) -- when a specific SME is picked, only show
+    // deliverables actually assigned to them on Focal Points, so the asker
+    // can't pick an item that person has nothing to do with.
+    var target = document.getElementById("supTarget").value;
+    if (target) {
+      var targetLower = target.trim().toLowerCase();
+      delivs = delivs.filter(function (d) {
+        return (d.sme_emails || []).some(function (e) { return (e || "").trim().toLowerCase() === targetLower; });
+      });
+    }
+    delivs.forEach(function (d) {
+      var opt = document.createElement("option");
+      opt.value = d.item_no + " " + d.name; opt.textContent = d.item_no + " · " + d.name;
+      sel.appendChild(opt);
+    });
+  }
+  document.getElementById("supStage").addEventListener("change", _populateSupEstNo);
+  document.getElementById("supEstNo").addEventListener("change", _populateSupDeliverable);
+  document.getElementById("supTarget").addEventListener("change", _populateSupDeliverable);
+
+  // Item 37: "Direct to" picker, populated with real SMEs from the roster
+  // (item 75's role field) so the asker can address a specific person
+  // instead of just Admins generally.
+  async function _populateSupTarget() {
+    var sel = document.getElementById("supTarget");
+    if (sel.dataset.loaded) return;
+    sel.dataset.loaded = "1";
+    try {
+      var users = await api("/api/departments/users");
+      users.filter(function (u) { return u.role === "SME"; }).forEach(function (u) {
+        var opt = el("option", "", (u.name ? u.name + " " : "") + "&#8211; " + u.email);
+        opt.value = u.email;
+        sel.appendChild(opt);
+      });
+    } catch (e) { /* roster lookup is a nice-to-have, not required to submit */ }
+  }
+
+  document.getElementById("supSubmit").addEventListener("click", async function () {
+    var email = myIdentity();
+    var message = document.getElementById("supMessage").value.trim();
+    var errors = [];
+    if (!email) errors.push("An email is required to send this");
+    if (!message) errors.push("Message is required");
+    if (errors.length) { showToast(errors.join("<br>"), true); return; }
+    var estSel = document.getElementById("supEstNo");
+    var payload = {
+      name: null,
+      email: email,
+      stage: document.getElementById("supStage").value || null,
+      est_no: estSel.value ? estSel.options[estSel.selectedIndex].textContent.split(" — ")[0] : null,
+      deliverable: document.getElementById("supDeliverable").value || null,
+      target_email: document.getElementById("supTarget").value || null,
+      message: message,
+    };
+    try {
+      var users = await api("/api/departments/users");
+      var me = users.find(function (u) { return u.email.toLowerCase() === email.toLowerCase(); });
+      if (me) payload.name = me.name;
+    } catch (e) { /* roster lookup is a nice-to-have, not required to submit */ }
+    try {
+      await api("/api/support", {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload),
+      });
+    } catch (err) {
+      showToast("Could not send &#8211; " + apiErrorDetail(err), true);
+      return;
+    }
+    showToast(payload.target_email ? "Sent, directed to " + payload.target_email : "Sent to the admins &#8211; they'll follow up by email");
+    document.getElementById("supMessage").value = "";
+    document.getElementById("supStage").value = "";
+    document.getElementById("supTarget").value = "";
+    _populateSupEstNo();
+    loadSupport();
+  });
+
+  // Item 20 (redlined): the flat "list row crammed into a modal" thread view
+  // is replaced with a real conversation panel -- meta header, message
+  // bubbles for the full back-and-forth, and (when open) an always-visible
+  // reply box right in the panel instead of a popup prompt. Modeled on the
+  // Deliverables detail modal's structure (meta grid up top, wide card).
+  function _renderSupportThread(container, r, opts) {
+    container.innerHTML = "";
+    var panel = el("div", "qa-thread");
+
+    // Item 37: surface who this was really directed to (a specific SME, or
+    // Admins generally) so whoever's handling it knows to loop them in.
+    var meta = el("div", "modal-meta-grid");
+    [["Asked By", r.name ? r.name + " (" + r.email + ")" : r.email],
+     ["To", r.target_email || "Admins"],
+     ["Stage", r.stage || "&#8213;"],
+     ["Project / Deliverable", [r.est_no, r.deliverable].filter(Boolean).join(" &middot; ") || "&#8213;"]].forEach(function (m) {
+      var mi = el("div");
+      mi.appendChild(el("div", "mk", m[0]));
+      mi.appendChild(el("div", "mv", m[1]));
+      meta.appendChild(mi);
+    });
+    panel.appendChild(meta);
+    panel.appendChild(r.status === "resolved"
+      ? el("span", "pill good", '<span class="dot"></span>Resolved')
+      : el("span", "pill warn", '<span class="dot"></span>Open'));
+
+    // The conversation itself: the original question first, then every
+    // reply in order, each its own bubble so a back-and-forth actually
+    // reads like one, instead of the old italic one-liners stacked flat.
+    var thread = el("div", "qa-thread-messages");
+    var firstBubble = el("div", "qa-bubble asker");
+    firstBubble.appendChild(el("div", "qa-bubble-author", r.name || r.email));
+    firstBubble.appendChild(el("div", "qa-bubble-body", r.message));
+    thread.appendChild(firstBubble);
+    (r.messages || []).forEach(function (m) {
+      var isAdmin = m.author === "admin";
+      var bubble = el("div", "qa-bubble" + (isAdmin ? " admin" : " asker"));
+      bubble.appendChild(el("div", "qa-bubble-author", isAdmin ? "Admin" : (r.name || r.email || "Asker")));
+      bubble.appendChild(el("div", "qa-bubble-body", m.body));
+      thread.appendChild(bubble);
+    });
+    panel.appendChild(thread);
+
+    if (r.status !== "resolved" && (opts.canReply || opts.canResolve)) {
+      var footer = el("div", "qa-thread-footer");
+      var kbRefSelect = null;
+      if (opts.canReply) {
+        // Item 150/172.1: admin-only -- point this reply at an existing
+        // knowledge base answer instead of writing a fresh one, so
+        // resolving this ticket doesn't add a duplicate entry (the reply
+        // still goes out to the asker either way).
+        if (opts.kbEntries && opts.kbEntries.length) {
+          kbRefSelect = el("select");
+          kbRefSelect.appendChild(el("option", "", "Reference an existing answer&#8230;"));
+          opts.kbEntries.forEach(function (e) {
+            var o = el("option", "", "#" + e.id + " &middot; " + e.question.slice(0, 60));
+            o.value = e.id;
+            kbRefSelect.appendChild(o);
+          });
+          footer.appendChild(kbRefSelect);
+        }
+        // A real, always-visible reply box right in the panel -- not a
+        // popup prompt -- so writing and sending a reply is one motion.
+        var textarea = document.createElement("textarea");
+        textarea.className = "qa-reply-box";
+        textarea.placeholder = opts.replyPlaceholder;
+        footer.appendChild(textarea);
+        if (kbRefSelect) {
+          kbRefSelect.addEventListener("change", function () {
+            if (!kbRefSelect.value) return;
+            var picked = opts.kbEntries.find(function (e) { return String(e.id) === kbRefSelect.value; });
+            if (picked) textarea.value = picked.answer;
+          });
+        }
+        var actionsRow = el("div", "qa-thread-actions");
+        var replyBtn = el("button", "btn primary", "Send Reply");
+        replyBtn.addEventListener("click", async function () {
+          var body = textarea.value.trim();
+          if (!body) { showToast("A reply message is required", true); return; }
+          var picked = (kbRefSelect && kbRefSelect.value)
+            ? opts.kbEntries.find(function (e) { return String(e.id) === kbRefSelect.value; }) : null;
+          var payload = { body: body, actor_role: CURRENT_ROLE, actor_email: myIdentity() };
+          if (picked) payload.kb_reference_id = picked.id;
+          try {
+            await api("/api/support/" + r.id + "/" + opts.replyEndpoint, {
+              method: "POST", headers: { "Content-Type": "application/json" },
+              body: JSON.stringify(payload),
+            });
+          } catch (err) {
+            showToast("Could not reply &#8211; " + apiErrorDetail(err), true);
+            return;
+          }
+          opts.onReplied();
+        });
+        actionsRow.appendChild(replyBtn);
+        if (opts.canResolve) {
+          var resolveBtn = el("button", "btn", "Mark Resolved");
+          resolveBtn.addEventListener("click", async function () {
+            // If the admin picked a KB reference but resolved straight away
+            // without hitting Reply, the asker would otherwise get nothing
+            // -- send them the referenced answer first so resolving always
+            // means "they've been answered."
+            var hasAdminReply = (r.messages || []).some(function (m) { return m.author === "admin"; });
+            if (!hasAdminReply && kbRefSelect && kbRefSelect.value) {
+              var picked = opts.kbEntries.find(function (e) { return String(e.id) === kbRefSelect.value; });
+              if (picked) {
+                try {
+                  await api("/api/support/" + r.id + "/reply", {
+                    method: "POST", headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify({
+                      body: picked.answer, actor_role: CURRENT_ROLE, actor_email: myIdentity(),
+                      kb_reference_id: picked.id,
+                    }),
+                  });
+                } catch (err) {
+                  showToast("Could not send the referenced answer &#8211; " + apiErrorDetail(err), true);
+                  return;
+                }
+              }
+            }
+            await api("/api/support/" + r.id + "/resolve?actor_role=" + CURRENT_ROLE, { method: "PATCH" });
+            showToast("Marked resolved");
+            refreshNavBadges();
+            opts.onReplied();
+          });
+          actionsRow.appendChild(resolveBtn);
+        }
+        footer.appendChild(actionsRow);
+      }
+      panel.appendChild(footer);
+    }
+    container.appendChild(panel);
+  }
+
+  // Item 150: Ask a Question / Knowledge Base sub-tabs inside the same
+  // "Q/A - Ask the Team" nav item.
+  document.querySelectorAll("#supSubtabRow .chip").forEach(function (btn) {
+    btn.addEventListener("click", function () {
+      document.querySelectorAll("#supSubtabRow .chip").forEach(function (b) { b.classList.remove("active"); });
+      btn.classList.add("active");
+      var pane = btn.dataset.pane;
+      document.getElementById("supAskPane").hidden = pane !== "ask";
+      document.getElementById("supKbPane").hidden = pane !== "kb";
+      if (pane === "kb") loadKb();
+    });
+  });
+  var kbCache = [];
+  function _kbMatches(entry, term, category) {
+    if (category && entry.category !== category) return false;
+    if (!term) return true;
+    var haystack = (entry.question + " " + entry.answer + " " + (entry.est_no || "") + " " + (entry.deliverable || "")).toLowerCase();
+    return haystack.indexOf(term) !== -1;
+  }
+  // Items 21/36: a real table -- numbered rows, Stage/Related Project/Related
+  // Deliverable columns, high-level only, click a row for the full
+  // question+answer (previously grouped-by-category divs with the full
+  // answer always shown inline). Excel header adds sort on every column and
+  // filter on Stage/Related Project/Related Deliverable.
+  var _kbXh = null;
+  function _getKbXh() {
+    if (_kbXh) return _kbXh;
+    function uniq(getter) {
+      return function () {
+        var seen = {}, out = [];
+        kbCache.forEach(function (e) {
+          var v = getter(e); v = v == null ? "" : String(v);
+          if (!seen[v]) { seen[v] = true; out.push(v); }
+        });
+        return out.sort(function (a, b) { return a.localeCompare(b, undefined, { numeric: true, sensitivity: "base" }); });
+      };
+    }
+    var questionOf = function (e) { return e.question; };
+    var columns = [
+      { key: "id", get: function (e) { return e.id; }, filterable: false }, // "#" row rank, not a real filter dimension
+      // [queued: filterability treatment] was filterable:false (a whole
+      // question sentence, near-unique per row) -- same reversed judgment
+      // call as Assigned Deliverables' Deliverable column.
+      { key: "question", get: questionOf, uniqueValues: uniq(questionOf) },
+      { key: "stage", get: function (e) { return e.category === "L0" || e.category === "L1" ? e.category : ""; }, uniqueValues: uniq(function (e) { return e.category === "L0" || e.category === "L1" ? e.category : ""; }) },
+      { key: "est_no", get: function (e) { return e.est_no || ""; }, uniqueValues: uniq(function (e) { return e.est_no || ""; }) },
+      { key: "deliverable", get: function (e) { return e.deliverable || ""; }, uniqueValues: uniq(function (e) { return e.deliverable || ""; }) },
+    ];
+    var theadRow = document.getElementById("kbBody").closest("table").querySelector("thead tr");
+    _kbXh = installExcelHeader(theadRow, columns);
+    _kbXh.onChange(function () { _renderKbList(); });
+    return _kbXh;
+  }
+  function _renderKbList() {
+    var term = document.getElementById("kbSearch").value.trim().toLowerCase();
+    var category = document.getElementById("kbCategoryFilter").value;
+    var filtered = kbCache.filter(function (e) { return _kbMatches(e, term, category); });
+    filtered = _getKbXh().process(filtered);
+    var tbody = document.getElementById("kbBody");
+    var pager = document.getElementById("kbPager");
+    if (!filtered.length) {
+      tbody.innerHTML = '<tr><td colspan="5" style="text-align:center;color:var(--ink-500);padding:30px;">' +
+        (kbCache.length ? "No matching questions." : "No answered questions yet.") + "</td></tr>";
+      pager.innerHTML = "";
+      return;
+    }
+    renderPager(pager, filtered, 10, function (pageItems) {
+      tbody.innerHTML = "";
+      pageItems.forEach(function (e) {
+        var tr = el("tr");
+        tr.style.cursor = "pointer";
+        tr.appendChild(el("td", "num", "#" + e.id));
+        var snippet = e.question.length > 70 ? e.question.slice(0, 70) + "&#8230;" : e.question;
+        tr.appendChild(el("td", "", snippet));
+        tr.appendChild(el("td", "", e.category === "L0" || e.category === "L1" ? e.category : "&#8213;"));
+        tr.appendChild(el("td", "", e.est_no || "&#8213;"));
+        tr.appendChild(el("td", "", e.deliverable || "&#8213;"));
+        tr.addEventListener("click", function () { _openKbDetail(e); });
+        tbody.appendChild(tr);
+      });
+    });
+  }
+  // Item 21 (redlined): bigger, richer detail window -- the number sits
+  // right next to the question in the title instead of its own line, a
+  // Stage pill carries the same L0-orange/L1-green identity used
+  // everywhere else, and Question/Answer render as their own distinct
+  // panels instead of one flat italic line.
+  function _openKbDetail(e) {
+    var isStage = e.category === "L0" || e.category === "L1";
+    document.getElementById("kbDetailTitle").innerHTML =
+      '<span class="kb-detail-num">#' + e.id + "</span> " + e.question;
+    var body = document.getElementById("kbDetailBody");
+    body.innerHTML = "";
+    if (isStage || e.est_no || e.deliverable) {
+      var meta = el("div", "modal-meta-grid");
+      if (isStage) {
+        var mi = el("div");
+        mi.appendChild(el("div", "mk", "Stage"));
+        mi.appendChild(el("div", "mv", '<span class="pill ' + (e.category === "L0" ? "l0-tag" : "l1-tag") + '"><span class="dot"></span>' + e.category + "</span>"));
+        meta.appendChild(mi);
+      }
+      if (e.est_no) {
+        var mi2 = el("div");
+        mi2.appendChild(el("div", "mk", "Related Project"));
+        mi2.appendChild(el("div", "mv", e.est_no));
+        meta.appendChild(mi2);
+      }
+      if (e.deliverable) {
+        var mi3 = el("div");
+        mi3.appendChild(el("div", "mk", "Related Deliverable"));
+        mi3.appendChild(el("div", "mv", e.deliverable));
+        meta.appendChild(mi3);
+      }
+      body.appendChild(meta);
+    }
+    var qBlock = el("div", "kb-detail-panel question");
+    qBlock.appendChild(el("div", "kb-detail-panel-label", "Question"));
+    qBlock.appendChild(el("div", "kb-detail-panel-body", e.question));
+    body.appendChild(qBlock);
+    var aBlock = el("div", "kb-detail-panel answer");
+    aBlock.appendChild(el("div", "kb-detail-panel-label", "Answer"));
+    aBlock.appendChild(el("div", "kb-detail-panel-body", e.answer));
+    body.appendChild(aBlock);
+    document.getElementById("kbDetailOverlay").hidden = false;
+  }
+  document.getElementById("kbDetailClose").addEventListener("click", function () {
+    document.getElementById("kbDetailOverlay").hidden = true;
+  });
+  document.getElementById("kbDetailOverlay").addEventListener("click", function (e) {
+    if (e.target === this) this.hidden = true;
+  });
+  document.getElementById("kbSearch").addEventListener("input", _renderKbList);
+  document.getElementById("kbCategoryFilter").addEventListener("change", _renderKbList);
+  async function loadKb() {
+    kbCache = await api("/api/support/kb");
+    var catSel = document.getElementById("kbCategoryFilter");
+    var current = catSel.value;
+    var cats = Array.from(new Set(kbCache.map(function (e) { return e.category; }))).sort();
+    catSel.innerHTML = '<option value="">All categories</option>';
+    cats.forEach(function (c) { var o = el("option", "", c); o.value = c; catSel.appendChild(o); });
+    catSel.value = cats.indexOf(current) !== -1 ? current : "";
+    _renderKbList();
+  }
+
+  async function loadSupport() {
+    document.getElementById("supAsEmail").textContent = actingEmail() || localStorage.getItem("myEmail") || "(not set yet)";
+    if (!document.getElementById("supEstNo").dataset.loaded) {
+      document.getElementById("supEstNo").dataset.loaded = "1";
+      await _populateSupEstNo();
+    }
+    await _populateSupTarget();
+
+    var mineWrap = document.getElementById("supMineList");
+    var minePager = document.getElementById("supMinePager");
+    var email = actingEmail() || localStorage.getItem("myEmail") || "";
+    mineWrap.innerHTML = "";
+    minePager.innerHTML = "";
+    if (!email) {
+      mineWrap.appendChild(el("div", "empty-state", "Send a request above, or set your acting email, to see your own requests here."));
+    } else {
+      var mine = await api("/api/support/mine?email=" + encodeURIComponent(email));
+      if (!mine.length) {
+        mineWrap.appendChild(el("div", "empty-state", "No requests from you yet."));
+      } else {
+        // Item 19: high-level rows (question + status) with the shared
+        // pager, instead of every question's full thread rendering inline
+        // -- click a row for the full conversation (see _openMyQADetail).
+        renderPager(minePager, mine, 6, function (pageItems) {
+          mineWrap.innerHTML = "";
+          pageItems.forEach(function (r) { mineWrap.appendChild(_supMineRowEl(r)); });
+        });
+      }
+    }
+
+  }
+  function _supMineRowEl(r) {
+    var row = el("div", "aq-row aq-row-clickable");
+    row.style.cursor = "pointer";
+    var main = el("div", "aq-main");
+    var snippet = r.message.length > 80 ? r.message.slice(0, 80) + "&#8230;" : r.message;
+    main.appendChild(el("div", "aq-title", snippet));
+    var context = [r.stage, r.est_no, r.deliverable, fmtDate((r.created_at || "").slice(0, 10))].filter(Boolean).join(" &middot; ");
+    main.appendChild(el("div", "aq-sub", context));
+    row.appendChild(main);
+    row.appendChild(r.status === "resolved"
+      ? el("span", "pill good", '<span class="dot"></span>Resolved')
+      : el("span", "pill warn", '<span class="dot"></span>Open'));
+    row.addEventListener("click", function () { _openMyQADetail(r); });
+    return row;
+  }
+  function _openMyQADetail(r) {
+    var body = document.getElementById("myQABody");
+    _renderSupportThread(body, r, {
+      canReply: true, canResolve: false, replyEndpoint: "respond", replyPlaceholder: "Reply to the admin…",
+      onReplied: async function () { await loadSupport(); document.getElementById("myQAOverlay").hidden = true; },
+    });
+    document.getElementById("myQAOverlay").hidden = false;
+  }
+  document.getElementById("myQAClose").addEventListener("click", function () {
+    document.getElementById("myQAOverlay").hidden = true;
+  });
+  document.getElementById("myQAOverlay").addEventListener("click", function (e) {
+    if (e.target === this) this.hidden = true;
+  });
+
+  // --- AI SUPPORT: Claude-powered chat, stateless on the backend -- this
+  // array IS the conversation's memory, resent (capped) on every turn. ---
+  var aiChatHistory = [];
+  function _renderAiChatMessages() {
+    var wrap = document.getElementById("aiChatMessages");
+    wrap.innerHTML = "";
+    if (!aiChatHistory.length) {
+      wrap.appendChild(el("div", "empty-state", "Ask anything about how the platform works, or about your own assigned deliverables."));
+      return;
+    }
+    aiChatHistory.forEach(function (m) {
+      wrap.appendChild(el("div", "ai-chat-msg " + m.role, _mdLiteToHtml(m.content)));
+    });
+    wrap.scrollTop = wrap.scrollHeight;
+  }
+  // Just enough formatting for lists/bold/newlines in a model's plain-text
+  // reply to read decently -- not a real Markdown renderer, and text comes
+  // from Claude (not another user), so this is about readability, not an
+  // injection boundary.
+  function _mdLiteToHtml(text) {
+    var escaped = text.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+    escaped = escaped.replace(/\*\*(.+?)\*\*/g, "<b>$1</b>");
+    return escaped.split("\n").map(function (line) {
+      var bullet = line.match(/^[-*]\s+(.*)/);
+      return bullet ? "&#8226; " + bullet[1] : line;
+    }).join("<br>");
+  }
+  // Floating widget, not a routed view -- open/closed state lives purely
+  // in the panel's [hidden] attribute, toggled from the bubble/close
+  // button/Escape key, independent of switchView() entirely.
+  function _openAiChatPanel() {
+    document.getElementById("aiChatPanel").hidden = false;
+    document.getElementById("aiChatBubble").hidden = true;
+    _renderAiChatMessages();
+    document.getElementById("aiChatInput").focus();
+    _refreshAiChatUsage();
+  }
+  function _closeAiChatPanel() {
+    document.getElementById("aiChatPanel").hidden = true;
+    document.getElementById("aiChatBubble").hidden = false;
+  }
+  document.getElementById("aiChatBubble").addEventListener("click", _openAiChatPanel);
+  document.getElementById("aiChatPanelClose").addEventListener("click", _closeAiChatPanel);
+  // _aiChatSetSending(false) (the "request just finished" reset) must not
+  // blindly re-enable Send if the usage badge separately disabled it for
+  // being out of messages -- this flag is what lets the two coexist
+  // instead of racing to overwrite the input's disabled state.
+  var _aiChatAtLimit = false;
+  function _aiChatSetSending(sending) {
+    document.getElementById("aiChatSend").disabled = sending || _aiChatAtLimit;
+    document.getElementById("aiChatSend").textContent = sending ? "Thinking…" : "Send";
+  }
+  // 10 messages/day, tracked server-side per actor_email (see
+  // ai_support.py) -- this just reflects that count, it isn't the source
+  // of truth, so a fresh GET on open always shows what's real even if the
+  // count changed in another tab/session today.
+  function _setAiChatUsageDisplay(used, limit) {
+    var el2 = document.getElementById("aiChatUsage");
+    var remaining = Math.max(0, limit - used);
+    el2.textContent = remaining + "/" + limit + " today";
+    el2.classList.toggle("low", remaining > 0 && remaining <= 3);
+    el2.classList.toggle("zero", remaining === 0);
+    _aiChatAtLimit = remaining === 0;
+    document.getElementById("aiChatSend").disabled = _aiChatAtLimit;
+    document.getElementById("aiChatInput").disabled = _aiChatAtLimit;
+    document.getElementById("aiChatInput").placeholder = _aiChatAtLimit
+      ? "Out of messages for today — try again tomorrow" : "Ask a question…";
+  }
+  async function _refreshAiChatUsage() {
+    try {
+      var usage = await api("/api/ai-support/usage?actor_email=" + encodeURIComponent(passiveIdentity() || ""));
+      _setAiChatUsageDisplay(usage.used, usage.limit);
+    } catch (err) { /* usage display is a courtesy, not worth surfacing a failure for */ }
+  }
+  async function _sendAiChatMessage() {
+    var input = document.getElementById("aiChatInput");
+    var message = input.value.trim();
+    if (!message) return;
+    aiChatHistory.push({ role: "user", content: message });
+    input.value = "";
+    _renderAiChatMessages();
+    _aiChatSetSending(true);
+    try {
+      var res = await api("/api/ai-support/chat", {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          message: message, history: aiChatHistory.slice(0, -1),
+          actor_email: passiveIdentity() || "", actor_role: CURRENT_ROLE,
+        }),
+      });
+      aiChatHistory.push({ role: "assistant", content: res.reply });
+      if (res.limit != null) _setAiChatUsageDisplay(res.limit - res.remaining, res.limit);
+    } catch (err) {
+      aiChatHistory.push({ role: "assistant", content: apiErrorDetail(err) || "Something went wrong — try Ask the Team instead." });
+      // Covers the 429-at-limit case (err carries no parsed status code,
+      // just the message/detail text) without needing to parse it out --
+      // refreshing from the server is correct regardless of which error
+      // this was, and cheap enough not to special-case.
+      _refreshAiChatUsage();
+    }
+    _aiChatSetSending(false);
+    _renderAiChatMessages();
+  }
+  document.getElementById("aiChatSend").addEventListener("click", _sendAiChatMessage);
+  document.getElementById("aiChatInput").addEventListener("keydown", function (e) {
+    if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); _sendAiChatMessage(); }
+  });
+  document.getElementById("aiChatAskTeam").addEventListener("click", function () {
+    _closeAiChatPanel();
+    switchView("support");
+  });
+
+  // Item 151: every Ask the Team thread, admin-only, in its own dedicated
+  // view -- same reply/resolve/reference-KB behavior that used to live
+  // inline inside "Q/A - Ask the Team" as an "Inbox" card.
+  var _ticketsCache = [], _ticketsKbEntries = [];
+  async function loadTickets() {
+    _ticketsCache = await api("/api/support?actor_role=" + CURRENT_ROLE);
+    // Item 150: admins get the option to reference an existing KB entry
+    // instead of writing a fresh answer, so the picker needs the full list.
+    _ticketsKbEntries = await api("/api/support/kb");
+    _renderTicketsList();
+  }
+  // Items 20/36: a real table -- numbered rows (Q1, Q2...), high-level info
+  // only (question snippet, asker, status, date), click a row for the
+  // full conversation in its own modal instead of every question's whole
+  // thread rendering inline. Header-inline filter (item 4) + Excel header
+  // sort/filter. No pager here (item 20 redlined that back out) -- every
+  // matching question just lists, same convention as L0 Tenders/L1 Projects.
+  var _ticketsXh = null;
+  function _getTicketsXh() {
+    if (_ticketsXh) return _ticketsXh;
+    function uniq(getter) {
+      return function () {
+        var seen = {}, out = [];
+        _ticketsCache.forEach(function (r) {
+          var v = getter(r); v = v == null ? "" : String(v);
+          if (!seen[v]) { seen[v] = true; out.push(v); }
+        });
+        return out.sort(function (a, b) { return a.localeCompare(b, undefined, { numeric: true, sensitivity: "base" }); });
+      };
+    }
+    var statusGet = function (r) { return r.status === "resolved" ? "Resolved" : "Open"; };
+    var messageOf = function (r) { return r.message; };
+    // Matches the displayed dd-Mon-yyyy label (fmtDate, same as the row
+    // render below) rather than the raw ISO date the old filterable:false
+    // get() used -- keeps the filter's value-space the same text the
+    // checkbox list actually shows.
+    var dateOf = function (r) { return fmtDate((r.created_at || "").slice(0, 10)); };
+    // [queued: filterability treatment] message/date were filterable:false.
+    var columns = [
+      null, // Q-number is a display-only rank, not a real sortable/filterable field
+      { key: "message", get: messageOf, uniqueValues: uniq(messageOf) },
+      { key: "asker", get: function (r) { return r.name || r.email; }, uniqueValues: uniq(function (r) { return r.name || r.email; }) },
+      { key: "status", get: statusGet, uniqueValues: uniq(statusGet) },
+      { key: "date", get: dateOf, sortValue: function (r) { return r.created_at || ""; }, uniqueValues: uniq(dateOf) },
+    ];
+    var theadRow = document.getElementById("ticketsBody").closest("table").querySelector("thead tr");
+    _ticketsXh = installExcelHeader(theadRow, columns);
+    _ticketsXh.onChange(function () { _renderTicketsList(); });
+    return _ticketsXh;
+  }
+  function _renderTicketsList() {
+    var term = document.getElementById("ticketsSearch").value.trim().toLowerCase();
+    var filtered = _ticketsCache.filter(function (r) {
+      if (!term) return true;
+      return ((r.name || "") + " " + r.email + " " + r.message + " " + (r.est_no || "")).toLowerCase().indexOf(term) !== -1;
+    });
+    filtered = _getTicketsXh().process(filtered);
+    var tbody = document.getElementById("ticketsBody");
+    if (!filtered.length) {
+      tbody.innerHTML = '<tr><td colspan="5" style="text-align:center;color:var(--ink-500);padding:30px;">' +
+        (term ? "No questions match &#8220;" + term + "&#8221;." : "No requests yet.") + "</td></tr>";
+      return;
+    }
+    tbody.innerHTML = "";
+    filtered.forEach(function (r, idx) {
+      var qNum = idx + 1;
+      var tr = el("tr");
+      tr.style.cursor = "pointer";
+      tr.appendChild(el("td", "num", "Q" + qNum));
+      var snippet = r.message.length > 70 ? r.message.slice(0, 70) + "&#8230;" : r.message;
+      tr.appendChild(el("td", "", snippet));
+      tr.appendChild(el("td", "", r.name || r.email));
+      tr.appendChild(el("td", "", r.status === "resolved"
+        ? '<span class="pill good"><span class="dot"></span>Resolved</span>'
+        : '<span class="pill warn"><span class="dot"></span>Open</span>'));
+      tr.appendChild(el("td", "", fmtDate((r.created_at || "").slice(0, 10))));
+      tr.addEventListener("click", function () { _openTicketDetail(r); });
+      tbody.appendChild(tr);
+    });
+  }
+  document.getElementById("ticketsSearch").addEventListener("input", _renderTicketsList);
+  function _openTicketDetail(r) {
+    document.getElementById("ticketDetailTitle").textContent = r.name || r.email;
+    var body = document.getElementById("ticketDetailBody");
+    _renderSupportThread(body, r, {
+      canReply: true, canResolve: true, replyEndpoint: "reply", replyPlaceholder: "Reply to the asker…",
+      kbEntries: _ticketsKbEntries,
+      onReplied: async function () { await loadTickets(); document.getElementById("ticketDetailOverlay").hidden = true; },
+    });
+    document.getElementById("ticketDetailOverlay").hidden = false;
+  }
+  document.getElementById("ticketDetailClose").addEventListener("click", function () {
+    document.getElementById("ticketDetailOverlay").hidden = true;
+  });
+  document.getElementById("ticketDetailOverlay").addEventListener("click", function (e) {
+    if (e.target === this) this.hidden = true;
+  });
+
+  /* ================= ANNOUNCEMENTS ================= */
+  var announcementsAll = [];
+  // [queued: Announcements stage filter] same chip-toggle pattern
+  // Assigned Deliverables' L0/L1 toggle uses -- client-side, like the
+  // existing type/date filters, since announcementsAll is already fetched
+  // whole and a.stage now rides along on every row (see AnnouncementOut).
+  var annStageFilter = "";
+  document.querySelectorAll("#annStageToggle .chip").forEach(function (btn) {
+    btn.addEventListener("click", function () {
+      document.querySelectorAll("#annStageToggle .chip").forEach(function (b) { b.classList.remove("active"); });
+      btn.classList.add("active");
+      annStageFilter = btn.dataset.stage;
+      renderAnnouncements();
+    });
+  });
+  // Lets the Dashboard's "Latest L0/L1 Announcements" View all links (see
+  // .section-view-all[data-stage] wiring below) pre-scope this page to one
+  // stage instead of landing on the unfiltered list every time.
+  function goToAnnouncementsFilter(stage) {
+    annStageFilter = stage || "";
+    document.querySelectorAll("#annStageToggle .chip").forEach(function (b) { b.classList.toggle("active", b.dataset.stage === annStageFilter); });
+    switchView("announcements");
+  }
+  document.getElementById("annTypeFilter").addEventListener("change", renderAnnouncements);
+  document.getElementById("annFromDate").addEventListener("change", renderAnnouncements);
+  document.getElementById("annToDate").addEventListener("change", renderAnnouncements);
+  document.getElementById("annClearFilters").addEventListener("click", function () {
+    document.getElementById("annTypeFilter").value = "";
+    document.getElementById("annFromDate").value = "";
+    document.getElementById("annToDate").value = "";
+    annStageFilter = "";
+    document.querySelectorAll("#annStageToggle .chip").forEach(function (b) { b.classList.toggle("active", !b.dataset.stage); });
+    renderAnnouncements();
+  });
+  async function loadAnnouncements() {
+    buildAnnouncementFilterUI();
+    var qs = "?limit=500&category=news";
+    if (CURRENT_ROLE !== "Admin") {
+      qs += "&actor_role=" + encodeURIComponent(CURRENT_ROLE) + "&actor_email=" + encodeURIComponent(passiveIdentity());
+    }
+    announcementsAll = await api("/api/announcements" + qs);
+    await _getEmailRoleMap();
+    renderAnnouncements();
+    // Item [nav badges]: opening this view marks everything currently
+    // loaded as seen -- no read-tracking exists anywhere in the backend
+    // (no real login to hang a per-user table off of), so this is a
+    // per-browser localStorage timestamp, same trust level as the existing
+    // myEmail cache.
+    localStorage.setItem("annLastSeenAt", new Date().toISOString());
+    document.getElementById("announcementsBadge").textContent = "";
+  }
+  // Item [reminders tab]: the row markup is identical between Announcements
+  // and Reminders (same fields, same click-through) -- only the source
+  // array and the container differ, so this is shared rather than
+  // duplicated between renderAnnouncements() and renderReminders().
+  function annRowEl(a) {
+    var meta = annIcon(a);
+    var row = el("div", "ann-row");
+    row.appendChild(el("div", "ann-ic " + meta[1], meta[0]));
+    var main = el("div", "ann-main");
+    var when = new Date(a.created_at).toLocaleString("en-GB", { day: "2-digit", month: "short", hour: "2-digit", minute: "2-digit" });
+    var intlTag = a.project_international ? ' <span class="pill neutral" style="padding:1px 7px;"><span class="dot"></span>International</span>' : "";
+    main.appendChild(el("div", "ann-top", '<span class="ann-title">' + a.title + intlTag + '</span><span class="ann-time">' + when + '</span>'));
+    var bodyEl = el("div", "ann-body", a.body);
+    main.appendChild(bodyEl);
+    main.appendChild(el("div", "ann-meta", "To: <b>" + annAudienceTag(a, _emailRoleMap) + "</b> &middot; " + a.email_status));
+    row.appendChild(main);
+    // Item 6: a multi-deliverable batch reminder (deadline_reminders_batch)
+    // has no single submission_id on the row itself -- each item gets its
+    // own inline link baked into the body instead, marked with
+    // data-submission-id rather than a real href, so it opens the deliverable
+    // in-app the same way the row-level click-through does everywhere else,
+    // instead of navigating to a raw #deliverable= URL fragment nothing
+    // listens for.
+    bodyEl.querySelectorAll("a[data-submission-id]").forEach(function (link) {
+      link.addEventListener("click", function (e) {
+        e.preventDefault();
+        e.stopPropagation();
+        var sid = parseInt(link.dataset.submissionId, 10);
+        if (sid) openDelivModal(sid);
+      });
+    });
+    if (a.submission_id || a.project_id) {
+      row.style.cursor = "pointer";
+      row.addEventListener("click", function () {
+        if (a.submission_id) openDelivModal(a.submission_id);
+        else openDetail(a.project_id);
+      });
+    }
+    return row;
+  }
+  function renderAnnouncements() {
+    var type = document.getElementById("annTypeFilter").value;
+    var from = document.getElementById("annFromDate").value;
+    var to = document.getElementById("annToDate").value;
+    var list = announcementsAll.filter(function (a) {
+      if (annStageFilter && a.stage !== annStageFilter) return false;
+      if (type && a.type !== type) return false;
+      var day = a.created_at.slice(0, 10);
+      if (from && day < from) return false;
+      if (to && day > to) return false;
+      return true;
+    });
+    var wrap = document.getElementById("announcementsList");
+    wrap.innerHTML = "";
+    if (!list.length) { wrap.appendChild(el("div", "empty-state", "No announcements match this filter.")); return; }
+    list.forEach(function (a) { wrap.appendChild(annRowEl(a)); });
+  }
+
+  var remindersAll = [];
+  async function loadReminders() {
+    var qs = "?limit=500&category=reminders";
+    if (CURRENT_ROLE !== "Admin") {
+      qs += "&actor_role=" + encodeURIComponent(CURRENT_ROLE) + "&actor_email=" + encodeURIComponent(passiveIdentity());
+    }
+    remindersAll = await api("/api/announcements" + qs);
+    await _getEmailRoleMap();
+    renderReminders();
+    localStorage.setItem("remLastSeenAt", new Date().toISOString());
+    document.getElementById("remindersBadge").textContent = "";
+  }
+  function renderReminders() {
+    var from = document.getElementById("remFromDate").value;
+    var to = document.getElementById("remToDate").value;
+    var list = remindersAll.filter(function (a) {
+      var day = a.created_at.slice(0, 10);
+      if (from && day < from) return false;
+      if (to && day > to) return false;
+      return true;
+    });
+    var wrap = document.getElementById("remindersList");
+    wrap.innerHTML = "";
+    if (!list.length) { wrap.appendChild(el("div", "empty-state", "No reminders match this filter.")); return; }
+    list.forEach(function (a) { wrap.appendChild(annRowEl(a)); });
+  }
+  document.getElementById("remFromDate").addEventListener("change", renderReminders);
+  document.getElementById("remToDate").addEventListener("change", renderReminders);
+  document.getElementById("remClearFilters").addEventListener("click", function () {
+    document.getElementById("remFromDate").value = "";
+    document.getElementById("remToDate").value = "";
+    renderReminders();
+  });
+
+  /* ================= CREATE PROJECT ================= */
+  (function () {
+    var fileInput = document.getElementById("cfTenderDocs");
+    var folderInput = document.getElementById("cfTenderDocsFolder");
+    var summary = document.getElementById("cfTenderDocsSummary");
+    function updateSummary() {
+      var n = fileInput.files.length + folderInput.files.length;
+      summary.textContent = n ? n + " file" + (n === 1 ? "" : "s") + " selected" : "";
+    }
+    fileInput.addEventListener("change", updateSummary);
+    folderInput.addEventListener("change", updateSummary);
+    document.getElementById("cfTenderDocsUploadWrap").appendChild(fileOrFolderButton("Upload", fileInput, folderInput));
+  })();
+  var createOptionsLoaded = false;
+  var _createOptionsCache = null;
+  async function getCreateOptions() {
+    if (!_createOptionsCache) _createOptionsCache = await api("/api/departments/options");
+    return _createOptionsCache;
+  }
+  var buUncoveredScopes = [];
+  function refreshBuFieldVisibility() {
+    // [L0 International]: IBU is auto-assigned, not manually chosen -- the
+    // manual TBU/PBU/DBU/BBU/TBA picker never applies to these projects.
+    if (document.getElementById("cfInternational").checked) {
+      document.getElementById("cfBuField").style.display = "none";
+      return;
+    }
+    var scope = checkedValues("cfScopeGrid");
+    var needed = scope.some(function (s) { return buUncoveredScopes.indexOf(s) !== -1; });
+    document.getElementById("cfBuField").style.display = needed ? "" : "none";
+  }
+  function renderCheckGroup(containerId, otherInputId, options) {
+    var grid = document.getElementById(containerId);
+    grid.innerHTML = "";
+    options.forEach(function (opt) {
+      var label = el("label", "scope-opt");
+      var cb = el("input"); cb.type = "checkbox"; cb.value = opt;
+      label.appendChild(cb);
+      label.appendChild(document.createTextNode(opt));
+      grid.appendChild(label);
+      if (opt === "Other") {
+        cb.addEventListener("change", function () {
+          document.getElementById(otherInputId).style.display = cb.checked ? "" : "none";
+        });
+      }
+    });
+  }
+  function checkedValues(containerId) {
+    return Array.prototype.slice.call(document.querySelectorAll("#" + containerId + " input:checked")).map(function (c) { return c.value; });
+  }
+  async function loadCreateOptions() {
+    if (!createOptionsLoaded) {
+      var opts = await getCreateOptions();
+      var bidSel = document.getElementById("cfBid");
+      opts.bid_managers.forEach(function (m) { bidSel.appendChild(el("option", "", m)).value = m; });
+      renderCheckGroup("cfRegionGrid", "cfRegionOther", opts.regions);
+      renderCheckGroup("cfScopeGrid", "cfScopeOther", opts.scopes);
+      renderCheckGroup("cfBuGrid", "", opts.business_units);
+      buUncoveredScopes = opts.bu_uncovered_scopes || [];
+      document.querySelectorAll("#cfScopeGrid input").forEach(function (cb) {
+        cb.addEventListener("change", refreshBuFieldVisibility);
+      });
+      var pmSel = document.getElementById("cfL1PM");
+      var roster = await _getRoster();
+      roster.forEach(function (u) {
+        var o = el("option", "", u.name + " (" + u.email + ")"); o.value = u.name;
+        pmSel.appendChild(o);
+      });
+      createOptionsLoaded = true;
+    }
+    var l0List = await api("/api/projects?stage=L0&status=" + encodeURIComponent("In Progress"));
+    var sourceSel = document.getElementById("cfL0Source");
+    sourceSel.innerHTML = '<option value="">Select an in-progress L0&#8230;</option>';
+    l0List.forEach(function (p) {
+      var o = el("option", "", p.est_no + " &#8211; " + p.name); o.value = p.id;
+      sourceSel.appendChild(o);
+    });
+    applyStageToggle();
+  }
+  function applyStageToggle() {
+    var stage = document.getElementById("cfStage").value;
+    document.getElementById("cfL0Form").hidden = stage !== "L0";
+    document.getElementById("cfL1Form").hidden = stage !== "L1";
+  }
+  // [L0 International]: Country replaces the KSA Region checkboxes for an
+  // international tender -- everything else in the L0 form stays as-is.
+  function applyInternationalToggle() {
+    var intl = document.getElementById("cfInternational").checked;
+    document.getElementById("cfRegionField").style.display = intl ? "none" : "";
+    document.getElementById("cfCountryField").style.display = intl ? "" : "none";
+    refreshBuFieldVisibility();
+  }
+  document.getElementById("cfStage").addEventListener("change", applyStageToggle);
+  document.getElementById("cfInternational").addEventListener("change", applyInternationalToggle);
+  document.getElementById("cfEstNo").addEventListener("input", function () {
+    this.value = this.value.replace(/\D/g, "");
+  });
+  // Item [Bid Value decimals]: a bare whole number ("4250000") reads as
+  // ambiguous next to a currency prefix -- fill in ".00" on blur so the
+  // field always shows a real amount, the same way a price field would.
+  document.getElementById("cfL1BidValue").addEventListener("blur", function () {
+    if (this.value.trim() === "" || this.value.indexOf(".") !== -1) return;
+    this.value = Number(this.value).toFixed(2);
+  });
+
+  document.getElementById("cfSubmit").addEventListener("click", async function () {
+    var createdL0Id = null;
+    var stage = document.getElementById("cfStage").value;
+    var submitBtn = document.getElementById("cfSubmit");
+    var originalLabel = submitBtn.textContent;
+    submitBtn.disabled = true;
+    submitBtn.textContent = "Creating project…";
+    submitBtn.classList.add("btn-loading");
+    try {
+      if (stage === "L0") {
+        var name = document.getElementById("cfName").value.trim();
+        var estNoDigits = document.getElementById("cfEstNo").value.trim();
+        var announce = document.getElementById("cfAnnounce").value;
+        var bsd = document.getElementById("cfBsd").value;
+        var bidManager = document.getElementById("cfBid").value;
+        var international = document.getElementById("cfInternational").checked;
+        var region = international ? [] : checkedValues("cfRegionGrid");
+        var country = document.getElementById("cfCountry").value.trim();
+        var scope = checkedValues("cfScopeGrid");
+        var regionOtherVal = document.getElementById("cfRegionOther").value.trim();
+        var scopeOtherVal = document.getElementById("cfScopeOther").value.trim();
+        var needsManualBu = !international && scope.some(function (s) { return buUncoveredScopes.indexOf(s) !== -1; });
+        var businessUnits = checkedValues("cfBuGrid");
+        var errors = [];
+        if (!name) errors.push("Tender name is required");
+        if (!estNoDigits) errors.push("Est-Num is required");
+        else if (!/^\d+$/.test(estNoDigits)) errors.push("Est-Num must be a number only");
+        if (!bidManager) errors.push("Bid Manager is required");
+        if (!announce) errors.push("Announcement Date is required");
+        if (!bsd) errors.push("Bid Submission Date is required");
+        if (international) {
+          if (!country) errors.push("Country is required");
+        } else if (!region.length) {
+          errors.push("Select at least one Region");
+        }
+        if (!scope.length) errors.push("Select at least one Scope");
+        if (!international && region.indexOf("Other") !== -1 && !regionOtherVal) errors.push("Specify the Other region");
+        if (scope.indexOf("Other") !== -1 && !scopeOtherVal) errors.push("Specify the Other scope");
+        if (needsManualBu && !businessUnits.length) errors.push("Business Unit is required for this scope");
+        if (errors.length) { showToast(errors.join("<br>"), true); return; }
+        var estNo = "Est-" + estNoDigits;
+        var payload = {
+          name: name, est_no: estNo,
+          region: region, region_other: regionOtherVal || null,
+          international: international, country: international ? country : null,
+          scope: scope, scope_other: scopeOtherVal || null,
+          rfx_number: document.getElementById("cfRfx").value || null,
+          announcement_date: announce, site_visit_date: document.getElementById("cfSiteVisit").value || null,
+          pre_bid_meeting_date: document.getElementById("cfPreBidMeeting").value || null,
+          pre_bid_deadline: document.getElementById("cfPreBid").value || null,
+          bid_manager: bidManager, bsd: bsd,
+          business_units: needsManualBu ? businessUnits : null,
+        };
+        var p = await api("/api/projects/l0", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(payload) });
+        showToast(p.est_no + " created &#8211; announcement sent");
+        createdL0Id = p.id;
+        await uploadTenderDocFiles(p.id, document.getElementById("cfTenderDocs").files, "", false);
+        await uploadTenderDocFiles(p.id, document.getElementById("cfTenderDocsFolder").files, "", true);
+      } else {
+        var l0Id = document.getElementById("cfL0Source").value;
+        var l1Announce = document.getElementById("cfL1Announce").value;
+        var l1Errors = [];
+        if (!l0Id) l1Errors.push("Select the L0 tender this L1 project comes from");
+        if (!l1Announce) l1Errors.push("L1 Announcement Date is required");
+        if (l1Errors.length) { showToast(l1Errors.join("<br>"), true); return; }
+        var p1 = await api("/api/projects/l1", {
+          method: "POST", headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            l0_source_id: Number(l0Id), announcement_date: l1Announce,
+            project_manager: document.getElementById("cfL1PM").value.trim() || null,
+            bid_value: document.getElementById("cfL1BidValue").value.trim() ? Number(document.getElementById("cfL1BidValue").value) : null,
+          }),
+        });
+        showToast(p1.est_no + " created &#8211; announcement sent");
+      }
+    } catch (err) {
+      showToast("Could not create project &#8211; " + apiErrorDetail(err), true);
+      return;
+    } finally {
+      submitBtn.disabled = false;
+      submitBtn.textContent = originalLabel;
+      submitBtn.classList.remove("btn-loading");
+    }
+    if (createdL0Id) {
+      await openTriage(createdL0Id);
+    } else {
+      switchView("announcements");
+    }
+  });
+  document.getElementById("cfCancel").addEventListener("click", function () { switchView("dashboard"); });
+
+  /* ================= SEARCH ================= */
+  document.getElementById("globalSearch").addEventListener("input", async function (e) {
+    var v = e.target.value.trim().toLowerCase();
+    if (!v) return;
+    var list = await api("/api/projects");
+    var match = list.filter(function (p) { return (p.est_no + " " + p.name).toLowerCase().indexOf(v) !== -1; });
+    if (match.length === 1) {
+      openDetail(match[0].id); e.target.value = "";
+      return;
+    }
+    // Item 119: an L0/L1 pair now shares one Est number, so a search that's
+    // an exact Est-No match can hit two rows instead of one -- go to
+    // whichever is still active (its L1, once the L0 auto-closes) rather
+    // than silently doing nothing the way a length!==1 check used to.
+    // Est numbers were failing (e.g. searching "1800"/"1553") because users
+    // type bare digits, not the "Est-" prefix -- normalize both sides so a
+    // digits-only search still counts as an exact Est-No match.
+    var norm = function (s) { return s.toLowerCase().replace(/^est-/, ""); };
+    var exact = match.filter(function (p) { return norm(p.est_no) === norm(v); });
+    if (exact.length >= 1) {
+      var active = exact.filter(function (p) { return p.status === "In Progress"; });
+      var pick = (active.length ? active : exact).sort(function (a, b) { return b.id - a.id; })[0];
+      openDetail(pick.id); e.target.value = "";
+    }
+  });
+
+  /* ================= ROLE + THEME ================= */
+  // Item 162: lets a tester actually become a real Owner/SME with real
+  // assigned work instead of guessing an email that matches nothing (the
+  // real cause behind item 160's "why can't I upload" question -- the acting
+  // email has to match a real owner_email/sme_email for isAssigned() to
+  // pass). Built from the live /api/deliverables list, so it's always
+  // pointing at real, current, testable rows -- SME options are labelled
+  // with their pending-review count so "test Pending SME Review" is a
+  // one-click pick instead of a hunt through the data.
+  async function populateActingEmailQuickPick(isRetry) {
+    var quickPick = document.getElementById("actingEmailQuickPick");
+    if (CURRENT_ROLE !== "Owner" && CURRENT_ROLE !== "SME") { quickPick.style.display = "none"; return; }
+    // A slow/failed fetch here (e.g. Render's free-tier cold start on the
+    // very first request after idling) used to throw uncaught and leave the
+    // quick-pick permanently stuck hidden with nothing but the placeholder --
+    // no error shown anywhere, just silently broken until the next full role
+    // switch happened to succeed. One quiet retry covers the transient case.
+    var all, roster;
+    try {
+      all = await api("/api/deliverables");
+      roster = await _getRoster();
+    } catch (err) {
+      if (!isRetry) return populateActingEmailQuickPick(true);
+      console.error("Quick pick failed to load", err);
+      return;
+    }
+    var counts = {};
+    all.forEach(function (d) {
+      var emails = CURRENT_ROLE === "Owner" ? (d.owner_emails || []) : (d.sme_emails || []);
+      emails.forEach(function (email) {
+        if (!counts[email]) counts[email] = { due: 0, pendingReview: 0 };
+        if (d.deadline_status === "due") counts[email].due++;
+        if (d.status === "pending_review") counts[email].pendingReview++;
+      });
+    });
+    // Every roster member of this role is offered, not just whoever
+    // already has assigned work -- a freshly-added Owner/SME with nothing
+    // assigned yet still needs to be pickable to actually test as them.
+    roster.filter(function (u) { return u.role === CURRENT_ROLE; }).forEach(function (u) {
+      if (!counts[u.email]) counts[u.email] = { due: 0, pendingReview: 0 };
+    });
+    var emails = Object.keys(counts).sort();
+    quickPick.innerHTML = '<option value="">Quick pick&#8230;</option>';
+    emails.forEach(function (email) {
+      var c = counts[email];
+      var label = CURRENT_ROLE === "SME"
+        ? email + " (" + c.pendingReview + " pending review)"
+        : email + " (" + c.due + " due)";
+      var o = el("option", "", label); o.value = email; quickPick.appendChild(o);
+    });
+    quickPick.style.display = emails.length ? "" : "none";
+  }
+  document.getElementById("roleSelect").addEventListener("change", async function (e) {
+    CURRENT_ROLE = e.target.value;
+    var showAdmin = can("create");
+    document.getElementById("adminNav").style.display = showAdmin ? "" : "none";
+    document.getElementById("adminGroupLabel").style.display = showAdmin ? "" : "none";
+    var actingAsPerson = CURRENT_ROLE === "Owner" || CURRENT_ROLE === "SME";
+    document.getElementById("actingEmail").style.display = actingAsPerson ? "" : "none";
+    // A hidden field a user can no longer see or edit shouldn't keep
+    // silently steering identity-dependent checks (announcement visibility,
+    // isAssigned) after switching away from Owner/SME -- clear it so
+    // Admin/Viewer never inherit whichever email was last typed in.
+    if (!actingAsPerson) document.getElementById("actingEmail").value = "";
+    await _refreshCanSeeBmTriage();
+    document.getElementById("bmTriageNavItem").hidden = !canSeeBmTriage();
+    document.getElementById("assignedNavItem").hidden = !canSeeAssigned();
+    document.getElementById("remindersNavItem").hidden = !canSeeReminders();
+    populateActingEmailQuickPick();
+    if (!showAdmin && ADMIN_ONLY_VIEWS.some(function (v) { return !document.getElementById("view-" + v).hidden; })) switchView("dashboard");
+    if (!canSeeBmTriage() && !document.getElementById("view-bmtriage").hidden) switchView("dashboard");
+    if (!canSeeAssigned() && !document.getElementById("view-assigned").hidden) switchView("dashboard");
+    if (!canSeeReminders() && !document.getElementById("view-reminders").hidden) switchView("dashboard");
+    if (currentProjectId && !document.getElementById("view-detail").hidden) openDetail(currentProjectId);
+    if (!document.getElementById("view-announcements").hidden) loadAnnouncements();
+    if (!document.getElementById("view-reminders").hidden) loadReminders();
+    checkBmTriageDeadline();
+    refreshNavBadges();
+  });
+  // Item [BM triage viewer bug]: on a page refresh, some browsers restore a
+  // <select>'s prior value from before the reload without firing "change" --
+  // the dropdown then visually shows e.g. "Viewer" while every piece of app
+  // state (CURRENT_ROLE, the nav's hidden flags) is still sitting at the
+  // "Admin" default, since nothing ever re-ran to sync them. This pilot has
+  // no real login and doesn't persist the role choice across reloads by
+  // design, so force the control back to the actual default on every load.
+  document.getElementById("roleSelect").value = "Admin";
+  document.getElementById("actingEmailQuickPick").addEventListener("change", function (e) {
+    if (!e.target.value) return;
+    document.getElementById("actingEmail").value = e.target.value;
+    document.getElementById("actingEmail").dispatchEvent(new Event("change"));
+  });
+  document.getElementById("actingEmail").addEventListener("change", async function () {
+    if (!document.getElementById("view-announcements").hidden) loadAnnouncements();
+    if (!document.getElementById("view-reminders").hidden) loadReminders();
+    // Item 183: "My Items" reads the acting-as-email identity live, so
+    // switching who you're acting as should refresh the Dashboard's scoped
+    // view immediately rather than showing stale data until the next visit.
+    if (dashFocus === "mine" && !document.getElementById("view-dashboard").hidden) loadDashboard();
+    checkBmTriageDeadline();
+    await _refreshCanSeeBmTriage();
+    document.getElementById("bmTriageNavItem").hidden = !canSeeBmTriage();
+    if (!canSeeBmTriage() && !document.getElementById("view-bmtriage").hidden) switchView("dashboard");
+    refreshNavBadges();
+  });
+  document.getElementById("themeToggle").addEventListener("click", function () {
+    var root = document.documentElement;
+    var next = root.getAttribute("data-theme") === "dark" ? "light" : "dark";
+    root.setAttribute("data-theme", next);
+    this.textContent = next === "dark" ? "Light mode" : "Dark mode";
+  });
+
+  // Item 170: a native date input can't be restyled to show month names
+  // while picking (the calendar/typed-value display is entirely
+  // browser-controlled) -- so every date input on the page gets a small
+  // read-only "16-Sep-2026" reading right after it instead, updating live
+  // as soon as a value is picked, without giving up the native picker.
+  document.querySelectorAll('input[type="date"]').forEach(function (input) {
+    var preview = el("span", "date-preview");
+    input.insertAdjacentElement("afterend", preview);
+    var update = function () { preview.textContent = input.value ? fmtDate(input.value) : ""; };
+    input.addEventListener("change", update);
+    update();
+  });
+
+  /* ================= INIT ================= */
+  // Item [BM triage viewer bug], part 2: a page restored from the browser's
+  // back-forward cache (bfcache -- back/forward nav, some "reopen tab"
+  // flows) resumes its exact frozen JS state without re-running any script
+  // on this page at all -- so a role switched right before navigating away
+  // stays showing in the dropdown, but every nav-visibility decision this
+  // file makes only runs once, at initial script execution, and never
+  // reruns. The only reliable fix is forcing a real reload when this
+  // happens, so the whole app boots fresh instead of resuming stale state.
+  window.addEventListener("pageshow", function (event) {
+    if (event.persisted) location.reload();
+  });
+  document.getElementById("todayLabel").textContent = new Date().toLocaleDateString("en-GB", { weekday: "long", day: "2-digit", month: "long", year: "numeric" });
+  // Item [nav badges]: piggybacking only on the role/acting-email change
+  // handlers isn't enough -- CURRENT_ROLE starts hardcoded to "Admin" and
+  // neither handler fires on a fresh load, so badges would stay empty
+  // until the user manually touched role or acting-email.
+  refreshNavBadges();
+
+  // Item 120: loadDashboard() used to always fire immediately, then a
+  // project/view restore (below) would hide it again a moment later once
+  // its own awaits resolved — the dashboard would actually finish loading
+  // and render onscreen before being swapped out, a visible flash on every
+  // refresh. Decide the real starting view FIRST, and only load the
+  // dashboard when that's genuinely where we're landing.
+  var sharedMatch = location.hash.match(/deliverable=(\d+)/);
+  var projectMatch = location.hash.match(/project=(\d+)/);
+  var viewMatch = location.hash.match(/view=(\w+)/);
+  if (projectMatch) {
+    // Item 99: refreshing while on a project detail page returns to it.
+    // openDetail() makes several sequential api() calls before it finally
+    // reveals #view-detail — wrapping the whole thing in one extra
+    // start/end pair keeps the loading count above zero the entire time,
+    // so the overlay shows (at most) once instead of flickering between
+    // each individual fetch (item 120).
+    document.getElementById("view-dashboard").hidden = true;
+    _loadingStart();
+    openDetail(parseInt(projectMatch[1], 10)).finally(_loadingEnd);
+  } else if (viewMatch && document.getElementById("view-" + viewMatch[1])) {
+    // Item 99: refreshing on any other nav view stays on that view.
+    document.getElementById("view-dashboard").hidden = true;
+    switchView(viewMatch[1]);
+  } else {
+    // Item 147: view-dashboard now starts `hidden` in the markup like every
+    // other view (it used to be the one exception, so on a refresh landing
+    // anywhere else the browser painted the raw dashboard HTML -- filter
+    // chips, empty stat cards and all -- for the entire time it takes app.js
+    // to download and run, before swapping to the real destination view).
+    // That means the dashboard-landing case now has to unhide itself
+    // explicitly instead of relying on already being visible by default.
+    document.getElementById("view-dashboard").hidden = false;
+    loadDashboard();
+    // A shared deliverable link (item 76) opens straight to that item's
+    // popup, on top of the dashboard it's actually landing on.
+    if (sharedMatch) openDelivModal(parseInt(sharedMatch[1], 10));
+  }
+  checkBmTriageDeadline();
+  // Item 41 (reworked): the System Introduction opens automatically on
+  // every SIGN-IN now (not just the first one), on top of whatever view
+  // the app landed on -- unless the person turned that off for themselves
+  // via the tour's own "Disable auto tour on sign in" checkbox.
+  //
+  // Item [queued: tour on every refresh]: "every sign-in" stopped meaning
+  // "every page load" once landing.js's own mount() started skipping the
+  // sign-in gate on a same-session refresh (sessionStorage.hvSignedIn) --
+  // this bootstrap runs unconditionally on every load regardless, so
+  // without this check a plain refresh reopened the tour every time, since
+  // it can't otherwise tell "just signed in" apart from "already signed in
+  // an hour ago, just refreshing". hvSignedIn is set the instant landing.js
+  // reveals the app (onSubmit), before this IIFE ever runs on that same
+  // load -- but on a refresh it was ALREADY set from the previous load, so
+  // reading it here at bootstrap time is exactly "is this a fresh sign-in
+  // or a same-session reload" without landing.js and app.js needing any
+  // direct reference to each other.
+  var justSignedInThisLoad = true;
+  try { justSignedInThisLoad = sessionStorage.getItem("hvSignedIn") !== "1"; } catch (e) {}
+  if (justSignedInThisLoad && localStorage.getItem("tourAutoDisabled") !== "1") openTour();
+})();

@@ -1,0 +1,118 @@
+"""DB engine/session setup. Defaults to a local SQLite file for pilot testing;
+set DATABASE_URL to a real Postgres URL (e.g. Render's) to switch, no code changes needed.
+"""
+import os
+from sqlalchemy import create_engine, inspect, text
+from sqlalchemy.orm import sessionmaker
+
+DATABASE_URL = os.environ.get(
+    "DATABASE_URL",
+    "sqlite:///" + os.path.join(os.path.dirname(os.path.dirname(__file__)), "data", "app.db"),
+)
+
+connect_args = {"check_same_thread": False} if DATABASE_URL.startswith("sqlite") else {}
+engine = create_engine(DATABASE_URL, connect_args=connect_args)
+SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+
+
+def ensure_column(table_name: str, column_name: str, ddl_type: str) -> None:
+    """Adds a column to an already-existing table if it's missing.
+
+    metadata.create_all() only creates tables that don't exist yet — it never
+    alters an existing table's columns, so a plain model change like adding
+    a new field is invisible to a live database until this runs. No-op for a
+    brand-new database (the table won't exist yet; create_all builds the
+    column from the model directly).
+    """
+    inspector = inspect(engine)
+    if not inspector.has_table(table_name):
+        return
+    existing = [c["name"] for c in inspector.get_columns(table_name)]
+    if column_name in existing:
+        return
+    with engine.connect() as conn:
+        conn.execute(text(f"ALTER TABLE {table_name} ADD COLUMN {column_name} {ddl_type}"))
+        conn.commit()
+
+
+def ensure_enum_value(table_name: str, column_name: str, value: str) -> None:
+    """Adds a value to a Postgres native enum type backing a column, if missing.
+
+    SQLite has no real enum type — our Enum columns are just text there, so a
+    new Python enum member works immediately. Postgres enums are a fixed,
+    named type at the database level; SQLAlchemy's create_all() only creates
+    that type once and never alters it, so a new member is invisible to a
+    live database (every write of that value 500s) until this runs. No-op on
+    SQLite and on a brand-new database (the table won't exist yet; create_all
+    builds the type with every current member already included).
+    """
+    if not DATABASE_URL.startswith("postgres"):
+        return
+    inspector = inspect(engine)
+    if not inspector.has_table(table_name):
+        return
+    with engine.connect() as conn:
+        enum_type = conn.execute(text(
+            "SELECT udt_name FROM information_schema.columns WHERE table_name = :t AND column_name = :c"
+        ), {"t": table_name, "c": column_name}).scalar()
+        if not enum_type:
+            return
+        exists = conn.execute(text(
+            "SELECT 1 FROM pg_enum e JOIN pg_type t ON e.enumtypid = t.oid "
+            "WHERE t.typname = :enum_type AND e.enumlabel = :value"
+        ), {"enum_type": enum_type, "value": value}).first()
+        if exists:
+            return
+        conn.execute(text(f'ALTER TYPE "{enum_type}" ADD VALUE \'{value}\''))
+        conn.commit()
+
+
+def ensure_index(table_name: str, index_name: str, column_name: str) -> None:
+    """Adds an index on a column if missing. Foreign-key columns aren't
+    auto-indexed by Postgres (unlike MySQL), and create_all() only builds
+    indexes for brand-new tables — so every join/filter on these columns
+    does a full scan until this runs. CREATE INDEX IF NOT EXISTS is
+    supported natively by both SQLite and Postgres, so one statement covers
+    both; safe to re-run.
+    """
+    inspector = inspect(engine)
+    if not inspector.has_table(table_name):
+        return
+    with engine.connect() as conn:
+        conn.execute(text(f"CREATE INDEX IF NOT EXISTS {index_name} ON {table_name} ({column_name})"))
+        conn.commit()
+
+
+def ensure_not_unique(table_name: str, column_name: str) -> None:
+    """Drops a UNIQUE constraint (or unique index) on a single column, if one
+    exists. Item 119: L0 and L1 rows now deliberately share one est_no, so
+    the original unique=True on Project.est_no has to come off a live
+    database too, the same way a new column needs ensure_column.
+
+    Postgres-only in practice: SQLite bakes a column's UNIQUE directly into
+    its CREATE TABLE statement with no ALTER TABLE way to remove it, so a
+    local sqlite file created before this change keeps enforcing the old
+    constraint regardless — delete data/app.db and let create_all() rebuild
+    from the model (which no longer declares unique=True) instead.
+    """
+    if not DATABASE_URL.startswith("postgres"):
+        return
+    inspector = inspect(engine)
+    if not inspector.has_table(table_name):
+        return
+    with engine.connect() as conn:
+        for uc in inspector.get_unique_constraints(table_name):
+            if uc["column_names"] == [column_name]:
+                conn.execute(text(f'ALTER TABLE {table_name} DROP CONSTRAINT "{uc["name"]}"'))
+        for idx in inspector.get_indexes(table_name):
+            if idx.get("unique") and idx["column_names"] == [column_name]:
+                conn.execute(text(f'DROP INDEX IF EXISTS "{idx["name"]}"'))
+        conn.commit()
+
+
+def get_db():
+    db = SessionLocal()
+    try:
+        yield db
+    finally:
+        db.close()
