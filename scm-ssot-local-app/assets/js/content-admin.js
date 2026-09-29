@@ -26,8 +26,8 @@
     {
       key: 'coststructure', label: 'Cost structure', moduleKey: 'coststructure',
       file: 'cost-structure.json', apiKey: 'coststructure',
-      desc: 'Commodity cost breakdowns behind the Should-Cost reference library. Edit as JSON or replace the whole document from a file.',
-      editor: 'json'
+      desc: 'Commodity cost breakdowns behind the Should-Cost reference library.',
+      editor: 'coststructure'
     },
     {
       key: 'avl', label: 'AGC vendor list', moduleKey: 'avl',
@@ -36,16 +36,16 @@
       editor: 'json'
     },
     {
-      key: 'sec', label: 'SEC sole-source data', moduleKey: 'secsole',
+      key: 'sec', label: 'SEC AVL Sole Source Risk', moduleKey: 'secsole',
       file: 'sec-sole-source.json', apiKey: 'sec-sole-source',
-      desc: 'Vendor records behind the SEC sole-source risk analysis. Replace as a whole document.',
-      editor: 'json'
+      desc: 'The main vendor-risk table on the SEC AVL Sole Source Risk page. Replace as a whole document.',
+      editor: 'json', tabGroup: 'sec', tabLabel: 'Main Records'
     },
     {
-      key: 'secdetails', label: 'SEC record details', moduleKey: 'secsole',
+      key: 'secdetails', label: 'SEC AVL Sole Source Risk', moduleKey: 'secsole',
       file: 'sec-avl-details.json', apiKey: 'sec-avl-details',
-      desc: 'The long free-text fields shown in the SEC record drawer. Loaded only when a record is opened, so it is kept in its own file.',
-      editor: 'json'
+      desc: 'The long free-text fields shown when a row in the main table is opened (AVL description, local representative, type tests, remarks). Loaded only at that point, so it is kept as its own document, separate from the main table above.',
+      editor: 'json', tabGroup: 'sec', tabLabel: 'Record Details'
     },
     {
       key: 'monthly', label: 'Monthly reports', moduleKey: 'monthly',
@@ -184,6 +184,15 @@
       if (tail === 'steps') return { b: '', p: '' };
     }
     if (key === 'monthly' && tail === 'months') return { key: '', label: '', status: 'updating', src: '' };
+    if (key === 'coststructure') {
+      // id must be unique and non-empty -- it's used as the chart canvas id
+      // on the live page (csm-<id>, css-<id>, csc-<id>), so a blank/duplicate
+      // id would collide with another commodity's charts.
+      if (tail === 'commodities') return { id: 'commodity-' + Date.now(), name: 'New commodity', classification: 'Electrical', sub: '', notes: [], mainBreakdown: { title: 'Overall Cost Structure', items: [] } };
+      if (tail === 'items') return { label: '', value: 0 };
+      if (tail === 'notes') return '';
+      if (tail === 'cableBreakdowns') return { title: 'New variant', items: [] };
+    }
     return {};
   }
 
@@ -317,13 +326,20 @@
     { id: 'terminations-joints', no: '15', title: 'Terminations & Joints' }
   ];
 
+  var CFP_FIXED_IDS = {}; CFP_CATEGORIES.forEach(function (m) { CFP_FIXED_IDS[m.id] = true; });
+
   function formCfp() {
     var d = ST.data[ST.key];
     if (!Array.isArray(d.categories)) d.categories = [];
     var byId = {}; d.categories.forEach(function (c) { if (c && c.id) byId[c.id] = c; });
+    // extra = anything beyond the 15 fixed ids, added via "+ Add fact pack" below.
+    // Rebuilt fixed-first/extra-after on every render so indices into
+    // categories[] stay predictable for both blocks' field()/cfpExtra() paths.
+    var extra = d.categories.filter(function (c) { return c && c.id && !CFP_FIXED_IDS[c.id]; });
     d.categories = CFP_CATEGORIES.map(function (meta) {
       return byId[meta.id] || { id: meta.id, enabled: false, src: '', openUrl: '' };
-    });
+    }).concat(extra);
+
     var rows = CFP_CATEGORIES.map(function (meta, i) {
       var p = 'categories.' + i;
       return '<div class="admitem"><div class="admitem__h"><span class="admitem__n">#' + meta.no + '</span>' +
@@ -334,9 +350,136 @@
         field(p + '.openUrl', 'Open link', { wide: true, hint: 'opens in a new tab — shown as a button when there is no working embed' }) +
         '</div></div></div>';
     }).join('');
+
+    var extraRows = extra.map(function (c, i) {
+      var p = 'categories.' + (CFP_CATEGORIES.length + i);
+      var last = i === extra.length - 1;
+      return '<div class="admitem"><div class="admitem__h">' +
+        '<span class="admitem__t">' + E(c.title || '(untitled)') + '</span>' +
+        '<button type="button" class="admicon" title="Move up" data-act="cfpExtra" data-a1="up" data-a2="' + i + '"' + (i === 0 ? ' disabled' : '') + '>&#9650;</button>' +
+        '<button type="button" class="admicon" title="Move down" data-act="cfpExtra" data-a1="down" data-a2="' + i + '"' + (last ? ' disabled' : '') + '>&#9660;</button>' +
+        '<button type="button" class="admicon admicon--del" title="Remove" data-act="cfpExtra" data-a1="del" data-a2="' + i + '">&#10005;</button></div>' +
+        '<div class="admitem__b"><div class="admrow">' +
+        field(p + '.title', 'Title', { wide: true }) +
+        field(p + '.enabled', 'Enabled', { type: 'checkbox', hint: 'off = shows "Coming soon" — needs at least the Open link below' }) +
+        field(p + '.src', 'Embed URL', { wide: true, hint: 'optional — Power BI embed links work inline; SharePoint links do not (Microsoft blocks it) and fall back to the Open link' }) +
+        field(p + '.openUrl', 'Open link', { wide: true, hint: 'opens in a new tab — shown as a button when there is no working embed' }) +
+        '</div></div></div>';
+    }).join('');
+
     return group('Category cards', '15 fixed categories — enable one to show its fact pack instead of "Coming soon"',
-      '<div class="admlist">' + rows + '</div>');
+      '<div class="admlist">' + rows + '</div>') +
+      group('Additional fact packs', 'New categories beyond the fixed 15 — render on the live site in their own "Additional Fact Packs" section',
+        '<div class="admlist">' + extraRows +
+        '<button type="button" class="admadd" data-act="cfpExtra" data-a1="add">+ Add fact pack</button></div>');
   }
+
+  window.cfpExtra = function (op, index) {
+    var d = ST.data[ST.key];
+    if (!Array.isArray(d.categories)) d.categories = [];
+    var fixedCount = CFP_CATEGORIES.length;
+    if (op === 'add') {
+      var n = 1, id;
+      do { id = 'custom-' + n; n++; } while (d.categories.some(function (c) { return c && c.id === id; }));
+      d.categories.push({ id: id, title: 'New fact pack', enabled: false, src: '', openUrl: '' });
+    } else {
+      var extraArr = d.categories.slice(fixedCount);
+      if (op === 'del') extraArr.splice(index, 1);
+      else if (op === 'up' && index > 0) extraArr.splice(index - 1, 0, extraArr.splice(index, 1)[0]);
+      else if (op === 'down' && index < extraArr.length - 1) extraArr.splice(index + 1, 0, extraArr.splice(index, 1)[0]);
+      d.categories = d.categories.slice(0, fixedCount).concat(extraArr);
+    }
+    markDirty();
+    renderForm();
+  };
+
+  var CS_CLASSIFICATIONS = ['Electrical', 'Civil', 'Mechanical'];
+
+  // Shared by mainBreakdown/subBreakdown/each cableBreakdowns entry -- all
+  // three hold the same {label, value, range?} item shape.
+  function csItemsList(path, addLabel) {
+    return list(path, {
+      addLabel: addLabel || 'Add component',
+      title: function (it) { return (it.label || '(untitled)') + (it.value != null && it.value !== '' ? ' — ' + it.value + '%' : ''); },
+      render: function (p) {
+        return '<div class="admrow">' +
+          field(p + '.label', 'Label', { wide: true }) +
+          field(p + '.value', 'Value', { type: 'number', hint: '%, used for the chart' }) +
+          field(p + '.range', 'Range', { hint: 'optional, e.g. 50-70%' }) +
+          '</div>';
+      }
+    });
+  }
+
+  function formCoststructure() {
+    var d = ST.data[ST.key];
+    if (!Array.isArray(d.commodities)) d.commodities = [];
+    return group('Commodities', 'Each card on the Should-Cost reference library page',
+      list('commodities', {
+        addLabel: 'Add commodity',
+        title: function (c) { return (c.name || '(untitled)') + (c.classification ? ' · ' + c.classification : ''); },
+        render: function (p, c) {
+          var hasSub = !!c.subBreakdown;
+          var hasVariants = !!(c.cableBreakdowns && c.cableBreakdowns.length);
+
+          var out = '<div class="admrow">' +
+            field(p + '.name', 'Name', { wide: true }) +
+            field(p + '.classification', 'Classification', { type: 'select', options: CS_CLASSIFICATIONS }) +
+            field(p + '.sub', 'Subtitle', { wide: true }) +
+            '</div>';
+
+          out += group('Overall cost structure', 'The main donut chart on this commodity’s card — always shown',
+            field(p + '.mainBreakdown.title', 'Chart title', { wide: true }) +
+            csItemsList(p + '.mainBreakdown.items'));
+
+          var secondBody = '';
+          if (!hasSub && !hasVariants) {
+            secondBody = '<p class="adm__hint">This commodity shows only the overall chart above. Add one of the two optional breakdowns below if needed.</p>' +
+              '<div class="adm__tabtn">' +
+              '<button type="button" class="admadd" data-act="csBreakdown" data-a1="addSub" data-a2="' + E(p) + '">+ Add a raw-materials breakdown</button>' +
+              '<button type="button" class="admadd" data-act="csBreakdown" data-a1="addVariants" data-a2="' + E(p) + '">+ Add cable-style variants</button>' +
+              '</div>';
+          } else if (hasSub) {
+            secondBody = group('Raw materials / sub-breakdown', 'A second donut chart on this commodity’s card',
+              '<button type="button" class="admicon admicon--del" title="Remove this breakdown" data-act="csBreakdown" data-a1="removeSub" data-a2="' + E(p) + '">&#10005; Remove</button>' +
+              field(p + '.subBreakdown.title', 'Chart title', { wide: true }) +
+              csItemsList(p + '.subBreakdown.items'));
+          } else {
+            secondBody = group('Variants', 'Each variant gets its own tab on this commodity’s card (e.g. HV/MV/LV cable types) — remove every variant below to drop this section entirely',
+              list(p + '.cableBreakdowns', {
+                addLabel: 'Add variant',
+                title: function (cb) { return cb.title || '(untitled variant)'; },
+                render: function (vp) {
+                  return field(vp + '.title', 'Variant name', { wide: true }) +
+                    csItemsList(vp + '.items');
+                }
+              }));
+          }
+          out += secondBody;
+
+          out += group('Notes', 'Shown under "Show notes" on this commodity’s card — <strong> and <em> are allowed',
+            list(p + '.notes', {
+              addLabel: 'Add note',
+              title: function (n) { return String(n || '').replace(/<[^>]+>/g, '').slice(0, 60) || '(empty note)'; },
+              render: function (np) {
+                return field(np, 'Note', { wide: true, type: 'textarea', hint: '<strong>/<em> allowed' });
+              }
+            }));
+
+          return out;
+        }
+      }));
+  }
+
+  window.csBreakdown = function (op, path) {
+    var c = getPath(ST.data[ST.key], path);
+    if (!c) return;
+    if (op === 'addSub') c.subBreakdown = { title: 'Raw Materials Composition', items: [] };
+    else if (op === 'addVariants') c.cableBreakdowns = [];
+    else if (op === 'removeSub') delete c.subBreakdown;
+    markDirty();
+    renderForm();
+  };
 
   function formSoon() {
     var r = cur();
@@ -347,7 +490,7 @@
       'the other pages.</p></div></div>';
   }
 
-  var FORMS = { overview: formOverview, masterdata: formMasterdata, monthly: formMonthly, embed: formEmbed, cfp: formCfp, json: formJson, soon: formSoon };
+  var FORMS = { overview: formOverview, masterdata: formMasterdata, monthly: formMonthly, embed: formEmbed, cfp: formCfp, coststructure: formCoststructure, json: formJson, soon: formSoon };
 
   function msg(kind, title, body) {
     var m = el('admMsg'); if (!m) return;
@@ -358,11 +501,37 @@
 
   function renderRail() {
     var host = el('admRail'); if (!host) return;
-    host.innerHTML = '<div class="admrail__h">Datasets</div>' + ST.allowedKeys.map(function (key) {
+    // A tabGroup (e.g. SEC's main table + record details) shares one rail
+    // button -- switching between its documents happens via the tab bar
+    // above the editor (renderGroupTabs), not via separate rail entries.
+    var seenGroups = {};
+    var displayKeys = ST.allowedKeys.filter(function (key) {
+      var g = byKey[key].tabGroup;
+      if (!g) return true;
+      if (seenGroups[g]) return false;
+      seenGroups[g] = true;
+      return true;
+    });
+    host.innerHTML = '<div class="admrail__h">Datasets</div>' + displayKeys.map(function (key) {
       var r = byKey[key];
-      var state = ST.dirty[key] ? 'dirty' : (ST.loaded[key] ? 'ok' : 'warn');
-      return '<button type="button" class="admrail__b ' + state + (key === ST.key ? ' is-on' : '') + '"' +
+      var groupKeys = r.tabGroup ? ST.allowedKeys.filter(function (k) { return byKey[k].tabGroup === r.tabGroup; }) : [key];
+      var state = groupKeys.some(function (k) { return ST.dirty[k]; })
+        ? 'dirty' : (groupKeys.every(function (k) { return ST.loaded[k]; }) ? 'ok' : 'warn');
+      var isOn = r.tabGroup ? (byKey[ST.key] && byKey[ST.key].tabGroup === r.tabGroup) : key === ST.key;
+      return '<button type="button" class="admrail__b ' + state + (isOn ? ' is-on' : '') + '"' +
         ' data-act="admPick" data-a1="' + E(key) + '"><i></i><span>' + E(r.label) + '</span></button>';
+    }).join('');
+  }
+  function renderGroupTabs() {
+    var host = el('admGroupTabs'); if (!host) return;
+    var r = cur();
+    var groupKeys = r.tabGroup ? ST.allowedKeys.filter(function (k) { return byKey[k].tabGroup === r.tabGroup; }) : [];
+    if (groupKeys.length < 2) { host.hidden = true; host.innerHTML = ''; return; }
+    host.hidden = false;
+    host.innerHTML = groupKeys.map(function (k) {
+      var gr = byKey[k];
+      return '<button type="button" class="admtab' + (k === ST.key ? ' is-on' : '') + '"' +
+        ' data-act="admPick" data-a1="' + E(k) + '">' + E(gr.tabLabel || gr.label) + '</button>';
     }).join('');
   }
   function renderForm() {
@@ -412,7 +581,7 @@
     });
     if (v === 'json') renderJson();
   }
-  function renderAll() { renderRail(); renderHead(); renderForm(); renderView(); }
+  function renderAll() { renderRail(); renderHead(); renderForm(); renderView(); renderGroupTabs(); }
 
   window.admView = function (v) { ST.view = v; renderView(); };
   window.admPick = function (key) {

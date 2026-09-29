@@ -1072,6 +1072,32 @@ function renderCfpHub(){
       if(status){ status.className='mi__status mi__soon'; status.textContent='Coming soon'; }
     }
   });
+  const staticIds = new Set();
+  document.querySelectorAll('.mi[data-cfp-id]').forEach(c=>staticIds.add(c.dataset.cfpId));
+  renderCfpExtraCards(((data && data.categories) || []).filter(c=>c && c.id && !staticIds.has(c.id)));
+}
+// Categories added via Content Administration beyond the 15 fixed cards
+// above -- those are hand-authored HTML with bespoke icons, so this renders
+// extra ones dynamically instead, in their own section at the end of the
+// page. Escapes locally since this IIFE has no shared esc() in scope.
+const cfpEsc=s=>String(s==null?'':s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+function renderCfpExtraCards(list){
+  const host=document.getElementById('cfpExtraGroup');
+  if(!host) return;
+  if(!list.length){ host.hidden=true; host.innerHTML=''; return; }
+  host.hidden=false;
+  host.innerHTML='<div class="migroup__h"><span class="migroup__dash"></span>'+
+    '<b>Additional Fact Packs</b><em>· '+list.length+' item'+(list.length===1?'':'s')+'</em></div>'+
+    '<div class="migrid">'+list.map(function(c,i){
+      const enabled=!!(c.enabled&&(c.src||c.openUrl));
+      return '<article class="mi'+(enabled?' mi--open':'')+'" data-cfp-id="'+cfpEsc(c.id)+'"'+
+        (enabled?' data-open="cfp-detail" role="button" tabindex="0"':'')+'>'+
+        '<span class="mi__no">#'+String(16+i).padStart(2,'0')+'</span>'+
+        '<span class="mi__ic"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><path d="M12 8v8M8 12h8"/></svg></span>'+
+        '<h4 class="mi__t">'+cfpEsc(c.title||'(untitled)')+'</h4>'+
+        '<span class="mi__status '+(enabled?'mi__open':'mi__soon')+'">'+(enabled?'View fact pack →':'Coming soon')+'</span>'+
+      '</article>';
+    }).join('')+'</div>';
 }
 function renderCfpDetail(){
   const id = window.CFP_ACTIVE_ID;

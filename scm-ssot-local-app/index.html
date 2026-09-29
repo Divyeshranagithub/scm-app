@@ -160,6 +160,8 @@ window.SCM_BUILD = '20260916-3';
           </div>
         </div>
 
+        <div class="adm__grouptabs" id="admGroupTabs" hidden></div>
+
         <div class="adm__tabs" id="admTabs" role="tablist">
           <button type="button" class="admtab is-on" id="admTabForm" role="tab" aria-selected="true" data-act="admView" data-a1="form">Form</button>
           <button type="button" class="admtab" id="admTabJson" role="tab" aria-selected="false" data-act="admView" data-a1="json">JSON</button>
@@ -540,6 +542,9 @@ window.SCM_BUILD = '20260916-3';
         </article>
       </div>
     </div>
+    <!-- populated by renderCfpExtraCards() in app.js for categories added via
+         Content Administration beyond the 15 fixed cards above -->
+    <div class="migroup" id="cfpExtraGroup" hidden></div>
   </section>
 
   <section class="page" data-page="cfp-detail">

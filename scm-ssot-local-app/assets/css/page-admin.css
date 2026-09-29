@@ -36,6 +36,11 @@
 .admtab:hover{color:var(--red)}
 .admtab.is-on{background:var(--white);color:var(--red);font-weight:700;box-shadow:inset 0 -2px 0 var(--red)}
 
+/* ---- group tabs (one entry in the rail, multiple documents behind it, e.g. SEC's main table + record details) ---- */
+.adm__grouptabs{display:flex;gap:0;border:1px solid var(--line);border-bottom:0;background:var(--white);margin-top:12px}
+.adm__grouptabs .admtab{font-size:13px;font-weight:600;padding:11px 18px}
+.adm__grouptabs .admtab.is-on{box-shadow:inset 0 -3px 0 var(--red)}
+
 /* ---- panes ---- */
 .adm__pane{border:1px solid var(--line);background:var(--white);padding:18px 16px;min-height:240px}
 .adm__hint{margin:0 0 12px;font-size:12px;color:var(--muted);line-height:1.6}
