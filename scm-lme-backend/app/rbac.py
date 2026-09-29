@@ -4,6 +4,7 @@ from fastapi import APIRouter, Depends, Header, HTTPException, Query
 from pydantic import BaseModel
 
 from . import db
+from .audit import log_action
 from .auth import get_api_key
 
 router = APIRouter(dependencies=[Depends(get_api_key)])
@@ -84,7 +85,13 @@ def auth_me(email: str = Query(...)):
             else:  # viewer
                 modules = view_modules
                 editable_modules = []
+
+            log_action(cur, email_, "login")
+        conn.commit()
     except HTTPException:
+        raise
+    except Exception:
+        conn.rollback()
         raise
     finally:
         db.put_conn(conn)
@@ -124,16 +131,33 @@ def list_modules(admin_email: str = Depends(require_admin)):
 
 
 @router.get("/api/admin/users")
-def list_users(admin_email: str = Depends(require_admin)):
+def list_users(
+    q: Optional[str] = Query(None),
+    limit: int = Query(20, le=200),
+    offset: int = Query(0, ge=0),
+    admin_email: str = Depends(require_admin),
+):
+    where, params = "", []
+    if q:
+        where = "WHERE u.email ILIKE %s OR u.username ILIKE %s"
+        like = f"%{q}%"
+        params = [like, like]
+
     conn = db.get_conn()
     try:
         with conn.cursor() as cur:
+            cur.execute(f"SELECT count(*) FROM users u {where}", params)
+            (total,) = cur.fetchone()
+
             cur.execute(
-                """
+                f"""
                 SELECT u.id, u.email, u.username, r.role_key, r.role_name, u.created_at
                 FROM users u JOIN roles r ON r.role_key = u.role_key
+                {where}
                 ORDER BY u.created_at DESC
-                """
+                LIMIT %s OFFSET %s
+                """,
+                params + [limit, offset],
             )
             users = cur.fetchall()
             result = []
@@ -158,7 +182,7 @@ def list_users(admin_email: str = Depends(require_admin)):
                 })
     finally:
         db.put_conn(conn)
-    return result
+    return {"items": result, "total": total}
 
 
 class NewUser(BaseModel):
@@ -205,6 +229,8 @@ def add_user(body: NewUser, admin_email: str = Depends(require_admin)):
                     "INSERT INTO user_modules (user_id, module_key, can_view, can_edit) VALUES (%s, %s, %s, %s)",
                     (user_id, mk, mk in view_set, mk in edit_set),
                 )
+
+            log_action(cur, admin_email, "user.add", target=e, detail={"roleKey": rk})
         conn.commit()
     except HTTPException:
         conn.rollback()
@@ -242,6 +268,8 @@ def remove_user(email: str, admin_email: str = Depends(require_admin)):
 
             cur.execute("DELETE FROM users WHERE lower(email) = lower(%s) RETURNING id", (email,))
             deleted = cur.fetchone()
+            if deleted is not None:
+                log_action(cur, admin_email, "user.remove", target=email)
         conn.commit()
     except HTTPException:
         conn.rollback()
@@ -255,3 +283,71 @@ def remove_user(email: str, admin_email: str = Depends(require_admin)):
     if deleted is None:
         raise HTTPException(status_code=404, detail="User not found")
     return {"status": "deleted", "email": email}
+
+
+@router.get("/api/admin/audit-log")
+def list_audit_log(
+    actor: Optional[str] = Query(None),
+    from_date: Optional[str] = Query(None, description="YYYY-MM-DD, inclusive"),
+    to_date: Optional[str] = Query(None, description="YYYY-MM-DD, inclusive"),
+    limit: int = Query(50, le=500),
+    offset: int = Query(0, ge=0),
+    admin_email: str = Depends(require_admin),
+):
+    conditions, params = [], []
+    if actor:
+        conditions.append("actor_email = %s")
+        params.append(actor)
+    if from_date:
+        conditions.append("occurred_at >= %s::date")
+        params.append(from_date)
+    if to_date:
+        conditions.append("occurred_at < (%s::date + interval '1 day')")
+        params.append(to_date)
+    where = ("WHERE " + " AND ".join(conditions)) if conditions else ""
+
+    conn = db.get_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(f"SELECT count(*) FROM audit_log {where}", params)
+            (total,) = cur.fetchone()
+
+            cur.execute(
+                f"""
+                SELECT occurred_at, actor_email, action, target, detail
+                FROM audit_log
+                {where}
+                ORDER BY occurred_at DESC
+                LIMIT %s OFFSET %s
+                """,
+                params + [limit, offset],
+            )
+            rows = cur.fetchall()
+    finally:
+        db.put_conn(conn)
+
+    return {
+        "items": [
+            {
+                "occurredAt": occurred_at.isoformat(),
+                "actorEmail": actor_email,
+                "action": action,
+                "target": target,
+                "detail": detail,
+            }
+            for occurred_at, actor_email, action, target, detail in rows
+        ],
+        "total": total,
+    }
+
+
+@router.get("/api/admin/audit-log/actors")
+def list_audit_actors(admin_email: str = Depends(require_admin)):
+    conn = db.get_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT DISTINCT actor_email FROM audit_log ORDER BY actor_email")
+            rows = cur.fetchall()
+    finally:
+        db.put_conn(conn)
+    return [r[0] for r in rows]

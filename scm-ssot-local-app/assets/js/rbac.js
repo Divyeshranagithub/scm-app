@@ -168,21 +168,31 @@
     if(!host) return;
     host.innerHTML = 'Loading…';
 
-    var roles, modules, users;
+    var roles, modules, users = [];
     try{
       var hdr = authHeaders({'X-User-Email': adminEmail});
-      var [rolesRes, modsRes, usersRes] = await Promise.all([
+      var [rolesRes, modsRes] = await Promise.all([
         fetch(apiBase()+'/api/admin/roles', {headers: hdr}),
-        fetch(apiBase()+'/api/admin/modules', {headers: hdr}),
-        fetch(apiBase()+'/api/admin/users', {headers: hdr})
+        fetch(apiBase()+'/api/admin/modules', {headers: hdr})
       ]);
-      if(!rolesRes.ok || !modsRes.ok || !usersRes.ok) throw new Error('admin fetch failed');
+      if(!rolesRes.ok || !modsRes.ok) throw new Error('admin fetch failed');
       roles = await rolesRes.json();
       modules = await modsRes.json();
-      users = await usersRes.json();
     }catch(err){
       host.innerHTML = '<p style="color:#7a1620">Could not load user management data. '+escapeHtml(err.message)+'</p>';
       return;
+    }
+
+    var PAGE_SIZE_USERS = 20, PAGE_SIZE_AUDIT = 50;
+    var userState = {q:'', offset:0, total:0};
+    var auditState = {actor:'', from:'', to:'', offset:0, total:0};
+
+    function pagerHtml(idPrefix, state, pageSize){
+      var page = Math.floor(state.offset/pageSize)+1;
+      var pages = Math.max(1, Math.ceil(state.total/pageSize));
+      return '<button type="button" class="umbtn" data-act="'+idPrefix+'Prev"'+(state.offset<=0?' disabled':'')+'>&#8249; Prev</button>'+
+        '<span class="umpager__info">Page '+page+' of '+pages+' &middot; '+state.total+' total</span>'+
+        '<button type="button" class="umbtn" data-act="'+idPrefix+'Next"'+(state.offset+pageSize>=state.total?' disabled':'')+'>Next &#8250;</button>';
     }
 
     function roleOptions(selected){
@@ -292,6 +302,84 @@
       '</tr>';
     }
 
+    var ACTION_LABEL = {
+      'login': 'Signed in',
+      'dataset.update': 'Published content',
+      'user.add': 'Added/updated user',
+      'user.remove': 'Removed user'
+    };
+    function auditRow(a){
+      var when = (a.occurredAt||'').replace('T',' ').slice(0,19);
+      return '<tr>'+
+        '<td class="umtable__date">'+escapeHtml(when)+'</td>'+
+        '<td>'+escapeHtml(a.actorEmail)+'</td>'+
+        '<td>'+escapeHtml(ACTION_LABEL[a.action]||a.action)+'</td>'+
+        '<td>'+escapeHtml(a.target||'—')+'</td>'+
+      '</tr>';
+    }
+    async function loadAuditLog(){
+      var elHost = document.getElementById('auditLogHost');
+      var pagerBox = document.getElementById('auditPagerBox');
+      if(!elHost) return;
+      elHost.innerHTML = 'Loading…';
+      try{
+        var qs = 'limit='+PAGE_SIZE_AUDIT+'&offset='+auditState.offset;
+        if(auditState.actor) qs += '&actor='+encodeURIComponent(auditState.actor);
+        if(auditState.from) qs += '&from_date='+encodeURIComponent(auditState.from);
+        if(auditState.to) qs += '&to_date='+encodeURIComponent(auditState.to);
+        var res = await fetch(apiBase()+'/api/admin/audit-log?'+qs, {
+          headers: authHeaders({'X-User-Email': adminEmail})
+        });
+        if(!res.ok) throw new Error('HTTP '+res.status);
+        var data = await res.json();
+        auditState.total = data.total;
+        elHost.innerHTML = !data.items.length
+          ? '<p class="adm__hint">No activity matches these filters.</p>'
+          : '<div class="umtablewrap"><table class="umtable"><thead><tr>'+
+              '<th>When</th><th>Who</th><th>Action</th><th>Target</th>'+
+            '</tr></thead><tbody>'+data.items.map(auditRow).join('')+'</tbody></table></div>';
+        if(pagerBox) pagerBox.innerHTML = pagerHtml('audit', auditState, PAGE_SIZE_AUDIT);
+      }catch(err){
+        elHost.innerHTML = '<p style="color:#7a1620">Could not load the activity log. '+escapeHtml(err.message)+'</p>';
+        if(pagerBox) pagerBox.innerHTML = '';
+      }
+    }
+    async function loadAuditActors(){
+      var sel = document.getElementById('auditActorSelect');
+      if(!sel) return;
+      try{
+        var res = await fetch(apiBase()+'/api/admin/audit-log/actors', {headers: authHeaders({'X-User-Email': adminEmail})});
+        if(!res.ok) return;
+        var actors = await res.json();
+        sel.innerHTML = '<option value="">All users</option>'+actors.map(function(a){
+          return '<option value="'+escapeHtml(a)+'">'+escapeHtml(a)+'</option>';
+        }).join('');
+      }catch(err){ /* dropdown just stays "All users" */ }
+    }
+    async function loadUsers(){
+      var tbody = document.getElementById('adminUserRows');
+      var pagerBox = document.getElementById('userPagerBox');
+      if(!tbody) return;
+      tbody.innerHTML = '<tr><td colspan="7" class="adm__hint">Loading…</td></tr>';
+      try{
+        var qs = 'limit='+PAGE_SIZE_USERS+'&offset='+userState.offset;
+        if(userState.q) qs += '&q='+encodeURIComponent(userState.q);
+        var res = await fetch(apiBase()+'/api/admin/users?'+qs, {headers: authHeaders({'X-User-Email': adminEmail})});
+        if(!res.ok) throw new Error('HTTP '+res.status);
+        var data = await res.json();
+        users = data.items; userState.total = data.total;
+        tbody.innerHTML = users.length
+          ? users.map(userRow).join('')
+          : '<tr><td colspan="7" class="adm__hint">No users match.</td></tr>';
+        if(pagerBox) pagerBox.innerHTML = pagerHtml('user', userState, PAGE_SIZE_USERS);
+        bindEditButtons();
+        bindRemoveButtons();
+      }catch(err){
+        tbody.innerHTML = '<tr><td colspan="7" style="color:#7a1620">Could not load users. '+escapeHtml(err.message)+'</td></tr>';
+        if(pagerBox) pagerBox.innerHTML = '';
+      }
+    }
+
     host.innerHTML =
       '<div class="umcard">'+
         '<h3 id="adminFormHeading" class="umcard__h">Add user</h3>'+
@@ -309,18 +397,79 @@
         '</form>'+
         '<p id="adminAddMsg" class="ummsg"></p>'+
       '</div>'+
-      '<div class="umtablewrap">'+
-        '<table class="umtable">'+
-          '<thead><tr>'+
-            '<th>Email</th><th>Name</th>'+
-            '<th>Role</th><th>View</th><th>Edit</th>'+
-            '<th>Added</th><th></th>'+
-          '</tr></thead>'+
-          '<tbody id="adminUserRows">'+users.map(userRow).join('')+'</tbody>'+
-        '</table>'+
+      '<div class="umcard" style="margin-top:24px">'+
+        '<h3 class="umcard__h">All users</h3>'+
+        '<form id="userSearchForm" class="umsearch">'+
+          '<input type="search" name="q" class="expsearch" placeholder="Search by email or name…">'+
+          '<button type="submit" class="umbtn">Search</button>'+
+        '</form>'+
+        '<div class="umtablewrap">'+
+          '<table class="umtable">'+
+            '<thead><tr>'+
+              '<th>Email</th><th>Name</th>'+
+              '<th>Role</th><th>View</th><th>Edit</th>'+
+              '<th>Added</th><th></th>'+
+            '</tr></thead>'+
+            '<tbody id="adminUserRows">Loading…</tbody>'+
+          '</table>'+
+        '</div>'+
+        '<div class="umpager" id="userPagerBox"></div>'+
+      '</div>'+
+      '<div class="umcard" style="margin-top:24px">'+
+        '<h3 class="umcard__h">Activity log</h3>'+
+        '<p class="umcard__sub">Who signed in, and who last changed which page or user — newest first.</p>'+
+        '<div class="umfilters">'+
+          '<select id="auditActorSelect"><option value="">All users</option></select>'+
+          '<label>From <input type="date" id="auditFromDate"></label>'+
+          '<label>To <input type="date" id="auditToDate"></label>'+
+          '<button type="button" class="umbtn" data-act="auditClear">Clear filters</button>'+
+          '<button type="button" class="umbtn" data-act="auditRefresh">Refresh</button>'+
+        '</div>'+
+        '<div id="auditLogHost">Loading…</div>'+
+        '<div class="umpager" id="auditPagerBox"></div>'+
       '</div>';
 
     wireModuleTable(document.getElementById('adminAddForm'));
+    loadUsers();
+    loadAuditActors();
+    loadAuditLog();
+
+    host.addEventListener('click', function(ev){
+      var b = ev.target.closest && ev.target.closest('[data-act]');
+      if(!b) return;
+      var act = b.dataset.act;
+      if(act === 'userPrev'){ userState.offset = Math.max(0, userState.offset - PAGE_SIZE_USERS); loadUsers(); }
+      else if(act === 'userNext'){ userState.offset += PAGE_SIZE_USERS; loadUsers(); }
+      else if(act === 'auditPrev'){ auditState.offset = Math.max(0, auditState.offset - PAGE_SIZE_AUDIT); loadAuditLog(); }
+      else if(act === 'auditNext'){ auditState.offset += PAGE_SIZE_AUDIT; loadAuditLog(); }
+      else if(act === 'auditRefresh'){ loadAuditLog(); }
+      else if(act === 'auditClear'){
+        auditState.actor = ''; auditState.from = ''; auditState.to = ''; auditState.offset = 0;
+        document.getElementById('auditActorSelect').value = '';
+        document.getElementById('auditFromDate').value = '';
+        document.getElementById('auditToDate').value = '';
+        loadAuditLog();
+      }
+    });
+    host.addEventListener('submit', function(ev){
+      if(ev.target && ev.target.id === 'userSearchForm'){
+        ev.preventDefault();
+        userState.q = ev.target.q.value.trim();
+        userState.offset = 0;
+        loadUsers();
+      }
+    });
+    host.addEventListener('change', function(ev){
+      if(ev.target && ev.target.id === 'auditActorSelect'){
+        auditState.actor = ev.target.value; auditState.offset = 0; loadAuditLog();
+      }
+      if(ev.target && (ev.target.id === 'auditFromDate' || ev.target.id === 'auditToDate')){
+        auditState.from = document.getElementById('auditFromDate').value;
+        auditState.to = document.getElementById('auditToDate').value;
+        auditState.offset = 0;
+        loadAuditLog();
+      }
+    });
 
     var editingEmail = null;   // set while the form is pre-filled to edit an existing user
 
@@ -375,7 +524,8 @@
         if(!res.ok){ var t = await res.text(); throw new Error(t); }
         msg.textContent = wasEditing ? 'Saved.' : 'Added.'; msg.style.color = '#2e7d32';
         e.target.reset();
-        renderAdminPage(adminEmail);
+        exitEditMode();
+        loadUsers();
       }catch(err){
         msg.textContent = 'Failed: '+err.message; msg.style.color = '#c9463a';
       }
@@ -390,7 +540,6 @@
         });
       });
     }
-    bindEditButtons();
 
     function bindRemoveButtons(){
       host.querySelectorAll('.admin-remove').forEach(function(btn){
@@ -402,11 +551,10 @@
               headers: authHeaders({'X-User-Email': adminEmail})
             });
             if(!res.ok){ var t = await res.text(); throw new Error(t); }
-            renderAdminPage(adminEmail);
+            loadUsers();
           }catch(err){ alert('Could not remove user: '+err.message); }
         });
       });
     }
-    bindRemoveButtons();
   }
 })();

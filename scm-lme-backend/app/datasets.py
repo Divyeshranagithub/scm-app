@@ -4,6 +4,7 @@ from typing import Optional
 from fastapi import APIRouter, Depends, Header, HTTPException, Query
 
 from . import db
+from .audit import log_action
 from .auth import get_api_key
 from .rbac import _all_module_keys, _user_edit_modules, _user_view_modules
 
@@ -113,6 +114,7 @@ def put_dataset(dataset_key: str, body: dict, x_user_email: str = Header(...)):
                 (dataset_key, json.dumps(body), x_user_email),
             )
             (updated_at,) = cur.fetchone()
+            log_action(cur, x_user_email, "dataset.update", target=dataset_key)
         conn.commit()
     except Exception:
         conn.rollback()

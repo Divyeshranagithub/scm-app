@@ -122,7 +122,7 @@
 .admhr{border:0;border-top:1px solid var(--line);margin:14px 0}
 
 /* USER MANAGEMENT (admin role only) — own vocabulary (um*) but shares Content Administration's palette */
-.umwrap{max-width:900px;margin:0 auto}
+.umwrap{width:100%}
 
 .umcard{background:var(--white);border:1px solid var(--line);border-radius:10px;
   padding:20px 22px;margin-bottom:20px;box-shadow:0 1px 3px rgba(74,60,60,.06)}
@@ -199,7 +199,7 @@
 .umtable tbody td{padding:11px 14px;border-bottom:1px solid var(--soft);vertical-align:middle}
 .umtable tbody tr:last-child td{border-bottom:0}
 .umtable tbody tr:hover{background:var(--soft)}
-.umtable__mods{color:var(--muted);max-width:280px}
+.umtable__mods{color:var(--muted);max-width:420px}
 .umtable__date{color:var(--light);white-space:nowrap}
 .umtable__actions{white-space:nowrap;text-align:right}
 
@@ -215,9 +215,25 @@
 .umiconbtn--remove{border-color:#C9463A;color:#C9463A}
 .umiconbtn--remove:hover{background:#C9463A;color:#fff}
 
+.umsearch{display:flex;gap:10px;margin-bottom:14px}
+.umsearch input[type=search]{flex:1 1 auto;font-family:inherit;font-size:13px;color:var(--ink);
+  background:var(--white);border:1px solid var(--line);border-radius:6px;padding:9px 12px;min-width:0}
+.umsearch input[type=search]:focus{outline:2px solid var(--red);outline-offset:-1px;border-color:var(--red)}
+
+.umfilters{display:flex;gap:14px;flex-wrap:wrap;align-items:center;margin-bottom:14px}
+.umfilters select,.umfilters input[type=date]{font-family:inherit;font-size:12.5px;color:var(--ink);
+  background:var(--white);border:1px solid var(--line);border-radius:6px;padding:7px 10px}
+.umfilters label{display:flex;align-items:center;gap:6px;font-size:11.5px;color:var(--muted)}
+
+.umpager{display:flex;align-items:center;justify-content:center;gap:14px;margin-top:14px}
+.umpager__info{font-size:12px;color:var(--muted);white-space:nowrap}
+
 @media(max-width:640px){
   .umcard{padding:16px}
   .umform__row{flex-direction:column}
   .umform__row input[type=email],.umform__row input[type=text],.umform__row select{width:100%;flex:1 1 auto}
   .ummodtable{font-size:12px}
+  .umsearch{flex-direction:column}
+  .umfilters{flex-direction:column;align-items:stretch}
+  .umpager{flex-direction:column;gap:8px}
 }

@@ -36,4 +36,16 @@ def get_conn():
 
 def put_conn(conn) -> None:
     if _pool is not None:
+        # A handler that only reads (no explicit commit/rollback) leaves the
+        # transaction open -- returning it to the pool like that means the
+        # next request to reuse this connection inherits an "idle in
+        # transaction" session, and enough of those exhaust the pool's fixed
+        # maxconn, hanging every future request. Closing out any leftover
+        # transaction here, once, makes that impossible regardless of what
+        # any individual handler does or forgets to do. A harmless no-op for
+        # handlers that already committed/rolled back themselves.
+        try:
+            conn.rollback()
+        except Exception:
+            pass
         _pool.putconn(conn)
