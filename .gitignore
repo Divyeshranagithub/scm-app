@@ -20,3 +20,6 @@ server.pid
 maintainance-app
 OneDrive_2026-08-25
 scm-vibecode
+
+# local-only deploy version logs — not app content, never pushed
+scm-ssot-local-app/VERSIONS.md
