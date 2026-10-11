@@ -18,7 +18,19 @@ DATABASE_URL = os.environ.get(
 if DATABASE_URL.startswith("postgresql://") or DATABASE_URL.startswith("postgres://"):
     DATABASE_URL = "postgresql+psycopg2://" + DATABASE_URL.split("://", 1)[1]
 
+# A dedicated Postgres schema within a shared database -- e.g. the Algihaz
+# UAT server, where scm/tender/incident/kpi/... each already get their own
+# schema in the same `dronahq_prod_postgres` database rather than a
+# database each. Unset (the common case: a dedicated database, or local
+# SQLite) leaves every connection on its default schema exactly as before.
+# Ported from scm-lme-backend's own `options="-c search_path=..."` pattern
+# so a fresh connection always resolves unqualified table names against
+# this schema first, never another project's.
+DB_SCHEMA = os.environ.get("DB_SCHEMA")
+
 connect_args = {"check_same_thread": False} if DATABASE_URL.startswith("sqlite") else {}
+if DB_SCHEMA and not DATABASE_URL.startswith("sqlite"):
+    connect_args["options"] = f"-c search_path={DB_SCHEMA}"
 # [load test finding, 2026-09-22]: SQLAlchemy's own default pool (size 5,
 # max_overflow 10 -- 15 connections total) is what a load test at 50
 # concurrent users actually hit first -- requests queued for a connection
@@ -32,6 +44,17 @@ connect_args = {"check_same_thread": False} if DATABASE_URL.startswith("sqlite")
 # whatever plan/instance the platform ends up hosted on.
 pool_kwargs = {} if DATABASE_URL.startswith("sqlite") else {"pool_size": 10, "max_overflow": 20, "pool_pre_ping": True}
 engine = create_engine(DATABASE_URL, connect_args=connect_args, **pool_kwargs)
+
+if DB_SCHEMA and not DATABASE_URL.startswith("sqlite"):
+    # search_path alone only decides where UNQUALIFIED names resolve -- it
+    # doesn't create the schema. This has to happen before anything else
+    # touches `engine` (seed.py's own ensure_column/create_all calls run at
+    # IMPORT time), and is plain CREATE SCHEMA IF NOT EXISTS -- additive
+    # only, never touches another project's own schema in this database.
+    with engine.connect() as _conn:
+        _conn.execute(text(f'CREATE SCHEMA IF NOT EXISTS "{DB_SCHEMA}"'))
+        _conn.commit()
+
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 
 

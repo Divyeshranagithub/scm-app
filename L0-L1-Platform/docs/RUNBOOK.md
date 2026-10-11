@@ -37,6 +37,7 @@ None of these are required for local dev — every one has a safe fallback.
 | Variable | Purpose | Fallback when unset |
 |---|---|---|
 | `DATABASE_URL` | Postgres connection string | Local SQLite file |
+| `DB_SCHEMA` | A dedicated Postgres schema within a shared database (e.g. the Algihaz UAT server, where `scm`/`tender`/`incident`/`kpi`/... each already get their own schema in one shared `dronahq_prod_postgres` database) | The connection's own default schema (`public` on a plain Postgres connection, or whatever a dedicated database already defaults to) |
 | `APP_BASE_URL` | Used to build links inside emails/notifications | `https://l0l1-platform.onrender.com` |
 | `ANTHROPIC_API_KEY` | Powers GAHIZ (`/api/ai-support/chat`) | GAHIZ returns a 503 ("not configured yet") |
 | `STORAGE_BACKEND` | `local` or `onedrive` | `local` |
@@ -124,7 +125,22 @@ itself is unaffected (separate managed service). Resolves once
 
 As of 2026-09, the platform is being onboarded into Algihaz's own
 environment (their existing SSO, domain, and database platform) by the
-Digitalization Team. Two things they'll need beyond the source code:
+Digitalization Team.
+
+**Database**: the UAT Postgres server already shared by `scm` and ~18 other
+projects (one database, one schema per project) now also has an `l0l1`
+schema, created via `DB_SCHEMA=l0l1` (see the env var table above) and
+seeded with the full department/catalog data — created additively
+(`CREATE SCHEMA IF NOT EXISTS`), reusing the same connection credentials
+`scm`'s own backend uses. No other project's schema/data was touched or
+read beyond a one-time `information_schema` listing to confirm `l0l1`
+wasn't already taken. `BOOTSTRAP_ADMIN_EMAILS` (see "First Admin" above)
+still needs to be set and `backend.seed` re-run once more to actually grant
+the first real Admin on this environment — that wasn't done as part of the
+schema setup itself, since it's a deployment decision (whose email), not a
+schema one.
+
+Two more things they'll need beyond the source code:
 
 1. **Confirm the database engine is PostgreSQL.** The app uses
    Postgres-specific features (native enum types, `psycopg2`). A different
