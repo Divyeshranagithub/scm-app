@@ -15,26 +15,21 @@ uvicorn backend.main:app --reload
 
 Open http://127.0.0.1:8000
 
-## Deploy (Render)
+## Running tests
 
-This repo includes `render.yaml`. In the Render dashboard: **New** →
-**Blueprint** → connect this repository → Render provisions both the web
-service and a free Postgres database automatically, wired together.
+```
+pip install -r requirements-dev.txt
+pytest
+```
 
-**Known limitation on Render's free tier:** the free web service has no
-persistent disk, so uploaded files (via the local storage stand-in) are
-lost on restart/redeploy. The database persists correctly (separate managed
-Postgres). This is resolved once `STORAGE_BACKEND=onedrive` is connected —
-files then go to real, persistent OneDrive storage instead.
+## Documentation
 
-## Switching to real OneDrive + real email
-
-1. Register an app at portal.azure.com (see comments at the top of
-   `backend/providers/graph_auth.py` for exact steps).
-2. Set env vars: `GRAPH_CLIENT_ID`, `GRAPH_CLIENT_SECRET`, `GRAPH_TENANT_ID`,
-   `GRAPH_REFRESH_TOKEN` (obtained via the one-time device-code login —
-   run `python -m backend.providers.graph_auth` once, locally, to get it).
-3. Set `STORAGE_BACKEND=onedrive` and `MAIL_BACKEND=graph`.
-
-Nothing else changes — every route already calls through the provider
-interfaces in `backend/providers/`.
+- **[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)** — how the system is
+  built: the data model, the due-date/scoring engine, the storage/mail
+  provider pattern, identity/permissions, and a few things that look like
+  bugs but aren't.
+- **[docs/API.md](docs/API.md)** — the API surface, organized by resource.
+  For exact request/response shapes, run the app and open `/docs`.
+- **[docs/RUNBOOK.md](docs/RUNBOOK.md)** — environment variables, deployment
+  (including moving to the Algihaz environment), how a schema/catalog change
+  actually ships, and troubleshooting.

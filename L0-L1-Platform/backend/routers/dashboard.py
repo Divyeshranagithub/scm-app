@@ -5,6 +5,7 @@ from fastapi import APIRouter, Depends
 from sqlalchemy.orm import Session, joinedload, contains_eager
 
 from .. import models, rules
+from ..auth import CurrentActor, get_current_actor
 from ..database import get_db
 
 router = APIRouter(prefix="/api/dashboard", tags=["dashboard"])
@@ -17,7 +18,8 @@ _PERF_EXCLUDED_DEPTS = {"Operation Units"}
 
 
 @router.get("")
-def get_dashboard(focus_email: str | None = None, db: Session = Depends(get_db)):
+def get_dashboard(focus_email: str | None = None, db: Session = Depends(get_db),
+                   current: CurrentActor = Depends(get_current_actor)):
     """`focus_email` (item 72) scopes the stat tiles, per-department Concerns
     breakdown, and Deliverables Matrix (see get_matrix) to just what that
     person owns or reviews — "My Items" narrows the whole Dashboard, not
@@ -119,6 +121,11 @@ def get_dashboard(focus_email: str | None = None, db: Session = Depends(get_db))
                            models.SubmissionStatus.IN_PROGRESS: "in_progress",
                            models.SubmissionStatus.APPROVED: "approved",
                            models.SubmissionStatus.REJECTED: "rejected"}
+    # [load test finding, 2026-09-22]: reused below (dept_overdue) instead of
+    # calling rules.deadline_status(s) a second time per submission -- same
+    # "compute once, reuse via lookup" discipline as _stage_buckets above,
+    # this specific second call just hadn't been folded in yet.
+    _deadline_key_by_sub_id = {s.id: k for s, k in zip(stat_subs, _deadline_keys)}
     for s, dkey_raw in zip(stat_subs, _deadline_keys):
         bucket = _stage_buckets.get(s.definition.stage)
         if bucket is None:
@@ -156,7 +163,7 @@ def get_dashboard(focus_email: str | None = None, db: Session = Depends(get_db))
             s for s in stat_subs_by_dept.get(dept.id, [])
             if s.definition.kpi_relevant is not False
         ]
-        dept_overdue = [s for s in dept_subs if rules.deadline_status(s)[0] == "due"]
+        dept_overdue = [s for s in dept_subs if _deadline_key_by_sub_id[s.id] == "due"]
         due_and_done = [s for s in dept_subs if s.status == models.SubmissionStatus.APPROVED] + dept_overdue + [
             s for s in dept_subs if s.status == models.SubmissionStatus.PENDING_REVIEW]
         dept_approved = sum(1 for s in dept_subs if s.status == models.SubmissionStatus.APPROVED)
@@ -443,7 +450,7 @@ def _pad_with_samples(ranked, samples):
 
 
 @router.get("/top-achievers")
-def get_top_achievers(db: Session = Depends(get_db)):
+def get_top_achievers(db: Session = Depends(get_db), current: CurrentActor = Depends(get_current_actor)):
     active_projects = db.query(models.Project).filter(
         models.Project.status == models.ProjectStatus.IN_PROGRESS, models.Project.archived.is_not(True),
     ).all()
@@ -473,7 +480,8 @@ def get_top_achievers(db: Session = Depends(get_db)):
 
 
 @router.get("/matrix")
-def get_matrix(stage: str, focus_email: str | None = None, db: Session = Depends(get_db)):
+def get_matrix(stage: str, focus_email: str | None = None, db: Session = Depends(get_db),
+                current: CurrentActor = Depends(get_current_actor)):
     """Deliverables (rows, grouped by department) x active projects (columns) —
     the live equivalent of the old Control Sheet's L0/L1 Tracking Sheets, scoped
     to currently in-progress projects instead of every tender ever tracked.
@@ -806,7 +814,7 @@ _INTL_SUFFIX = " (International)"
 
 
 @router.get("/performance")
-def get_performance(db: Session = Depends(get_db)):
+def get_performance(db: Session = Depends(get_db), current: CurrentActor = Depends(get_current_actor)):
     """Item 42: the Performance tab's real data source -- per department, a
     tracked-level (L1/L0) card with a live percentage, a due-items list, a
     month-over-month trend, and (item [performance history]) a real Excellent/
@@ -920,7 +928,8 @@ def get_performance(db: Session = Depends(get_db)):
 
 
 @router.get("/performance/breakdown")
-def get_performance_breakdown(department: str, stage: str, db: Session = Depends(get_db)):
+def get_performance_breakdown(department: str, stage: str, db: Session = Depends(get_db),
+                               current: CurrentActor = Depends(get_current_actor)):
     """Item [performance history]: the "click a percentage to see the math"
     drill-down -- every submission in that department/stage's KPI cohort,
     its own point value (rules.kpi_points), and how those points roll up
@@ -1050,7 +1059,7 @@ def get_performance_breakdown(department: str, stage: str, db: Session = Depends
 # (lifetime/performance, not current/active) -- keeping it separate means
 # zero risk of changing get_dashboard()'s existing shape or behavior.
 @router.get("/lifetime-kpis")
-def get_lifetime_kpis(db: Session = Depends(get_db)):
+def get_lifetime_kpis(db: Session = Depends(get_db), current: CurrentActor = Depends(get_current_actor)):
     l0_lifetime = db.query(models.Project).filter(models.Project.stage == models.Stage.L0).count()
     l1_projects = db.query(models.Project).filter(models.Project.stage == models.Stage.L1).all()
     l1_lifetime = len(l1_projects)

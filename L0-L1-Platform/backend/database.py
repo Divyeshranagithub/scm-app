@@ -9,9 +9,29 @@ DATABASE_URL = os.environ.get(
     "DATABASE_URL",
     "sqlite:///" + os.path.join(os.path.dirname(os.path.dirname(__file__)), "data", "app.db"),
 )
+# requirements.txt installs psycopg2-binary, not psycopg (v3) -- but recent
+# SQLAlchemy resolves a bare "postgresql://" scheme by probing for psycopg
+# (v3) first and raises ModuleNotFoundError since it isn't installed, rather
+# than falling back to psycopg2. A PaaS-issued DATABASE_URL (Render, most
+# others) is exactly this bare scheme, so pin the driver explicitly instead
+# of relying on auto-detection picking the one that's actually present.
+if DATABASE_URL.startswith("postgresql://") or DATABASE_URL.startswith("postgres://"):
+    DATABASE_URL = "postgresql+psycopg2://" + DATABASE_URL.split("://", 1)[1]
 
 connect_args = {"check_same_thread": False} if DATABASE_URL.startswith("sqlite") else {}
-engine = create_engine(DATABASE_URL, connect_args=connect_args)
+# [load test finding, 2026-09-22]: SQLAlchemy's own default pool (size 5,
+# max_overflow 10 -- 15 connections total) is what a load test at 50
+# concurrent users actually hit first -- requests queued for a connection
+# and started timing out (QueuePool limit ... reached) well before the
+# app's own query logic was the bottleneck. Bumped for Postgres specifically
+# (SQLite's real constraint is its own single-writer file lock, not this
+# pool, and local dev never needs this many). 30 total is a deliberately
+# moderate bump, not a large one -- Render's current Postgres plan
+# (render.yaml: basic-256mb) has its own server-side max_connections cap
+# that this should stay comfortably under; re-check this number against
+# whatever plan/instance the platform ends up hosted on.
+pool_kwargs = {} if DATABASE_URL.startswith("sqlite") else {"pool_size": 10, "max_overflow": 20, "pool_pre_ping": True}
+engine = create_engine(DATABASE_URL, connect_args=connect_args, **pool_kwargs)
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 
 

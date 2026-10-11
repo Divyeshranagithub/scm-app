@@ -17,6 +17,7 @@ from pydantic import BaseModel
 from sqlalchemy.orm import Session, object_session
 
 from .. import models, rules, announcements
+from ..auth import CurrentActor, get_current_actor, require_admin
 from ..database import get_db
 
 router = APIRouter(prefix="/api/deliverables", tags=["deliverables-config"])
@@ -261,18 +262,13 @@ def _log_definition_change(db: Session, definition: "models.DeliverableDefinitio
     return log
 
 
-def _require_admin(actor_role: str, action: str) -> None:
-    if actor_role != "Admin":
-        raise HTTPException(403, f"Only an Admin can {action}")
-
-
 # ---------------------------------------------------------------------------
 # Admin: DeliverableDefinition CRUD
 # ---------------------------------------------------------------------------
 @router.get("/admin/definitions")
 def list_admin_definitions(stage: str | None = None, international: bool | None = None,
                             department_id: int | None = None, include_inactive: bool = False,
-                            db: Session = Depends(get_db)):
+                            db: Session = Depends(get_db), current: CurrentActor = Depends(require_admin)):
     q = db.query(models.DeliverableDefinition).join(models.Department)
     if stage:
         q = q.filter(models.DeliverableDefinition.stage == stage)
@@ -287,7 +283,8 @@ def list_admin_definitions(stage: str | None = None, international: bool | None 
 
 
 @router.get("/admin/definitions/{definition_id}")
-def get_admin_definition(definition_id: int, db: Session = Depends(get_db)):
+def get_admin_definition(definition_id: int, db: Session = Depends(get_db),
+                          current: CurrentActor = Depends(require_admin)):
     d = db.get(models.DeliverableDefinition, definition_id)
     if not d:
         raise HTTPException(404, "Deliverable not found")
@@ -303,14 +300,11 @@ class DefinitionFieldsUpdate(BaseModel):
     is_milestone: bool | None = None
     milestone_code: str | None = None
     kpi_weight: float | None = None
-    actor_role: str = "Admin"
-    actor_email: str = ""
-    actor_name: str = ""
 
 
 @router.patch("/admin/definitions/{definition_id}")
-def update_admin_definition(definition_id: int, payload: DefinitionFieldsUpdate, db: Session = Depends(get_db)):
-    _require_admin(payload.actor_role, "edit a deliverable")
+def update_admin_definition(definition_id: int, payload: DefinitionFieldsUpdate, db: Session = Depends(get_db),
+                             current: CurrentActor = Depends(require_admin)):
     d = db.get(models.DeliverableDefinition, definition_id)
     if not d:
         raise HTTPException(404, "Deliverable not found")
@@ -370,21 +364,18 @@ def update_admin_definition(definition_id: int, payload: DefinitionFieldsUpdate,
     if cascaded:
         summary += f"; also updated the formula on: {', '.join(cascaded)}"
     _log_definition_change(db, d, "admin_edit", "field_edit", before, after,
-                            payload.actor_email, payload.actor_name, summary)
+                            current.email, current.name, summary)
     db.commit()
     return _definition_out(d)
 
 
 class BranchesUpdate(BaseModel):
     branches: list[BranchIn]
-    actor_role: str = "Admin"
-    actor_email: str = ""
-    actor_name: str = ""
 
 
 @router.put("/admin/definitions/{definition_id}/branches")
-def update_admin_definition_branches(definition_id: int, payload: BranchesUpdate, db: Session = Depends(get_db)):
-    _require_admin(payload.actor_role, "edit a deliverable's formula")
+def update_admin_definition_branches(definition_id: int, payload: BranchesUpdate, db: Session = Depends(get_db),
+                                      current: CurrentActor = Depends(require_admin)):
     d = db.get(models.DeliverableDefinition, definition_id)
     if not d:
         raise HTTPException(404, "Deliverable not found")
@@ -394,22 +385,16 @@ def update_admin_definition_branches(definition_id: int, payload: BranchesUpdate
     d.is_customized = True
     after = _definition_snapshot(d)
     _log_definition_change(db, d, "admin_edit", "branch_edit", before, after,
-                            payload.actor_email, payload.actor_name, f"Changed the formula for {d.item_no} {d.name}")
+                            current.email, current.name, f"Changed the formula for {d.item_no} {d.name}")
     db.commit()
     affected = _force_recompute_affected(db, d.id)
     return _definition_out(d) | {"projects_recomputed": affected}
 
 
-class DefinitionActorOnly(BaseModel):
-    actor_role: str = "Admin"
-    actor_email: str = ""
-    actor_name: str = ""
-
-
 @router.post("/admin/definitions/{definition_id}/restore-default")
-def restore_admin_definition_default(definition_id: int, payload: DefinitionActorOnly, db: Session = Depends(get_db)):
+def restore_admin_definition_default(definition_id: int, db: Session = Depends(get_db),
+                                      current: CurrentActor = Depends(require_admin)):
     from .. import seed as seed_module  # local import: seed.py imports rules, avoid a top-level cycle
-    _require_admin(payload.actor_role, "restore a deliverable to its default")
     d = db.get(models.DeliverableDefinition, definition_id)
     if not d:
         raise HTTPException(404, "Deliverable not found")
@@ -442,7 +427,7 @@ def restore_admin_definition_default(definition_id: int, payload: DefinitionActo
     rules.sync_definition_mirror_columns(d)
     after = _definition_snapshot(d)
     _log_definition_change(db, d, "restore_default", "branch_edit", before, after,
-                            payload.actor_email, payload.actor_name, f"Restored {d.item_no} {d.name} to its default formula")
+                            current.email, current.name, f"Restored {d.item_no} {d.name} to its default formula")
     db.commit()
     affected = _force_recompute_affected(db, d.id)
     return _definition_out(d) | {"projects_recomputed": affected}
@@ -503,9 +488,6 @@ class DefinitionCreate(BaseModel):
     is_milestone: bool = False
     milestone_code: str | None = None
     branches: list[BranchIn] = []
-    actor_role: str = "Admin"
-    actor_email: str = ""
-    actor_name: str = ""
     # [Request 10]: reoccurring=True (default) means this joins the
     # permanent catalog -- active=True, so every future new project of
     # this stage gets it automatically, same as any other catalog item.
@@ -522,8 +504,8 @@ class DefinitionCreate(BaseModel):
 
 
 @router.post("/admin/definitions", status_code=201)
-def create_admin_definition(payload: DefinitionCreate, db: Session = Depends(get_db)):
-    _require_admin(payload.actor_role, "add a deliverable")
+def create_admin_definition(payload: DefinitionCreate, db: Session = Depends(get_db),
+                             current: CurrentActor = Depends(require_admin)):
     if payload.stage not in ("L0", "L1"):
         raise HTTPException(400, "stage must be L0 or L1")
     item_no = payload.item_no.strip()
@@ -554,7 +536,7 @@ def create_admin_definition(payload: DefinitionCreate, db: Session = Depends(get
     if payload.branches:
         _apply_branches(db, d, payload.branches)
     _log_definition_change(db, d, "admin_edit", "created", None, _definition_snapshot(d),
-                            payload.actor_email, payload.actor_name, f"Created {item_no} {name}")
+                            current.email, current.name, f"Created {item_no} {name}")
     db.commit()
 
     # [Request 9/10]: retrofit onto currently open projects of this stage --
@@ -607,14 +589,11 @@ def create_admin_definition(payload: DefinitionCreate, db: Session = Depends(get
 
 class ActiveToggle(BaseModel):
     active: bool
-    actor_role: str = "Admin"
-    actor_email: str = ""
-    actor_name: str = ""
 
 
 @router.patch("/admin/definitions/{definition_id}/active")
-def toggle_admin_definition_active(definition_id: int, payload: ActiveToggle, db: Session = Depends(get_db)):
-    _require_admin(payload.actor_role, "deactivate or reactivate a deliverable")
+def toggle_admin_definition_active(definition_id: int, payload: ActiveToggle, db: Session = Depends(get_db),
+                                    current: CurrentActor = Depends(require_admin)):
     d = db.get(models.DeliverableDefinition, definition_id)
     if not d:
         raise HTTPException(404, "Deliverable not found")
@@ -623,13 +602,14 @@ def toggle_admin_definition_active(definition_id: int, payload: ActiveToggle, db
     after = _definition_snapshot(d)
     verb = "Reactivated" if payload.active else "Deactivated"
     _log_definition_change(db, d, "admin_edit", "reactivated" if payload.active else "deactivated",
-                            before, after, payload.actor_email, payload.actor_name, f"{verb} {d.item_no} {d.name}")
+                            before, after, current.email, current.name, f"{verb} {d.item_no} {d.name}")
     db.commit()
     return _definition_out(d)
 
 
 @router.get("/admin/change-history")
-def list_admin_change_history(deliverable_definition_id: int | None = None, limit: int = 100, db: Session = Depends(get_db)):
+def list_admin_change_history(deliverable_definition_id: int | None = None, limit: int = 100,
+                               db: Session = Depends(get_db), current: CurrentActor = Depends(require_admin)):
     # Item 34: a reverted change is back to how it was before it happened --
     # hidden from the default list "like it never happened," along with the
     # revert entry itself (see revert_admin_change, which marks both rows).
@@ -654,8 +634,8 @@ def list_admin_change_history(deliverable_definition_id: int | None = None, limi
 
 
 @router.post("/admin/change-history/{log_id}/revert")
-def revert_admin_change(log_id: int, payload: DefinitionActorOnly, db: Session = Depends(get_db)):
-    _require_admin(payload.actor_role, "revert a change")
+def revert_admin_change(log_id: int, db: Session = Depends(get_db),
+                         current: CurrentActor = Depends(require_admin)):
     log = db.get(models.DeliverableDefinitionChangeLog, log_id)
     if not log or not log.before_snapshot:
         raise HTTPException(404, "Change not found or has nothing to revert to")
@@ -682,7 +662,7 @@ def revert_admin_change(log_id: int, payload: DefinitionActorOnly, db: Session =
         _apply_branches(db, d, branch_payloads)
     after = _definition_snapshot(d)
     revert_log = _log_definition_change(db, d, "revert", "field_edit", before, after,
-                                         payload.actor_email, payload.actor_name,
+                                         current.email, current.name,
                                          f"Reverted {d.item_no} {d.name} to an earlier version")
     # Item 34: the change this just undid, and the revert action itself,
     # are both hidden from the default Audit History list -- net effect is
@@ -700,7 +680,8 @@ def revert_admin_change(log_id: int, payload: DefinitionActorOnly, db: Session =
 # ---------------------------------------------------------------------------
 @router.get("/config/formulas")
 def list_formulas(stage: str | None = None, international: bool | None = None,
-                   department_id: int | None = None, db: Session = Depends(get_db)):
+                   department_id: int | None = None, db: Session = Depends(get_db),
+                   current_actor: CurrentActor = Depends(get_current_actor)):
     q = (
         db.query(models.DeliverableDefinition)
         .join(models.Department)
@@ -764,16 +745,12 @@ class FormulaChangeRequestCreate(BaseModel):
     proposed_branches: list[BranchIn]
     proposed_weight: float | None = None
     comment: str
-    actor_name: str | None = None
-    actor_email: str
 
 
 @router.post("/config/formula-change-requests", status_code=201)
-def create_formula_change_request(payload: FormulaChangeRequestCreate, db: Session = Depends(get_db)):
-    email = payload.actor_email.strip()
+def create_formula_change_request(payload: FormulaChangeRequestCreate, db: Session = Depends(get_db),
+                                   current: CurrentActor = Depends(get_current_actor)):
     comment = payload.comment.strip()
-    if not email:
-        raise HTTPException(400, "Email is required")
     if not comment:
         raise HTTPException(400, "A reason is required")
     if payload.proposed_weight is not None and payload.proposed_weight <= 0:
@@ -782,11 +759,8 @@ def create_formula_change_request(payload: FormulaChangeRequestCreate, db: Sessi
     if not d:
         raise HTTPException(404, "Deliverable not found")
     _validate_branches(payload.proposed_branches)
-    user = db.query(models.User).filter(models.User.email.ilike(email)).first()
-    if not user:
-        raise HTTPException(400, "You need to be in the L0-L1 Group to suggest a change (Focal Points → L0-L1 Group)")
     req = models.FormulaChangeRequest(
-        deliverable_definition_id=d.id, requested_by_email=user.email, requested_by_name=user.name,
+        deliverable_definition_id=d.id, requested_by_email=current.email, requested_by_name=current.name,
         current_summary=rules.describe_formula_branches(d),
         proposed_branches=[b.model_dump() for b in payload.proposed_branches],
         proposed_weight=payload.proposed_weight,
@@ -795,32 +769,32 @@ def create_formula_change_request(payload: FormulaChangeRequestCreate, db: Sessi
     db.add(req)
     db.commit()
     db.refresh(req)
-    announcements.formula_change_requested(db, sorted(rules.admin_emails(db)), user.email, user.name, d.item_no, d.name)
+    announcements.formula_change_requested(db, sorted(rules.admin_emails(db)), current.email, current.name, d.item_no, d.name)
     return _serialize_formula_request(req)
 
 
 @router.get("/config/formula-change-requests")
-def list_formula_change_requests(status: str | None = "pending", requested_by_email: str | None = None,
-                                  db: Session = Depends(get_db)):
+def list_formula_change_requests(status: str | None = "pending", db: Session = Depends(get_db),
+                                  current: CurrentActor = Depends(get_current_actor)):
     q = db.query(models.FormulaChangeRequest).order_by(models.FormulaChangeRequest.requested_at.desc())
     if status:
         q = q.filter(models.FormulaChangeRequest.status == status)
-    if requested_by_email:
-        q = q.filter(models.FormulaChangeRequest.requested_by_email.ilike(requested_by_email.strip()))
+    # Decisions on these are Admin-only (decide_formula_change_request below),
+    # so -- same pattern as bid-value/reassignment/comm-offer requests -- a
+    # non-admin only ever sees their own suggestions, never everyone else's.
+    if current.role != "Admin":
+        q = q.filter(models.FormulaChangeRequest.requested_by_email.ilike(current.email))
     return [_serialize_formula_request(r) for r in q.all()]
 
 
 class FormulaChangeDecision(BaseModel):
     approved: bool
     comment: str = ""
-    actor_role: str = "Admin"
-    actor_email: str = ""
-    actor_name: str = ""
 
 
 @router.post("/config/formula-change-requests/{request_id}/decide")
-def decide_formula_change_request(request_id: int, payload: FormulaChangeDecision, db: Session = Depends(get_db)):
-    _require_admin(payload.actor_role, "decide a formula change suggestion")
+def decide_formula_change_request(request_id: int, payload: FormulaChangeDecision, db: Session = Depends(get_db),
+                                   current: CurrentActor = Depends(require_admin)):
     req = db.get(models.FormulaChangeRequest, request_id)
     if not req:
         raise HTTPException(404, "Request not found")
@@ -840,14 +814,14 @@ def decide_formula_change_request(request_id: int, payload: FormulaChangeDecisio
         after = _definition_snapshot(d)
         log = _log_definition_change(
             db, d, "suggestion_approved", "branch_edit", before, after,
-            payload.actor_email, payload.actor_name,
+            current.email, current.name,
             f"Approved {req.requested_by_name or req.requested_by_email}'s suggested formula change for {d.item_no} {d.name}",
             origin_request_id=req.id,
         )
         req.applied_change_log_id = log.id
     req.status = "approved" if payload.approved else "rejected"
     req.decided_at = datetime.utcnow()
-    req.decided_by_email = payload.actor_email or None
+    req.decided_by_email = current.email
     req.decision_comment = payload.comment or None
     db.commit()
     if payload.approved:

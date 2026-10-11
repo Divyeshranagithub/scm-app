@@ -7,6 +7,8 @@ Focal point / owner / SME emails below are PLACEHOLDERS — swap for the real
 per-department contacts and the real per-deliverable owner/SME mapping when
 provided, then re-run: `python -m backend.seed` (safe to re-run, upserts).
 """
+import os
+
 from sqlalchemy import inspect, text
 from .database import SessionLocal, engine, ensure_column, ensure_enum_value, ensure_index, ensure_not_unique
 from . import models, rules
@@ -1446,9 +1448,38 @@ def _seed_missing_branches(db) -> None:
         db.commit()
 
 
+def _ensure_bootstrap_admins(db) -> int:
+    """BOOTSTRAP_ADMIN_EMAILS (comma-separated) -- the only way the very
+    first Admin gets onto the roster. Every other path onto the roster
+    (Focal Points -> L0-L1 Group, Requests -> Group Add Requests) itself
+    requires an existing Admin, so on a genuinely empty roster nobody could
+    ever reach Admin through the app at all without this.
+
+    Create-only: an email already on the roster is left completely alone,
+    even if it's still listed here -- this is a one-time bootstrap, not a
+    standing override. Safe to leave the env var set permanently; it never
+    fights a later, deliberate role change made through the admin UI.
+    """
+    raw = os.environ.get("BOOTSTRAP_ADMIN_EMAILS", "")
+    emails = [e.strip() for e in raw.split(",") if e.strip()]
+    created = 0
+    for email in emails:
+        if db.query(models.User).filter(models.User.email.ilike(email)).first():
+            continue
+        db.add(models.User(name=email.split("@")[0], email=email, role="Admin"))
+        created += 1
+    if created:
+        db.commit()
+    return created
+
+
 def run():
     db = SessionLocal()
     try:
+        bootstrapped = _ensure_bootstrap_admins(db)
+        if bootstrapped:
+            print(f"Bootstrap: added {bootstrapped} Admin(s) from BOOTSTRAP_ADMIN_EMAILS.")
+
         for old_name, new_name in DEPARTMENT_RENAMES.items():
             old = db.query(models.Department).filter_by(name=old_name).first()
             if old and not db.query(models.Department).filter_by(name=new_name).first():

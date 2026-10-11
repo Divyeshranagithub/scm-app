@@ -1,17 +1,18 @@
 import asyncio
 import os
 from pathlib import Path
-from fastapi import Depends, FastAPI
+import limits
+from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
-from fastapi.responses import FileResponse, HTMLResponse
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
+from starlette.middleware.base import BaseHTTPMiddleware
 
-from .auth import get_api_key
 from .database import engine
 from . import models
 from .routers import (
     projects, deliverables, announcements_router, dashboard, departments, milestones, gantt, support, po_line_items,
-    deliverables_config, reports, ai_support, export,
+    deliverables_config, reports, ai_support, export, auth_router,
 )
 from .scheduler import scheduler_loop
 
@@ -20,10 +21,10 @@ models.Base.metadata.create_all(bind=engine)
 app = FastAPI(title="Project Readiness (L0/L1) Platform (Pilot)")
 
 # Once the frontend moves to S3/CloudFront it's a different origin than this
-# API (same split scm-ssot already uses), so browser fetch()es need CORS.
-# CORS_ORIGINS is a comma-separated allowlist; unset means "same-origin only
-# call sites" still work (local dev, Render, DronaHQ webview) but no new
-# cross-origin browser caller is allowed until its origin is added.
+# API (same split scm-ssot/QMS360 already use), so browser fetch()es need
+# CORS. CORS_ORIGINS is a comma-separated allowlist; unset means same-origin
+# only (local dev, Render) still works, but no cross-origin caller is
+# allowed until its origin is added.
 _cors_origins = [o.strip() for o in os.getenv("CORS_ORIGINS", "").split(",") if o.strip()]
 if _cors_origins:
     app.add_middleware(
@@ -33,6 +34,67 @@ if _cors_origins:
         allow_headers=["*"],
     )
 
+# [load test follow-up, 2026-09-22]: a blanket per-client safety net, not a
+# per-user/per-feature policy -- GAHIZ already has its own real daily
+# message quota (ai_support.py, DB-backed, per actor_email) for cost
+# control; this is the "nothing infrastructure-level" gap underneath that:
+# nothing stopped a runaway client (a buggy polling loop, a script) from
+# hammering any other endpoint. Keyed by IP, not actor_email, since there's
+# still no verified identity to key on (see docs/ARCHITECTURE.md's
+# "Identity and permissions") -- actor_email is just a self-reported form
+# field today, trivially reset by typing a different one.
+#
+# Hand-written middleware, not the slowapi package's own SlowAPIMiddleware
+# -- tried that first, and confirmed (by direct testing, not assumed) that
+# its route-handler resolution silently no-ops against this FastAPI version
+# (0.141.1): every route registered via app.include_router() -- i.e. every
+# real route in this app -- is wrapped in an internal _IncludedRouter with
+# no top-level .endpoint attribute, which slowapi's _find_route_handler
+# requires; failing to find one, it treats the route as exempt. The result
+# was a rate limiter that looked correctly configured and worked on the two
+# routes declared directly on `app` (/, /health) while doing nothing at all
+# on every /api/* route -- exactly the routes this exists to protect. Using
+# the `limits` package (slowapi's own underlying dependency) directly here
+# sidesteps that route-resolution step entirely: this checks request.url.path
+# against a plain exempt-set, with no dependency on how FastAPI happens to
+# represent a matched route internally.
+#
+# Keyed by IP specifically has one real limitation worth knowing: several
+# real people behind one shared corporate NAT/proxy look like a single IP
+# and would share this one bucket. 300/minute is deliberately generous
+# (ordinary UI navigation can fire a handful of calls per page) precisely
+# to keep that scenario unlikely to matter in practice -- this is a safety
+# net against something clearly broken, not a tight per-user throttle.
+# Override via RATE_LIMIT_PER_MINUTE if real usage needs a different number.
+_RATE_LIMIT_PER_MINUTE = int(os.environ.get("RATE_LIMIT_PER_MINUTE", "300"))
+_rate_limit_item = limits.parse(f"{_RATE_LIMIT_PER_MINUTE}/minute")
+_rate_limit_storage = limits.storage.MemoryStorage()
+_rate_limiter = limits.strategies.MovingWindowRateLimiter(_rate_limit_storage)
+# Render (and most PaaS/reverse-proxy setups) puts the real client's address
+# in X-Forwarded-For, not the TCP-level request.client -- that would just be
+# the proxy's own address for every request, collapsing every real visitor
+# into one shared bucket.
+_RATE_LIMIT_EXEMPT_PATHS = {"/health"}  # Render polls this on its own schedule -- never throttle it
+
+
+def _client_ip(request: Request) -> str:
+    forwarded = request.headers.get("x-forwarded-for")
+    if forwarded:
+        return forwarded.split(",")[0].strip()
+    return request.client.host if request.client else "unknown"
+
+
+class RateLimitMiddleware(BaseHTTPMiddleware):
+    async def dispatch(self, request: Request, call_next):
+        if request.url.path in _RATE_LIMIT_EXEMPT_PATHS:
+            return await call_next(request)
+        if not _rate_limiter.hit(_rate_limit_item, _client_ip(request)):
+            return JSONResponse(status_code=429, content={"detail": "Too many requests -- please slow down and try again shortly."})
+        return await call_next(request)
+
+
+app.add_middleware(RateLimitMiddleware)
+
 
 @app.on_event("startup")
 async def _start_scheduler():
@@ -40,20 +102,20 @@ async def _start_scheduler():
     # loop, not a host-specific cron job -- see scheduler.py's docstring.
     asyncio.create_task(scheduler_loop())
 
-_api_auth = [Depends(get_api_key)]
-app.include_router(projects.router, dependencies=_api_auth)
-app.include_router(deliverables.router, dependencies=_api_auth)
-app.include_router(announcements_router.router, dependencies=_api_auth)
-app.include_router(dashboard.router, dependencies=_api_auth)
-app.include_router(departments.router, dependencies=_api_auth)
-app.include_router(milestones.router, dependencies=_api_auth)
-app.include_router(gantt.router, dependencies=_api_auth)
-app.include_router(support.router, dependencies=_api_auth)
-app.include_router(po_line_items.router, dependencies=_api_auth)
-app.include_router(deliverables_config.router, dependencies=_api_auth)
-app.include_router(reports.router, dependencies=_api_auth)
-app.include_router(ai_support.router, dependencies=_api_auth)
-app.include_router(export.router, dependencies=_api_auth)
+app.include_router(auth_router.router)
+app.include_router(projects.router)
+app.include_router(deliverables.router)
+app.include_router(announcements_router.router)
+app.include_router(dashboard.router)
+app.include_router(departments.router)
+app.include_router(milestones.router)
+app.include_router(gantt.router)
+app.include_router(support.router)
+app.include_router(po_line_items.router)
+app.include_router(deliverables_config.router)
+app.include_router(reports.router)
+app.include_router(ai_support.router)
+app.include_router(export.router)
 
 FRONTEND_DIR = Path(__file__).resolve().parent.parent / "frontend"
 LOCAL_FILES_DIR = Path(__file__).resolve().parent.parent / "data" / "local_storage"
@@ -96,10 +158,10 @@ def index():
         (FRONTEND_DIR / "static" / "css" / "landing.css").stat().st_mtime,
         (FRONTEND_DIR / "static" / "js" / "landing.js").stat().st_mtime,
     )))
-    html = html.replace('static/app.js"', f'static/app.js?v={version}"')
-    html = html.replace('static/styles.css"', f'static/styles.css?v={version}"')
-    html = html.replace('static/css/landing.css"', f'static/css/landing.css?v={version}"')
-    html = html.replace('static/js/landing.js"', f'static/js/landing.js?v={version}"')
+    html = html.replace('/static/app.js"', f'/static/app.js?v={version}"')
+    html = html.replace('/static/styles.css"', f'/static/styles.css?v={version}"')
+    html = html.replace('/static/css/landing.css"', f'/static/css/landing.css?v={version}"')
+    html = html.replace('/static/js/landing.js"', f'/static/js/landing.js?v={version}"')
     return HTMLResponse(html, headers={"Cache-Control": "no-cache"})
 
 

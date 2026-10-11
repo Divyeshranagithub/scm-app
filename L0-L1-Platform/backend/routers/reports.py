@@ -9,19 +9,15 @@ every L1 project).
 """
 from datetime import date
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends
 from sqlalchemy.orm import Session
 
 from .. import models, rules
+from ..auth import CurrentActor, get_current_actor, require_admin
 from ..database import get_db
 from .po_line_items import po_cycle_summary
 
 router = APIRouter(prefix="/api/reports", tags=["reports"])
-
-
-def _require_admin(actor_role: str) -> None:
-    if actor_role != "Admin":
-        raise HTTPException(403, "Only an Admin can view this report")
 
 
 # [PO Status report design]: the reference dashboard (Dashboard Design
@@ -70,7 +66,7 @@ def _po_status_and_delay(item_status: str, sub: "models.DeliverableSubmission | 
 
 
 @router.get("/master-po")
-def get_master_po_report(actor_role: str = "Viewer", db: Session = Depends(get_db)):
+def get_master_po_report(db: Session = Depends(get_db), current: CurrentActor = Depends(get_current_actor)):
     """Every PO line item across every active L1 project, flattened -- the
     same per-project data the PO Lifecycle tab (po_cycle_summary) already
     computes, just called once per project and tagged with that project's
@@ -87,7 +83,7 @@ def get_master_po_report(actor_role: str = "Viewer", db: Session = Depends(get_d
     )
     rows = []
     for p in projects:
-        summary = po_cycle_summary(project_id=p.id, db=db)
+        summary = po_cycle_summary(project_id=p.id, db=db, current=current)
         sub_ids = [item["open_submission_id"] for cat in summary.values() for item in cat["items"] if item["open_submission_id"]]
         subs_by_id = {}
         if sub_ids:
@@ -128,8 +124,7 @@ _BUDGET_ITEM_NOS = ("6.1", "6.2", "6.3")
 
 
 @router.get("/budget-status")
-def get_budget_status_report(actor_role: str = "Viewer", db: Session = Depends(get_db)):
-    _require_admin(actor_role)
+def get_budget_status_report(db: Session = Depends(get_db), current: CurrentActor = Depends(require_admin)):
     projects = (
         db.query(models.Project)
         .filter(models.Project.stage == models.Stage.L1, models.Project.archived.is_not(True))

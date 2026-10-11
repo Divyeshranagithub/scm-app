@@ -1,7 +1,8 @@
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends
 from sqlalchemy.orm import Session
 
 from .. import models, schemas
+from ..auth import CurrentActor, get_current_actor, require_admin
 from ..database import get_db
 
 router = APIRouter(prefix="/api/announcements", tags=["announcements"])
@@ -27,9 +28,8 @@ _ALWAYS_VISIBLE_TYPES = {
 
 
 @router.get("", response_model=list[schemas.AnnouncementOut])
-def list_announcements(limit: int = 50, actor_role: str | None = None, actor_email: str | None = None,
-                        mine: bool = False, stage: str | None = None, category: str = "news",
-                        db: Session = Depends(get_db)):
+def list_announcements(limit: int = 50, mine: bool = False, stage: str | None = None, category: str = "news",
+                        db: Session = Depends(get_db), current: CurrentActor = Depends(get_current_actor)):
     """Item [reminders tab]: `category` splits one shared table into two
     tabs the same way `kind` already splits DueDateRequest instead of two
     near-duplicate tables -- "news" (the default, everything except
@@ -51,8 +51,8 @@ def list_announcements(limit: int = 50, actor_role: str | None = None, actor_ema
         q = q.join(models.Project, models.Announcement.project_id == models.Project.id).filter(
             models.Project.stage == stage, models.Project.archived.is_not(True))
     items = q.limit(limit).all()
-    if actor_role and actor_role != "Admin":
-        email = (actor_email or "").strip().lower()
+    if current.role != "Admin":
+        email = (current.email or "").strip().lower()
 
         def visible(a: models.Announcement) -> bool:
             if a.type in _ALWAYS_VISIBLE_TYPES:
@@ -70,7 +70,7 @@ def list_announcements(limit: int = 50, actor_role: str | None = None, actor_ema
     # "Mine" means it's actually about my work, not just that I'm allowed
     # to see it.
     if mine:
-        email = (actor_email or "").strip().lower()
+        email = (current.email or "").strip().lower()
         if not email:
             return []
         items = [
@@ -93,14 +93,12 @@ def list_announcements(limit: int = 50, actor_role: str | None = None, actor_ema
 
 
 @router.delete("/reminders")
-def clear_reminders(actor_role: str = "Admin", db: Session = Depends(get_db)):
+def clear_reminders(db: Session = Depends(get_db), current: CurrentActor = Depends(require_admin)):
     """Item [reminders tab]: one-time (or occasional) cleanup of every
     DEADLINE-type row -- the Reminders tab was previously mixed into
     Announcements, so this clears out that backlog rather than leaving it
     to resurface the moment the two views split.
     """
-    if actor_role != "Admin":
-        raise HTTPException(403, "Only an Admin can clear reminders")
     deleted = db.query(models.Announcement).filter(models.Announcement.type == models.AnnouncementType.DEADLINE).delete()
     db.commit()
     return {"deleted": deleted}

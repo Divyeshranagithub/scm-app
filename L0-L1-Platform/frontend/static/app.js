@@ -1,20 +1,18 @@
 /* Real frontend for the L0/L1 pilot. Every render here comes from an actual
    fetch() to the FastAPI backend — no hardcoded data arrays anywhere in this
-   file. Role-based button gating is client-side only for now (no per-user
-   login exists yet in the pilot) — before this goes company-wide, the same
-   checks need to be enforced server-side too, not just hidden in the UI. */
+   file. CURRENT_ROLE/actingEmail() are no longer client-chosen -- they're
+   set once, from the verified /api/auth/session response, by the bootstrap
+   at the bottom of this file (see establishSession/boot). The server
+   independently re-verifies identity/role on every request anyway
+   (backend/auth.py) — this is just what the UI uses to decide what to show. */
 (function () {
   "use strict";
 
-  var CURRENT_ROLE = "Admin";
-  function actingEmail() {
-    // Real DronaHQ SSO identity (see dronahq-sso.js) takes priority over the
-    // manual "acting as email" field once it's available -- that field stays
-    // as the fallback for local/non-DronaHQ use where no SSO session exists.
-    if (window.L0L1_USER && window.L0L1_USER.email) return window.L0L1_USER.email.trim();
-    var f = document.getElementById("actingEmail");
-    return f ? f.value.trim() : "";
-  }
+  var CURRENT_ROLE = null;
+  var CURRENT_EMAIL = null;
+  var CURRENT_NAME = null;
+  var AUTH_TOKEN = null;
+  function actingEmail() { return CURRENT_EMAIL || ""; }
   function can(action) {
     if (CURRENT_ROLE === "Admin") return true;
     if (action === "upload") return CURRENT_ROLE === "Owner";
@@ -534,14 +532,6 @@
       }, 150);
     }
   }
-  // Set by index.html when the frontend is hosted separately from the
-  // backend (S3/CloudFront, same split scm-ssot uses) -- e.g.
-  // window.L0L1_API_BASE = 'https://orion.algihaz.com/l0l1'. Left unset
-  // for local dev / Render, where the frontend is same-origin with the API
-  // and a relative path is correct as-is.
-  var API_BASE = window.L0L1_API_BASE || "";
-  var API_KEY = window.L0L1_API_KEY || "";
-
   async function api(path, opts) {
     // Item 100: force a real network round-trip on every call — GET requests
     // otherwise had no explicit Cache-Control, letting the browser occasionally
@@ -549,10 +539,23 @@
     // an upload from a different entry point, showing the pre-upload state
     // until something forced a genuinely fresh request).
     opts = Object.assign({ cache: "no-store" }, opts || {});
-    if (API_KEY) opts.headers = Object.assign({ "X-API-Key": API_KEY }, opts.headers || {});
+    // Every real route requires this now (backend/auth.py) -- merged onto
+    // whatever headers the caller already set (a JSON call's Content-Type,
+    // or no headers at all for a FormData/multipart body) rather than
+    // replacing them.
+    opts.headers = Object.assign({}, opts.headers, AUTH_TOKEN ? { Authorization: "Bearer " + AUTH_TOKEN } : {});
     _loadingStart();
     try {
-      var r = await fetch(API_BASE + path, opts);
+      var r = await fetch(path, opts);
+      if (r.status === 401) {
+        // The session token expired, or an Admin took this person off the
+        // roster mid-session -- there's nothing a retry can fix client-side,
+        // so drop back to the sign-in screen rather than surfacing a raw 401.
+        AUTH_TOKEN = null;
+        showAuthOverlay();
+        showLocalSignIn("Your session has expired -- please sign in again.");
+        throw new Error(path + " -> 401: session expired");
+      }
       if (!r.ok) {
         var bodyText = await r.text();
         var err = new Error(path + " -> " + r.status + ": " + bodyText);
@@ -604,10 +607,10 @@
       rows: exportRows,
     };
     try {
-      var headers = { "Content-Type": "application/json" };
-      if (API_KEY) headers["X-API-Key"] = API_KEY;
-      var resp = await fetch(API_BASE + "/api/export/xlsx", {
-        method: "POST", headers: headers, body: JSON.stringify(payload),
+      var resp = await fetch("/api/export/xlsx", {
+        method: "POST",
+        headers: Object.assign({ "Content-Type": "application/json" }, AUTH_TOKEN ? { Authorization: "Bearer " + AUTH_TOKEN } : {}),
+        body: JSON.stringify(payload),
       });
       if (!resp.ok) throw new Error("Export failed (" + resp.status + ")");
       var blob = await resp.blob();
@@ -11536,111 +11539,30 @@
     }
   });
 
-  /* ================= ROLE + THEME ================= */
-  // Item 162: lets a tester actually become a real Owner/SME with real
-  // assigned work instead of guessing an email that matches nothing (the
-  // real cause behind item 160's "why can't I upload" question -- the acting
-  // email has to match a real owner_email/sme_email for isAssigned() to
-  // pass). Built from the live /api/deliverables list, so it's always
-  // pointing at real, current, testable rows -- SME options are labelled
-  // with their pending-review count so "test Pending SME Review" is a
-  // one-click pick instead of a hunt through the data.
-  async function populateActingEmailQuickPick(isRetry) {
-    var quickPick = document.getElementById("actingEmailQuickPick");
-    if (CURRENT_ROLE !== "Owner" && CURRENT_ROLE !== "SME") { quickPick.style.display = "none"; return; }
-    // A slow/failed fetch here (e.g. Render's free-tier cold start on the
-    // very first request after idling) used to throw uncaught and leave the
-    // quick-pick permanently stuck hidden with nothing but the placeholder --
-    // no error shown anywhere, just silently broken until the next full role
-    // switch happened to succeed. One quiet retry covers the transient case.
-    var all, roster;
-    try {
-      all = await api("/api/deliverables");
-      roster = await _getRoster();
-    } catch (err) {
-      if (!isRetry) return populateActingEmailQuickPick(true);
-      console.error("Quick pick failed to load", err);
-      return;
-    }
-    var counts = {};
-    all.forEach(function (d) {
-      var emails = CURRENT_ROLE === "Owner" ? (d.owner_emails || []) : (d.sme_emails || []);
-      emails.forEach(function (email) {
-        if (!counts[email]) counts[email] = { due: 0, pendingReview: 0 };
-        if (d.deadline_status === "due") counts[email].due++;
-        if (d.status === "pending_review") counts[email].pendingReview++;
-      });
-    });
-    // Every roster member of this role is offered, not just whoever
-    // already has assigned work -- a freshly-added Owner/SME with nothing
-    // assigned yet still needs to be pickable to actually test as them.
-    roster.filter(function (u) { return u.role === CURRENT_ROLE; }).forEach(function (u) {
-      if (!counts[u.email]) counts[u.email] = { due: 0, pendingReview: 0 };
-    });
-    var emails = Object.keys(counts).sort();
-    quickPick.innerHTML = '<option value="">Quick pick&#8230;</option>';
-    emails.forEach(function (email) {
-      var c = counts[email];
-      var label = CURRENT_ROLE === "SME"
-        ? email + " (" + c.pendingReview + " pending review)"
-        : email + " (" + c.due + " due)";
-      var o = el("option", "", label); o.value = email; quickPick.appendChild(o);
-    });
-    quickPick.style.display = emails.length ? "" : "none";
-  }
-  document.getElementById("roleSelect").addEventListener("change", async function (e) {
-    CURRENT_ROLE = e.target.value;
+  /* ================= IDENTITY + THEME ================= */
+  // Replaces the old roleSelect/actingEmail dropdown handler -- there's
+  // nothing left for the user to switch, so this just applies the one real,
+  // server-verified identity (see establishSession/boot below) to the nav
+  // once, at sign-in.
+  async function applyIdentity() {
     var showAdmin = can("create");
     document.getElementById("adminNav").style.display = showAdmin ? "" : "none";
     document.getElementById("adminGroupLabel").style.display = showAdmin ? "" : "none";
-    var actingAsPerson = CURRENT_ROLE === "Owner" || CURRENT_ROLE === "SME";
-    document.getElementById("actingEmail").style.display = actingAsPerson ? "" : "none";
-    // A hidden field a user can no longer see or edit shouldn't keep
-    // silently steering identity-dependent checks (announcement visibility,
-    // isAssigned) after switching away from Owner/SME -- clear it so
-    // Admin/Viewer never inherit whichever email was last typed in.
-    if (!actingAsPerson) document.getElementById("actingEmail").value = "";
     await _refreshCanSeeBmTriage();
     document.getElementById("bmTriageNavItem").hidden = !canSeeBmTriage();
     document.getElementById("assignedNavItem").hidden = !canSeeAssigned();
     document.getElementById("remindersNavItem").hidden = !canSeeReminders();
-    populateActingEmailQuickPick();
-    if (!showAdmin && ADMIN_ONLY_VIEWS.some(function (v) { return !document.getElementById("view-" + v).hidden; })) switchView("dashboard");
-    if (!canSeeBmTriage() && !document.getElementById("view-bmtriage").hidden) switchView("dashboard");
-    if (!canSeeAssigned() && !document.getElementById("view-assigned").hidden) switchView("dashboard");
-    if (!canSeeReminders() && !document.getElementById("view-reminders").hidden) switchView("dashboard");
-    if (currentProjectId && !document.getElementById("view-detail").hidden) openDetail(currentProjectId);
-    if (!document.getElementById("view-announcements").hidden) loadAnnouncements();
-    if (!document.getElementById("view-reminders").hidden) loadReminders();
-    checkBmTriageDeadline();
-    refreshNavBadges();
-  });
-  // Item [BM triage viewer bug]: on a page refresh, some browsers restore a
-  // <select>'s prior value from before the reload without firing "change" --
-  // the dropdown then visually shows e.g. "Viewer" while every piece of app
-  // state (CURRENT_ROLE, the nav's hidden flags) is still sitting at the
-  // "Admin" default, since nothing ever re-ran to sync them. This pilot has
-  // no real login and doesn't persist the role choice across reloads by
-  // design, so force the control back to the actual default on every load.
-  document.getElementById("roleSelect").value = "Admin";
-  document.getElementById("actingEmailQuickPick").addEventListener("change", function (e) {
-    if (!e.target.value) return;
-    document.getElementById("actingEmail").value = e.target.value;
-    document.getElementById("actingEmail").dispatchEvent(new Event("change"));
-  });
-  document.getElementById("actingEmail").addEventListener("change", async function () {
-    if (!document.getElementById("view-announcements").hidden) loadAnnouncements();
-    if (!document.getElementById("view-reminders").hidden) loadReminders();
-    // Item 183: "My Items" reads the acting-as-email identity live, so
-    // switching who you're acting as should refresh the Dashboard's scoped
-    // view immediately rather than showing stale data until the next visit.
-    if (dashFocus === "mine" && !document.getElementById("view-dashboard").hidden) loadDashboard();
-    checkBmTriageDeadline();
-    await _refreshCanSeeBmTriage();
-    document.getElementById("bmTriageNavItem").hidden = !canSeeBmTriage();
-    if (!canSeeBmTriage() && !document.getElementById("view-bmtriage").hidden) switchView("dashboard");
-    refreshNavBadges();
-  });
+    var badge = document.getElementById("identityBadge");
+    if (badge) badge.textContent = (CURRENT_NAME || CURRENT_EMAIL || "") + " · " + CURRENT_ROLE;
+    var avatar = document.getElementById("userAvatar");
+    if (avatar) {
+      var initialsSrc = (CURRENT_NAME || CURRENT_EMAIL || "?").trim();
+      var parts = initialsSrc.split(/\s+/).filter(Boolean);
+      avatar.textContent = parts.length > 1
+        ? (parts[0][0] + parts[1][0]).toUpperCase()
+        : initialsSrc.slice(0, 2).toUpperCase();
+    }
+  }
   document.getElementById("themeToggle").addEventListener("click", function () {
     var root = document.documentElement;
     var next = root.getAttribute("data-theme") === "dark" ? "light" : "dark";
@@ -11662,6 +11584,10 @@
   });
 
   /* ================= INIT ================= */
+  // Runs once, only after establishSession() below has a real, server-
+  // verified identity -- see the auth bootstrap at the very end of this file.
+  async function boot() {
+  await applyIdentity();
   // Item [BM triage viewer bug], part 2: a page restored from the browser's
   // back-forward cache (bfcache -- back/forward nav, some "reopen tab"
   // flows) resumes its exact frozen JS state without re-running any script
@@ -11675,9 +11601,9 @@
   });
   document.getElementById("todayLabel").textContent = new Date().toLocaleDateString("en-GB", { weekday: "long", day: "2-digit", month: "long", year: "numeric" });
   // Item [nav badges]: piggybacking only on the role/acting-email change
-  // handlers isn't enough -- CURRENT_ROLE starts hardcoded to "Admin" and
-  // neither handler fires on a fresh load, so badges would stay empty
-  // until the user manually touched role or acting-email.
+  // handlers isn't enough -- neither handler fires on a fresh load, so
+  // badges would stay empty until the user manually touched role or
+  // acting-email.
   refreshNavBadges();
 
   // Item 120: loadDashboard() used to always fire immediately, then a
@@ -11738,4 +11664,122 @@
   var justSignedInThisLoad = true;
   try { justSignedInThisLoad = sessionStorage.getItem("hvSignedIn") !== "1"; } catch (e) {}
   if (justSignedInThisLoad && localStorage.getItem("tourAutoDisabled") !== "1") openTour();
+  } // end boot()
+
+  /* ================= AUTH BOOTSTRAP ================= */
+  // Real identity, enforced server-side on every request (backend/auth.py) --
+  // this is the one and only place CURRENT_ROLE/CURRENT_EMAIL/AUTH_TOKEN are
+  // ever set. Nothing in the rest of this file can grant itself a role
+  // anymore; it can only display whatever role the backend actually returned.
+  function showAuthOverlay() { document.getElementById("authOverlay").hidden = false; }
+  function hideAuthOverlay() { document.getElementById("authOverlay").hidden = true; }
+  function showLocalSignIn(errorMsg) {
+    document.getElementById("authBooting").hidden = true;
+    document.getElementById("authPending").hidden = true;
+    document.getElementById("authLocalSignin").hidden = false;
+    var errEl = document.getElementById("authLocalError");
+    if (errorMsg) { errEl.textContent = errorMsg; errEl.hidden = false; } else { errEl.hidden = true; }
+  }
+  function showPendingScreen(email) {
+    document.getElementById("authBooting").hidden = true;
+    document.getElementById("authLocalSignin").hidden = true;
+    document.getElementById("authPending").hidden = false;
+    document.getElementById("authPendingEmail").textContent = email;
+  }
+
+  // POSTs to /api/auth/session: an unregistered email gets auto-filed as a
+  // pending Group Add Request (see auth_router.py) and comes back
+  // {status:"pending"} -- a registered one gets a real signed session token
+  // and {status:"ok", token, role, email, name}. Never guesses or remembers
+  // a role client-side between calls; every call re-asks the server.
+  async function establishSession(email, name) {
+    var res = await fetch("/api/auth/session", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ email: email, name: name || null }),
+    });
+    var data = await res.json().catch(function () { return {}; });
+    if (!res.ok) throw new Error((data && data.detail) || ("sign-in failed (" + res.status + ")"));
+    if (data.status === "pending") {
+      showPendingScreen(data.email);
+      return false;
+    }
+    AUTH_TOKEN = data.token;
+    CURRENT_ROLE = data.role;
+    CURRENT_EMAIL = data.email;
+    CURRENT_NAME = data.name;
+    return true;
+  }
+
+  document.getElementById("authEmailSubmit").addEventListener("click", async function () {
+    var input = document.getElementById("authEmailInput");
+    var email = (input.value || "").trim();
+    if (!email) { showLocalSignIn("Enter an email to continue."); return; }
+    this.disabled = true;
+    try {
+      var ok = await establishSession(email);
+      if (ok) { hideAuthOverlay(); boot(); }
+    } catch (err) {
+      showLocalSignIn(err.message || "Sign-in failed -- try again.");
+    } finally {
+      this.disabled = false;
+    }
+  });
+  document.getElementById("authRecheckBtn").addEventListener("click", async function () {
+    var email = document.getElementById("authPendingEmail").textContent;
+    this.disabled = true;
+    try {
+      var ok = await establishSession(email);
+      if (ok) { hideAuthOverlay(); boot(); }
+    } finally {
+      this.disabled = false;
+    }
+  });
+
+  // Identity source priority: a real DronaHQ container session (see
+  // dronahq-sso.js) when this is running inside the DronaHQ app shell --
+  // its profile email is established, verified SSO identity, so sign-in
+  // there is fully automatic, no form. Standalone/local/dev use (no
+  // DronaHQ container present) falls back to the plain email prompt above,
+  // same email-only trust ceiling already documented in backend/auth.py.
+  // dronahq-sso.js waits up to its own 15000ms for the container's
+  // "deviceready" event before giving up and logging standalone mode (see
+  // its TIMEOUT_MS) -- this has to wait at least that long too, or a slow
+  // container cold start gets misread as "not in the container" and shows
+  // the manual sign-in prompt before the real SSO identity ever arrives.
+  var DRONAHQ_WAIT_MS = 15500;
+  function waitForDronaHqUser() {
+    return new Promise(function (resolve) {
+      if (window.L0L1_USER && window.L0L1_USER.email) { resolve(window.L0L1_USER); return; }
+      var done = false;
+      var timer = setTimeout(function () {
+        if (done) return;
+        done = true;
+        document.removeEventListener("l0l1:sso-ready", onReady);
+        resolve(null);
+      }, DRONAHQ_WAIT_MS);
+      function onReady(e) {
+        if (done) return;
+        done = true;
+        clearTimeout(timer);
+        resolve(e.detail || window.L0L1_USER || null);
+      }
+      document.addEventListener("l0l1:sso-ready", onReady, { once: true });
+    });
+  }
+
+  (async function bootstrapAuth() {
+    showAuthOverlay();
+    var profile = await waitForDronaHqUser();
+    if (profile && profile.email) {
+      try {
+        var ok = await establishSession(profile.email, profile.name);
+        if (ok) { hideAuthOverlay(); boot(); return; }
+        return; // pending screen already shown by establishSession
+      } catch (err) {
+        showLocalSignIn("Automatic sign-in failed (" + (err.message || "unknown error") + ") -- sign in manually.");
+        return;
+      }
+    }
+    showLocalSignIn();
+  })();
 })();

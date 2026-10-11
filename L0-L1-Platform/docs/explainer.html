@@ -1,0 +1,466 @@
+<title>L0/L1 Platform Explained</title>
+<style>
+  /* Layout: single-column reference doc, sticky section rail on wide screens, stacked on phone */
+  :root {
+    --bg: #f6f4ef;
+    --surface: #ffffff;
+    --ink: #1f2420;
+    --ink-soft: #5b6560;
+    --rule: #ddd7c9;
+    --accent: #2f5d4f;
+    --accent-soft: #e4ede9;
+    --good: #2f6b3f;
+    --warn: #9a6a12;
+    --bad: #a1402f;
+    --font-display: 'Fraunces', Georgia, 'Times New Roman', serif;
+    --font-body: 'Source Sans 3', -apple-system, Segoe UI, sans-serif;
+    --font-mono: 'IBM Plex Mono', 'SFMono-Regular', Menlo, monospace;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --bg: #15181a;
+      --surface: #1d2124;
+      --ink: #eceae4;
+      --ink-soft: #a3ac9f;
+      --rule: #343a34;
+      --accent: #7fb79e;
+      --accent-soft: #223029;
+      --good: #6fbf7f;
+      --warn: #d9a441;
+      --bad: #e18672;
+      color-scheme: dark;
+    }
+  }
+  :root[data-theme="dark"] {
+    --bg: #15181a;
+    --surface: #1d2124;
+    --ink: #eceae4;
+    --ink-soft: #a3ac9f;
+    --rule: #343a34;
+    --accent: #7fb79e;
+    --accent-soft: #223029;
+    --good: #6fbf7f;
+    --warn: #d9a441;
+    --bad: #e18672;
+    color-scheme: dark;
+  }
+
+  * { box-sizing: border-box; }
+  body {
+    background: var(--bg);
+    color: var(--ink);
+    font-family: var(--font-body);
+    font-size: 16px;
+    line-height: 1.6;
+    padding: 0 16px;
+    padding-block: 28px 64px;
+  }
+  .wrap { max-width: 760px; margin: 0 auto; }
+
+  .masthead {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    padding-bottom: 22px;
+    border-bottom: 2px solid var(--ink);
+    margin-bottom: 28px;
+  }
+  .masthead .eyebrow {
+    font-family: var(--font-mono);
+    font-size: 12px;
+    letter-spacing: 0.12em;
+    text-transform: uppercase;
+    color: var(--accent);
+  }
+  .masthead h1 {
+    font-family: var(--font-display);
+    font-weight: 600;
+    font-size: clamp(28px, 5vw, 38px);
+    margin: 0;
+    text-wrap: balance;
+  }
+  .masthead p {
+    color: var(--ink-soft);
+    margin: 0;
+    max-width: 58ch;
+  }
+
+  nav.toc {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px 14px;
+    margin-bottom: 40px;
+    font-family: var(--font-mono);
+    font-size: 12.5px;
+  }
+  nav.toc a {
+    color: var(--ink-soft);
+    text-decoration: none;
+    border-bottom: 1px dotted var(--rule);
+  }
+  nav.toc a:hover { color: var(--accent); }
+
+  section { margin-bottom: 46px; }
+  section h2 {
+    font-family: var(--font-display);
+    font-size: 23px;
+    font-weight: 600;
+    margin: 0 0 4px;
+    text-wrap: balance;
+  }
+  section .kicker {
+    font-family: var(--font-mono);
+    font-size: 11.5px;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    color: var(--accent);
+    display: block;
+    margin-bottom: 6px;
+  }
+  section > p { margin: 10px 0; max-width: 64ch; }
+  section > p.lede {
+    font-size: 17px;
+    color: var(--ink-soft);
+  }
+
+  strong { color: var(--ink); font-weight: 650; }
+  code {
+    font-family: var(--font-mono);
+    font-size: 0.88em;
+    background: var(--accent-soft);
+    color: var(--accent);
+    padding: 1px 5px;
+    border-radius: 4px;
+  }
+
+  /* L0 -> L1 flow */
+  .flow {
+    display: flex;
+    align-items: stretch;
+    gap: 10px;
+    margin: 18px 0 8px;
+    flex-wrap: wrap;
+  }
+  .flow .stage {
+    flex: 1 1 220px;
+    min-width: 0;
+    background: var(--surface);
+    border: 1px solid var(--rule);
+    border-radius: 10px;
+    padding: 14px 16px;
+  }
+  .flow .stage .tag {
+    font-family: var(--font-mono);
+    font-size: 11px;
+    letter-spacing: 0.08em;
+    color: var(--accent);
+    text-transform: uppercase;
+  }
+  .flow .stage h3 {
+    font-family: var(--font-display);
+    font-size: 18px;
+    margin: 4px 0 6px;
+  }
+  .flow .stage p { margin: 0; font-size: 14px; color: var(--ink-soft); }
+  .flow .arrow {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    color: var(--ink-soft);
+    font-size: 20px;
+    padding: 0 2px;
+    flex: 0 0 auto;
+  }
+  @media (max-width: 560px) {
+    .flow { flex-direction: column; }
+    .flow .arrow { transform: rotate(90deg); padding: 4px 0; }
+  }
+
+  /* role cards */
+  .roles {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+    gap: 12px;
+    margin-top: 16px;
+  }
+  .role-card {
+    background: var(--surface);
+    border: 1px solid var(--rule);
+    border-radius: 10px;
+    padding: 16px;
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+  }
+  .role-card .name {
+    font-family: var(--font-display);
+    font-size: 19px;
+    font-weight: 600;
+  }
+  .role-card .does { font-size: 14px; color: var(--ink-soft); flex: 1; }
+  .role-card .cant {
+    font-size: 12.5px;
+    color: var(--ink-soft);
+    border-top: 1px dashed var(--rule);
+    padding-top: 8px;
+  }
+  .pill {
+    display: inline-flex;
+    align-self: flex-start;
+    font-family: var(--font-mono);
+    font-size: 10.5px;
+    letter-spacing: 0.06em;
+    text-transform: uppercase;
+    padding: 3px 9px;
+    border-radius: 999px;
+    background: var(--accent-soft);
+    color: var(--accent);
+  }
+
+  /* status pipeline */
+  .pipeline {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px;
+    margin: 16px 0;
+    font-family: var(--font-mono);
+    font-size: 13px;
+  }
+  .pipeline .step {
+    background: var(--surface);
+    border: 1px solid var(--rule);
+    border-radius: 7px;
+    padding: 7px 12px;
+    white-space: nowrap;
+  }
+  .pipeline .step.rejected { color: var(--bad); border-color: var(--bad); }
+  .pipeline .step.approved { color: var(--good); border-color: var(--good); }
+  .pipeline .sep { align-self: center; color: var(--ink-soft); }
+
+  /* deadline chips */
+  .chips { display: flex; flex-wrap: wrap; gap: 8px; margin: 14px 0; }
+  .chip {
+    font-family: var(--font-mono);
+    font-size: 12.5px;
+    padding: 5px 11px;
+    border-radius: 999px;
+    border: 1px solid var(--rule);
+    color: var(--ink-soft);
+  }
+  .chip.early { color: var(--good); border-color: var(--good); }
+  .chip.late { color: var(--bad); border-color: var(--bad); }
+  .chip.on-time { color: var(--accent); border-color: var(--accent); }
+
+  /* stat row */
+  .stats {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(130px, 1fr));
+    gap: 10px;
+    margin: 18px 0;
+  }
+  .stat {
+    background: var(--surface);
+    border: 1px solid var(--rule);
+    border-radius: 10px;
+    padding: 12px 14px;
+  }
+  .stat .n {
+    font-family: var(--font-display);
+    font-size: 26px;
+    font-weight: 600;
+    font-variant-numeric: tabular-nums;
+    color: var(--accent);
+    display: block;
+  }
+  .stat .l {
+    font-size: 12px;
+    color: var(--ink-soft);
+  }
+
+  ul.feature-list { margin: 12px 0; padding-left: 0; list-style: none; }
+  ul.feature-list li {
+    padding: 10px 0;
+    border-top: 1px solid var(--rule);
+    display: flex;
+    gap: 12px;
+    align-items: baseline;
+  }
+  ul.feature-list li:first-child { border-top: none; }
+  ul.feature-list .label {
+    font-family: var(--font-mono);
+    font-size: 11.5px;
+    letter-spacing: 0.04em;
+    color: var(--accent);
+    flex: 0 0 110px;
+    text-transform: uppercase;
+  }
+  ul.feature-list .text { flex: 1; min-width: 0; font-size: 14.5px; color: var(--ink-soft); }
+
+  .callout {
+    background: var(--accent-soft);
+    border-radius: 10px;
+    padding: 14px 16px;
+    font-size: 14px;
+    color: var(--ink);
+    margin: 14px 0;
+  }
+  .callout .kicker { color: var(--accent); }
+
+  footer {
+    margin-top: 56px;
+    padding-top: 18px;
+    border-top: 1px solid var(--rule);
+    font-size: 12.5px;
+    color: var(--ink-soft);
+    font-family: var(--font-mono);
+  }
+</style>
+
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,500;9..144,600&family=Source+Sans+3:wght@400;600&family=IBM+Plex+Mono:wght@400;500&display=swap" rel="stylesheet">
+
+<div class="wrap">
+
+  <div class="masthead">
+    <span class="eyebrow">Algihaz Holding &middot; Internal reference</span>
+    <h1>The L0/L1 Platform, explained</h1>
+    <p>What it's for, who does what in it, and how a deliverable moves from "not started" to "done" &mdash; written for anyone who needs the picture without reading the code.</p>
+  </div>
+
+  <nav class="toc">
+    <a href="#problem">The problem</a>
+    <a href="#stages">L0 &rarr; L1</a>
+    <a href="#catalog">The checklist</a>
+    <a href="#roles">Roles</a>
+    <a href="#workflow">Workflow</a>
+    <a href="#dates">Due dates</a>
+    <a href="#dashboards">Dashboards &amp; scoring</a>
+    <a href="#other">Notifications &amp; GAHIZ</a>
+    <a href="#limits">Pilot limits</a>
+  </nav>
+
+  <section id="problem">
+    <span class="kicker">Why this exists</span>
+    <h2>Every tender has a paper trail. This stops it getting lost.</h2>
+    <p class="lede">Bidding for and running a project at Algihaz means producing dozens of specific documents &mdash; compliance certificates, quality plans, risk registers, performance reports &mdash; each with its own deadline and its own responsible person. Before this platform, tracking that fell to spreadsheets and memory.</p>
+    <p>The platform turns that paper trail into one live checklist per tender: what's due, who owns it, whether it's late, and who needs to sign off. Nothing on the list disappears into an inbox.</p>
+  </section>
+
+  <section id="stages">
+    <span class="kicker">Two phases, one record</span>
+    <h2>L0 is the bid. L1 is the job you won.</h2>
+    <p>Every tender starts as an <strong>L0</strong> &mdash; the bidding phase, before Algihaz has won anything. If the bid is awarded, that same tender becomes an <strong>L1</strong>: the actual project, now under contract. It isn't a new record with a new number; it's the same tender one stage further along, so its history carries forward.</p>
+    <div class="flow">
+      <div class="stage">
+        <span class="tag">L0 &middot; Bidding</span>
+        <h3>Tender</h3>
+        <p>Runs from the announcement to the bid submission date (BSD). Deliverables here are compliance docs, pricing, technical proposals &mdash; tight deadlines, often measured in days.</p>
+      </div>
+      <div class="arrow">&rarr;</div>
+      <div class="stage">
+        <span class="tag">L1 &middot; Awarded</span>
+        <h3>Project</h3>
+        <p>Starts once the contract is signed. Deliverables shift to execution: quality governance, reporting cycles, project closeout &mdash; deadlines measured in weeks and months.</p>
+      </div>
+    </div>
+    <p>Both stages share the same key dates (announcement, site visit, pre-bid meeting) &mdash; L1's deadlines are calculated from the same anchor points L0 used, so the schedule never has to be re-entered by hand.</p>
+  </section>
+
+  <section id="catalog">
+    <span class="kicker">The checklist itself</span>
+    <h2>A standing catalog of what's actually required</h2>
+    <p>Rather than someone deciding fresh each time what documents a tender needs, there's a pre-built catalog &mdash; maintained by an Admin &mdash; of every deliverable type Algihaz might need to produce, organized by stage.</p>
+    <div class="stats">
+      <div class="stat"><span class="n">329</span><span class="l">catalog items total</span></div>
+      <div class="stat"><span class="n">40</span><span class="l">departments</span></div>
+      <div class="stat"><span class="n">3</span><span class="l">catalogs &mdash; L0 domestic, L0 international, L1</span></div>
+    </div>
+    <p>When a new tender is created, the platform instantiates the right subset of that catalog automatically &mdash; a domestic L0 gets a different, tighter list than an international one, and an L1 gets its own set entirely.</p>
+  </section>
+
+  <section id="roles">
+    <span class="kicker">Who does what</span>
+    <h2>Three roles, three jobs</h2>
+    <p>Every person acting in the platform is one of three roles for the deliverables they're involved in:</p>
+    <div class="roles">
+      <div class="role-card">
+        <span class="pill">Sees everything</span>
+        <span class="name">Admin</span>
+        <p class="does">Full run of the platform &mdash; creates tenders/projects, manages the deliverable catalog, assigns Owners and SMEs, and can act on any item regardless of who it's assigned to.</p>
+        <p class="cant">No restriction &mdash; the one role that bypasses every assignment check.</p>
+      </div>
+      <div class="role-card">
+        <span class="pill">Does the work</span>
+        <span class="name">Owner</span>
+        <p class="does">The person responsible for actually producing a deliverable &mdash; uploads the document, marks it complete, and resubmits if it's sent back.</p>
+        <p class="cant">Can only act on deliverables they're personally assigned as Owner on.</p>
+      </div>
+      <div class="role-card">
+        <span class="pill">Signs off</span>
+        <span class="name">SME</span>
+        <p class="does">Subject Matter Expert &mdash; reviews what the Owner submitted and approves or rejects it. A deliverable can have more than one SME; any one of them can act.</p>
+        <p class="cant">Can only review deliverables they're personally assigned as SME on &mdash; and can't approve their own work.</p>
+      </div>
+    </div>
+    <p>A deliverable can list several Owners or several SMEs &mdash; any one of them acting is enough, which matters when the responsible person is out.</p>
+    <div class="callout">
+      <span class="kicker">Who can see what</span>
+      Around 95% of a tender is visible to everyone in the platform by design &mdash; that's the whole point, sharing information instead of it living in one person's inbox. A handful of genuinely sensitive fields (the bid value, for one) are restricted to specific people, and anyone else can request access, which an Admin approves or rejects.
+    </div>
+  </section>
+
+  <section id="workflow">
+    <span class="kicker">Life of one deliverable</span>
+    <h2>Not started &rarr; done, with one checkpoint</h2>
+    <p>Before any of this starts, the Bid Manager reviews the full catalog for the new tender and marks which items actually apply &mdash; of the roughly 70 that could, a typical tender only needs 40&ndash;50. Nothing gets assigned to an Owner until this triage is done.</p>
+    <div class="pipeline">
+      <div class="step">No progress</div><div class="sep">&rarr;</div>
+      <div class="step">In progress</div><div class="sep">&rarr;</div>
+      <div class="step">Pending SME review</div><div class="sep">&rarr;</div>
+      <div class="step approved">Approved</div>
+    </div>
+    <p>If an SME sends work back, it returns to <strong>In progress</strong> as <span style="color:var(--bad)">Rejected</span> rather than disappearing &mdash; the Owner resubmits and it re-enters review. This status (how far along the work is) is tracked separately from the deadline (whether it's on time) &mdash; a deliverable can be fully approved and still have landed late, and the platform records both facts rather than collapsing them into one.</p>
+    <div class="chips">
+      <span class="chip early">Early</span>
+      <span class="chip on-time">On time</span>
+      <span class="chip">Not due yet</span>
+      <span class="chip late">Late</span>
+    </div>
+  </section>
+
+  <section id="dates">
+    <span class="kicker">No one types in a due date</span>
+    <h2>Deadlines calculate themselves</h2>
+    <p>Each catalog item carries its own formula &mdash; so many days before the bid submission date, so many days after the announcement, or chained off <em>another</em> deliverable's own date. Enter the tender's key dates once, and every one of its ~hundred deliverable deadlines resolves on its own.</p>
+    <p>A handful of milestones (<code>M1</code>&ndash;<code>M6</code>) aren't separate checkpoints &mdash; a milestone simply <em>is</em> a specific catalog item; reaching it means that item was approved. On L1 specifically, milestones don't just track progress, they unlock it: only around 10% of deliverables are open at the start, and reaching each milestone opens the next batch &mdash; roughly half of all L1 deliverables wait on just one of them, the early project plan. And if something upstream runs late, everything chained off it slides forward automatically rather than quietly going overdue against a date that's no longer realistic.</p>
+  </section>
+
+  <section id="dashboards">
+    <span class="kicker">Seeing the whole picture</span>
+    <h2>Dashboards, performance, and a running score</h2>
+    <p>Beyond the per-tender checklist, the platform rolls everything up: how many L0s and L1s are active, how many items are overdue right now, and how each department is performing against its own deliverables.</p>
+    <p>Once something is approved, it earns a score from <strong>1.1</strong> (early) down to <strong>0.0</strong> (very late) &mdash; on-time submissions get a small grace window rather than being penalized for landing on the deadline itself. That feeds a department and individual performance ranking, so "who's actually keeping up" is a number, not an impression.</p>
+  </section>
+
+  <section id="other">
+    <span class="kicker">The rest of the system</span>
+    <ul class="feature-list">
+      <li><span class="label">Notifications</span><span class="text">In-app announcements fire on every meaningful event &mdash; assigned to you, sent for review, approaching due, overdue &mdash; and can go out as real email once the organization's Outlook is connected. Not assigned to something but still want updates? Follow it, and you'll get notified anyway.</span></li>
+      <li><span class="label">GAHIZ</span><span class="text">A built-in AI assistant Owners and SMEs can ask questions &mdash; "what's still open on this tender," "why is this item due when it is" &mdash; answered from the platform's own data, not a generic chatbot.</span></li>
+      <li><span class="label">Files</span><span class="text">Every upload can live in Algihaz's own OneDrive once connected, instead of the platform's own storage &mdash; the same document trail the rest of the business already uses.</span></li>
+      <li><span class="label">Escalation</span><span class="text">An overdue item doesn't just sit there &mdash; reminders step up automatically at 2, 7, and 14 days late if no one's acted.</span></li>
+    </ul>
+  </section>
+
+  <section id="limits">
+    <span class="kicker">Honest about where this is today</span>
+    <h2>Still a pilot in one specific way</h2>
+    <p>There's no real login yet. Who you're acting as is a self-reported email typed into the app (or, inside the Algihaz SSO container, filled in automatically) &mdash; the three roles above are enforced by checking that email against the assignment list, not by a verified identity. That's adequate for a pilot; before this goes company-wide, the same checks need enforcing with real authentication behind them, not just the honor system this runs on today.</p>
+  </section>
+
+  <footer>
+    L0/L1 Platform &middot; Algihaz Holding &middot; reference doc, not the engineering architecture &mdash; see <code>docs/ARCHITECTURE.md</code> for that.
+  </footer>
+
+</div>

@@ -358,6 +358,35 @@
   .theme-btn { border: 1px solid var(--line); background: var(--surface); color: var(--ink-700); border-radius: var(--radius-sm); padding: 8px 12px; cursor: pointer; font-size: 12px; font-weight: 600; }
   .avatar { width: 26px; height: 26px; border-radius: 50%; background: linear-gradient(135deg, var(--purple-1), var(--purple-2)); color: #fff; display: flex; align-items: center; justify-content: center; font-size: 11px; font-weight: 700; }
 
+  /* Session bootstrap overlay (app.js's establishSession/showWaitingForRole) --
+     covers the whole shell until a real, server-verified identity exists. */
+  .auth-overlay {
+    position: fixed; inset: 0; z-index: 9999; background: var(--surface-sunken);
+    display: flex; align-items: center; justify-content: center;
+  }
+  .auth-overlay[hidden] { display: none; }
+  .auth-card {
+    background: var(--surface); border: 1px solid var(--line); border-radius: var(--radius-md, 12px);
+    padding: 36px 32px; width: 360px; max-width: calc(100vw - 32px); text-align: center; box-shadow: 0 10px 40px rgba(0,0,0,.12);
+  }
+  .auth-card h2 { margin: 0 0 8px; font-size: 18px; color: var(--ink-900, var(--ink-700)); }
+  .auth-card p { margin: 0 0 16px; font-size: 13px; color: var(--ink-700); line-height: 1.5; }
+  .auth-spinner {
+    width: 32px; height: 32px; margin: 0 auto 16px; border-radius: 50%;
+    border: 3px solid var(--line); border-top-color: var(--algihaz-red); animation: auth-spin 0.8s linear infinite;
+  }
+  @keyframes auth-spin { to { transform: rotate(360deg); } }
+  .auth-card input[type="email"] {
+    width: 100%; box-sizing: border-box; border: 1px solid var(--line); border-radius: var(--radius-sm);
+    padding: 9px 12px; font-size: 13px; margin-bottom: 12px; background: var(--surface-sunken); color: var(--ink-700);
+  }
+  .btn-primary {
+    width: 100%; border: none; border-radius: var(--radius-sm); background: var(--algihaz-red); color: #fff;
+    padding: 10px 14px; font-size: 13px; font-weight: 700; cursor: pointer;
+  }
+  .btn-primary:hover { background: var(--algihaz-red-dark); }
+  .auth-error { color: var(--algihaz-red); font-size: 12px; margin-top: 10px; margin-bottom: 0; }
+
   .view { padding: 30px 34px 68px; max-width: 1280px; }
   /* The Dashboard is the default landing view -- on a wide monitor the
      1280px cap left a large dead strip down the right side instead of
@@ -2834,7 +2863,7 @@
     .rank-row { grid-template-columns: 22px 100px 1fr 50px; }
     .rank-row .rank-val { display: none; }
     .gantt-filter-row, .top-meta { gap: 8px; }
-    .role-select, #actingEmailQuickPick { font-size: 11.5px; padding: 6px 8px; }
+    .role-select { font-size: 11.5px; padding: 6px 8px; }
     .modal-card, .tour-card { max-width: calc(100vw - 24px); }
     /* Item 154: these action rows use flex:none/flex-shrink:0 on purpose
        on wide screens (buttons must never get squashed illegibly). A flex

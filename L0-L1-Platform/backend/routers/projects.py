@@ -1,8 +1,9 @@
 from datetime import date, datetime
 from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, joinedload
 
 from .. import models, schemas, rules, announcements
+from ..auth import CurrentActor, get_current_actor, require_admin
 from ..database import get_db
 from ..providers.storage import get_storage_provider, sanitize_segment
 
@@ -185,14 +186,28 @@ def _instantiate_deliverables(db: Session, project: models.Project):
     db.commit()
 
     # Auto-assign notification: one summary per distinct owner, per Modifications doc.
-    subs = db.query(models.DeliverableSubmission).filter(models.DeliverableSubmission.project_id == project.id).all()
+    # [load test finding, 2026-09-22]: this used to re-scan the full `subs`
+    # list once per department (`sum(1 for s in subs if ...)` inside the
+    # `for dept in new_depts` loop) with `.definition` lazy-loaded on each
+    # access -- O(departments x submissions) with an N+1 query on top.
+    # Profiling a single L0 creation (114 items, ~20 departments) showed
+    # this one block accounting for ~70% of the whole call's time. Eager-
+    # loading `definition` and counting in one pass fixes both at once.
+    subs = (
+        db.query(models.DeliverableSubmission)
+        .options(joinedload(models.DeliverableSubmission.definition))
+        .filter(models.DeliverableSubmission.project_id == project.id)
+        .all()
+    )
     by_owner: dict[str, int] = {}
+    count_by_dept_id: dict[int, int] = {}
     for s in subs:
         if s.owner_email:
             by_owner[s.owner_email] = by_owner.get(s.owner_email, 0) + 1
+        count_by_dept_id[s.definition.department_id] = count_by_dept_id.get(s.definition.department_id, 0) + 1
     for dept in new_depts:
         if dept.focal_point_email:
-            count = sum(1 for s in subs if s.definition.department_id == dept.id)
+            count = count_by_dept_id.get(dept.id, 0)
             if count:
                 announcements.owner_assigned(db, project, dept.focal_point_email, dept.name, count)
 
@@ -237,7 +252,7 @@ def _provision_and_instantiate(db: Session, project: models.Project):
 
 @router.get("", response_model=list[schemas.ProjectOut])
 def list_projects(stage: str | None = None, status: str | None = None, archived: bool | None = None,
-                   db: Session = Depends(get_db)):
+                   db: Session = Depends(get_db), current: CurrentActor = Depends(get_current_actor)):
     """`archived` left unset (the default, every existing caller) excludes
     archived projects -- the main L0/L1 tables, every dropdown/picker, and
     global search all silently stop offering an archived project this way,
@@ -291,7 +306,8 @@ def _active_bid_manager_emails(db: Session) -> set[str]:
 
 
 @router.post("/l0", response_model=schemas.ProjectOut)
-def create_l0_project(payload: schemas.ProjectCreateL0, db: Session = Depends(get_db)):
+def create_l0_project(payload: schemas.ProjectCreateL0, db: Session = Depends(get_db),
+                       current: CurrentActor = Depends(require_admin)):
     if (payload.bid_manager or "").lower() not in _active_bid_manager_emails(db):
         raise HTTPException(400, "Bid Manager must be selected from the directory")
     # [L0 International]: Country replaces the KSA Region checkboxes for
@@ -397,7 +413,8 @@ def _auto_complete_2_3(db: Session, project: models.Project) -> None:
 
 
 @router.post("/l1", response_model=schemas.ProjectOut)
-def create_l1_project(payload: schemas.ProjectCreateL1, db: Session = Depends(get_db)):
+def create_l1_project(payload: schemas.ProjectCreateL1, db: Session = Depends(get_db),
+                       current: CurrentActor = Depends(require_admin)):
     l0 = db.get(models.Project, payload.l0_source_id)
     if not l0 or l0.stage != models.Stage.L0:
         raise HTTPException(404, "L0 tender not found")
@@ -451,7 +468,8 @@ def create_l1_project(payload: schemas.ProjectCreateL1, db: Session = Depends(ge
 
 
 @router.get("/{project_id}/tender-documents")
-def list_tender_documents(project_id: int, db: Session = Depends(get_db)):
+def list_tender_documents(project_id: int, db: Session = Depends(get_db),
+                           current: CurrentActor = Depends(get_current_actor)):
     project = db.get(models.Project, project_id)
     if not project:
         raise HTTPException(404, "Project not found")
@@ -476,13 +494,13 @@ async def upload_tender_document(
     # own structure carries into the platform instead of flattening; a
     # plain file upload leaves this blank and the file lands at the root.
     relative_path: str = Form(""),
-    actor_name: str = Form("Admin"), actor_role: str = Form("Admin"), actor_email: str = Form(""),
     db: Session = Depends(get_db),
+    current: CurrentActor = Depends(get_current_actor),
 ):
     project = db.get(models.Project, project_id)
     if not project:
         raise HTTPException(404, "Project not found")
-    if not rules.can_act(actor_role, actor_email, [project.bid_manager, project.project_manager]):
+    if not rules.can_act(current.role, current.email, [project.bid_manager, project.project_manager]):
         raise HTTPException(403, "Only the assigned Bid Manager/Project Manager or an Admin can add tender documents")
     content = await file.read()
     rel_parts = [sanitize_segment(p) for p in (relative_path or "").split("/") if p.strip()]
@@ -492,7 +510,7 @@ async def upload_tender_document(
     folder = f"{base_folder}/{folder_path}" if folder_path else base_folder
     file_ref = _storage.upload_file(folder, file_name, content)
     doc = models.TenderDocument(
-        project_id=project.id, file_name=file_name, file_ref=file_ref, folder_path=folder_path, uploaded_by=actor_name,
+        project_id=project.id, file_name=file_name, file_ref=file_ref, folder_path=folder_path, uploaded_by=current.name,
     )
     db.add(doc)
     db.commit()
@@ -502,7 +520,8 @@ async def upload_tender_document(
 
 
 @router.delete("/{project_id}/tender-documents/folder")
-def delete_tender_document_folder(project_id: int, path: str, actor_role: str = "Viewer", actor_email: str = "", db: Session = Depends(get_db)):
+def delete_tender_document_folder(project_id: int, path: str, db: Session = Depends(get_db),
+                                   current: CurrentActor = Depends(require_admin)):
     """Removes an entire subfolder (and everything nested under it) in one
     call -- every doc whose folder_path is exactly `path` or starts with
     `path/`. Declared before the /{doc_id} route below on purpose: FastAPI
@@ -513,8 +532,6 @@ def delete_tender_document_folder(project_id: int, path: str, actor_role: str = 
     project = db.get(models.Project, project_id)
     if not project:
         raise HTTPException(404, "Project not found")
-    if actor_role != "Admin":
-        raise HTTPException(403, "Only an Admin can delete files/folders")
     path = path.strip("/")
     if not path:
         raise HTTPException(400, "No folder specified")
@@ -529,22 +546,22 @@ def delete_tender_document_folder(project_id: int, path: str, actor_role: str = 
 
 
 @router.delete("/{project_id}/tender-documents/{doc_id}")
-def delete_tender_document(project_id: int, doc_id: int, actor_role: str = "Viewer", actor_email: str = "", db: Session = Depends(get_db)):
+def delete_tender_document(project_id: int, doc_id: int, db: Session = Depends(get_db),
+                            current: CurrentActor = Depends(require_admin)):
     project = db.get(models.Project, project_id)
     if not project:
         raise HTTPException(404, "Project not found")
     doc = db.get(models.TenderDocument, doc_id)
     if not doc or doc.project_id != project_id:
         raise HTTPException(404, "Document not found")
-    if actor_role != "Admin":
-        raise HTTPException(403, "Only an Admin can delete files/folders")
     db.delete(doc)
     db.commit()
     return {"status": "ok"}
 
 
 @router.delete("/{project_id}")
-def delete_project(project_id: int, actor_role: str = "Viewer", db: Session = Depends(get_db)):
+def delete_project(project_id: int, db: Session = Depends(get_db),
+                    current: CurrentActor = Depends(require_admin)):
     """Removes a project and everything under it — mainly for cleaning up a
     mistaken or test entry. Cascades cover submissions and workflow history
     on their own; documents, followers, reassignment requests, due-date
@@ -564,8 +581,6 @@ def delete_project(project_id: int, actor_role: str = "Viewer", db: Session = De
     items themselves are deleted (it's nullable, but still a real FK that
     would otherwise dangle for the instant between the two deletes).
     """
-    if actor_role != "Admin":
-        raise HTTPException(403, "Only an Admin can delete a project")
     project = db.get(models.Project, project_id)
     if not project:
         raise HTTPException(404, "Project not found")
@@ -594,7 +609,7 @@ def delete_project(project_id: int, actor_role: str = "Viewer", db: Session = De
 
 
 @router.get("/bm-triage-status")
-def get_bm_triage_status(actor_role: str = "Viewer", actor_email: str = "", db: Session = Depends(get_db)):
+def get_bm_triage_status(db: Session = Depends(get_db), current: CurrentActor = Depends(get_current_actor)):
     """Admin overview (item 79) of where every L0 tender's BM triage stands:
     done, still pending, or pending-with-a-reminder-already-sent. Item 110:
     a Bid Manager (anyone acting as their own roster email, not just Admin)
@@ -606,15 +621,12 @@ def get_bm_triage_status(actor_role: str = "Viewer", actor_email: str = "", db: 
     project_id) the same way /follow-up once broke against /{submission_id}
     in deliverables.py. Literal routes always go first.
     """
-    actor_email = actor_email.strip().lower()
-    if actor_role != "Admin" and not actor_email:
-        raise HTTPException(403, "Only an Admin, or a Bid Manager viewing their own tenders, can view BM triage status")
     q = db.query(models.Project).filter(
         models.Project.stage == models.Stage.L0, models.Project.status == models.ProjectStatus.IN_PROGRESS,
         models.Project.archived.is_not(True),
     )
-    if actor_role != "Admin":
-        q = q.filter(models.Project.bid_manager.ilike(actor_email))
+    if current.role != "Admin":
+        q = q.filter(models.Project.bid_manager.ilike(current.email))
     projects = q.order_by(models.Project.created_at.desc()).all()
     out = []
     for p in projects:
@@ -636,10 +648,10 @@ def get_bm_triage_status(actor_role: str = "Viewer", actor_email: str = "", db: 
     return out
 
 
-def _can_view_bid_value(db: Session, project: models.Project, actor_role: str, actor_email: str) -> bool:
-    if rules.can_act(actor_role, actor_email, project.bid_manager):
+def _can_view_bid_value(db: Session, project: models.Project, current: CurrentActor) -> bool:
+    if rules.can_act(current.role, current.email, project.bid_manager):
         return True
-    email = (actor_email or "").strip().lower()
+    email = (current.email or "").strip().lower()
     if not email:
         return False
     return db.query(models.BidValueAccessRequest).filter(
@@ -655,12 +667,15 @@ def _can_view_bid_value(db: Session, project: models.Project, actor_role: str, a
 # (non-numeric) project_id and 422 before ever reaching the real handler.
 # Same reasoning as deliverables.py's reassignment-requests/due-date-requests.
 @router.get("/bid-value-requests")
-def list_bid_value_requests(status: str = "pending", requested_by_email: str | None = None, db: Session = Depends(get_db)):
+def list_bid_value_requests(status: str = "pending", db: Session = Depends(get_db),
+                             current: CurrentActor = Depends(get_current_actor)):
     q = db.query(models.BidValueAccessRequest)
     if status:
         q = q.filter(models.BidValueAccessRequest.status == status)
-    if requested_by_email:
-        q = q.filter(models.BidValueAccessRequest.requested_by_email.ilike(requested_by_email.strip()))
+    if current.role != "Admin":
+        # Non-admins only ever see their own request history (the "My
+        # Requests" view) -- an admin sees everyone's, to decide them.
+        q = q.filter(models.BidValueAccessRequest.requested_by_email.ilike(current.email))
     reqs = q.order_by(models.BidValueAccessRequest.requested_at.desc()).all()
     return [
         {
@@ -673,14 +688,13 @@ def list_bid_value_requests(status: str = "pending", requested_by_email: str | N
 
 
 @router.post("/bid-value-requests/{request_id}/decide")
-def decide_bid_value_request(request_id: int, decision: schemas.BidValueAccessDecision, db: Session = Depends(get_db)):
+def decide_bid_value_request(request_id: int, decision: schemas.BidValueAccessDecision, db: Session = Depends(get_db),
+                              current: CurrentActor = Depends(require_admin)):
     req = db.get(models.BidValueAccessRequest, request_id)
     if not req:
         raise HTTPException(404, "Request not found")
     if req.status != "pending":
         raise HTTPException(400, "This request has already been decided")
-    if decision.actor_role != "Admin":
-        raise HTTPException(403, "Only an Admin can decide a Bid Value access request")
     req.status = "approved" if decision.approved else "rejected"
     req.decided_at = datetime.utcnow()
     db.commit()
@@ -689,18 +703,18 @@ def decide_bid_value_request(request_id: int, decision: schemas.BidValueAccessDe
 
 
 @router.get("/{project_id}/bid-value")
-def get_bid_value(project_id: int, actor_role: str = "Viewer", actor_email: str = "", db: Session = Depends(get_db)):
+def get_bid_value(project_id: int, db: Session = Depends(get_db), current: CurrentActor = Depends(get_current_actor)):
     project = db.get(models.Project, project_id)
     if not project:
         raise HTTPException(404, "Project not found")
-    can_edit = rules.can_act(actor_role, actor_email, project.bid_manager)
-    visible = can_edit or _can_view_bid_value(db, project, actor_role, actor_email)
+    can_edit = rules.can_act(current.role, current.email, project.bid_manager)
+    visible = can_edit or _can_view_bid_value(db, project, current)
     request_status = None
-    if not visible and actor_email:
+    if not visible:
         existing = (
             db.query(models.BidValueAccessRequest)
             .filter(models.BidValueAccessRequest.project_id == project_id,
-                    models.BidValueAccessRequest.requested_by_email.ilike(actor_email.strip()))
+                    models.BidValueAccessRequest.requested_by_email.ilike(current.email))
             .order_by(models.BidValueAccessRequest.requested_at.desc())
             .first()
         )
@@ -712,13 +726,14 @@ def get_bid_value(project_id: int, actor_role: str = "Viewer", actor_email: str 
 
 
 @router.patch("/{project_id}/bid-value", response_model=schemas.ProjectOut)
-def update_bid_value(project_id: int, payload: schemas.BidValueUpdate, db: Session = Depends(get_db)):
+def update_bid_value(project_id: int, payload: schemas.BidValueUpdate, db: Session = Depends(get_db),
+                      current: CurrentActor = Depends(get_current_actor)):
     project = db.get(models.Project, project_id)
     if not project:
         raise HTTPException(404, "Project not found")
     if project.stage != models.Stage.L1:
         raise HTTPException(400, "Bid Value only applies to L1 projects")
-    if not rules.can_act(payload.actor_role, payload.actor_email, project.bid_manager):
+    if not rules.can_act(current.role, current.email, project.bid_manager):
         raise HTTPException(403, f"Only {project.bid_manager or 'the assigned Bid Manager'} or an Admin can edit the Bid Value")
     project.bid_value = payload.bid_value
     db.commit()
@@ -727,14 +742,13 @@ def update_bid_value(project_id: int, payload: schemas.BidValueUpdate, db: Sessi
 
 
 @router.post("/{project_id}/bid-value/request-access")
-def request_bid_value_access(project_id: int, payload: schemas.BidValueAccessRequestCreate, db: Session = Depends(get_db)):
+def request_bid_value_access(project_id: int, db: Session = Depends(get_db),
+                              current: CurrentActor = Depends(get_current_actor)):
     project = db.get(models.Project, project_id)
     if not project:
         raise HTTPException(404, "Project not found")
-    email = payload.actor_email.strip()
-    if not email:
-        raise HTTPException(400, "Your email is required")
-    if _can_view_bid_value(db, project, "Viewer", email):
+    email = current.email
+    if _can_view_bid_value(db, project, current):
         raise HTTPException(400, "You already have access")
     existing = (
         db.query(models.BidValueAccessRequest)
@@ -746,16 +760,16 @@ def request_bid_value_access(project_id: int, payload: schemas.BidValueAccessReq
     if existing:
         raise HTTPException(400, "A request is already pending")
     req = models.BidValueAccessRequest(project_id=project_id, requested_by_email=email,
-                                        requested_by_name=payload.actor_name.strip() or None)
+                                        requested_by_name=current.name or None)
     db.add(req)
     db.commit()
     db.refresh(req)
-    announcements.bid_value_access_requested(db, project, rules.admin_emails(db), email, payload.actor_name.strip() or None)
+    announcements.bid_value_access_requested(db, project, rules.admin_emails(db), email, current.name or None)
     return {"status": "ok", "id": req.id}
 
 
 @router.get("/{project_id}", response_model=schemas.ProjectOut)
-def get_project(project_id: int, db: Session = Depends(get_db)):
+def get_project(project_id: int, db: Session = Depends(get_db), current: CurrentActor = Depends(get_current_actor)):
     project = db.get(models.Project, project_id)
     if not project:
         raise HTTPException(404, "Project not found")
@@ -771,13 +785,14 @@ def get_project(project_id: int, db: Session = Depends(get_db)):
 
 
 @router.post("/{project_id}/triage", response_model=schemas.ProjectOut)
-def triage_l0_project(project_id: int, payload: schemas.TriageRequest, db: Session = Depends(get_db)):
+def triage_l0_project(project_id: int, payload: schemas.TriageRequest, db: Session = Depends(get_db),
+                       current: CurrentActor = Depends(get_current_actor)):
     project = db.get(models.Project, project_id)
     if not project:
         raise HTTPException(404, "Project not found")
     if project.stage != models.Stage.L0:
         raise HTTPException(400, "Only L0 tenders go through BM triage")
-    if not rules.can_act(payload.actor_role, payload.actor_email, project.bid_manager):
+    if not rules.can_act(current.role, current.email, project.bid_manager):
         raise HTTPException(403, f"Only {project.bid_manager or 'the assigned Bid Manager'} or an Admin can triage this tender")
 
     subs_by_id = {
@@ -820,7 +835,8 @@ def triage_l0_project(project_id: int, payload: schemas.TriageRequest, db: Sessi
 
 
 @router.get("/{project_id}/triage-defaults")
-def get_triage_defaults(project_id: int, db: Session = Depends(get_db)):
+def get_triage_defaults(project_id: int, db: Session = Depends(get_db),
+                         current: CurrentActor = Depends(get_current_actor)):
     """The assigned Bid Manager's remembered applicable/not-required calls
     (item 79), keyed by item_no, for pre-selecting the triage screen.
     """
@@ -835,9 +851,8 @@ def get_triage_defaults(project_id: int, db: Session = Depends(get_db)):
 
 
 @router.post("/{project_id}/triage-reminder")
-def send_triage_reminder(project_id: int, actor_role: str = "Viewer", db: Session = Depends(get_db)):
-    if actor_role != "Admin":
-        raise HTTPException(403, "Only an Admin can send a triage reminder")
+def send_triage_reminder(project_id: int, db: Session = Depends(get_db),
+                          current: CurrentActor = Depends(require_admin)):
     project = db.get(models.Project, project_id)
     if not project:
         raise HTTPException(404, "Project not found")
@@ -862,7 +877,8 @@ def send_triage_reminder(project_id: int, actor_role: str = "Viewer", db: Sessio
 
 
 @router.patch("/{project_id}/project-manager", response_model=schemas.ProjectOut)
-def update_project_manager(project_id: int, payload: schemas.ProjectManagerUpdate, db: Session = Depends(get_db)):
+def update_project_manager(project_id: int, payload: schemas.ProjectManagerUpdate, db: Session = Depends(get_db),
+                            current: CurrentActor = Depends(get_current_actor)):
     project = db.get(models.Project, project_id)
     if not project:
         raise HTTPException(404, "Project not found")
@@ -876,13 +892,12 @@ def update_project_manager(project_id: int, payload: schemas.ProjectManagerUpdat
 
 
 @router.patch("/{project_id}/details", response_model=schemas.ProjectOut)
-def update_project_details(project_id: int, payload: schemas.ProjectDetailsUpdate, db: Session = Depends(get_db)):
-    if payload.actor_role != "Admin":
-        raise HTTPException(403, "Only an Admin can edit these fields")
+def update_project_details(project_id: int, payload: schemas.ProjectDetailsUpdate, db: Session = Depends(get_db),
+                            current: CurrentActor = Depends(require_admin)):
     project = db.get(models.Project, project_id)
     if not project:
         raise HTTPException(404, "Project not found")
-    data = payload.model_dump(exclude_unset=True, exclude={"actor_role"})
+    data = payload.model_dump(exclude_unset=True)
     if "bid_manager" in data:
         active_emails = _active_bid_manager_emails(db)
         if (data["bid_manager"] or "").lower() not in active_emails:
@@ -988,7 +1003,8 @@ def update_project_details(project_id: int, payload: schemas.ProjectDetailsUpdat
 
 
 @router.patch("/{project_id}/status", response_model=schemas.ProjectOut)
-def update_project_status(project_id: int, payload: schemas.ProjectStatusUpdate, db: Session = Depends(get_db)):
+def update_project_status(project_id: int, payload: schemas.ProjectStatusUpdate, db: Session = Depends(get_db),
+                           current: CurrentActor = Depends(require_admin)):
     project = db.get(models.Project, project_id)
     if not project:
         raise HTTPException(404, "Project not found")
@@ -1010,7 +1026,8 @@ def update_project_status(project_id: int, payload: schemas.ProjectStatusUpdate,
 
 
 @router.patch("/{project_id}/archive", response_model=schemas.ProjectOut)
-def archive_project(project_id: int, payload: schemas.ArchiveUpdate, db: Session = Depends(get_db)):
+def archive_project(project_id: int, payload: schemas.ArchiveUpdate, db: Session = Depends(get_db),
+                     current: CurrentActor = Depends(require_admin)):
     """[Archive]: an admin's reversible "hide this everywhere" toggle for a
     project added by mistake or no longer relevant -- unlike delete_project
     above, nothing is destroyed. An archived project simply stops being
@@ -1020,8 +1037,6 @@ def archive_project(project_id: int, payload: schemas.ArchiveUpdate, db: Session
     /{project_id}, PO Lifecycle, Milestones, Gantt-by-id) stays reachable
     by id either way, so an admin can review and un-archive it here.
     """
-    if payload.actor_role != "Admin":
-        raise HTTPException(403, "Only an Admin can archive or unarchive a project")
     project = db.get(models.Project, project_id)
     if not project:
         raise HTTPException(404, "Project not found")
@@ -1036,7 +1051,8 @@ def archive_project(project_id: int, payload: schemas.ArchiveUpdate, db: Session
 
 
 @router.get("/{project_id}/history")
-def get_project_history(project_id: int, db: Session = Depends(get_db)):
+def get_project_history(project_id: int, db: Session = Depends(get_db),
+                         current: CurrentActor = Depends(get_current_actor)):
     project = db.get(models.Project, project_id)
     if not project:
         raise HTTPException(404, "Project not found")
@@ -1061,7 +1077,7 @@ def get_project_history(project_id: int, db: Session = Depends(get_db)):
 
 @router.get("/{project_id}/deliverables", response_model=list[schemas.SubmissionOut])
 def get_deliverables(project_id: int, department: str | None = None, include_auto_completed: bool = False,
-                      db: Session = Depends(get_db)):
+                      db: Session = Depends(get_db), current: CurrentActor = Depends(get_current_actor)):
     project = db.get(models.Project, project_id)
     if not project:
         raise HTTPException(404, "Project not found")

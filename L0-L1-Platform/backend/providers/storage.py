@@ -70,9 +70,9 @@ class LocalStorageProvider(StorageProvider):
     def file_url(self, file_ref: str) -> str:
         # Relative by default (same-origin local dev / Render, where the
         # frontend is served by this same backend). Once the frontend moves
-        # to a different origin (S3/CloudFront, same split scm-ssot uses),
-        # PUBLIC_BASE_URL makes these links resolve back to this backend
-        # instead of against the frontend's own origin.
+        # to a different origin (S3/CloudFront, same split scm-ssot/QMS360
+        # use), PUBLIC_BASE_URL makes these links resolve back to this
+        # backend instead of against the frontend's own origin.
         base = os.getenv("PUBLIC_BASE_URL", "").rstrip("/")
         return f"{base}/local-files/{file_ref.replace(chr(92), '/')}"  # URL path needs "/" even on Windows, where file_ref carries native "\"
 

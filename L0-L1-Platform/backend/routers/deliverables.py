@@ -4,6 +4,7 @@ from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, Form
 from sqlalchemy.orm import Session, contains_eager
 
 from .. import models, schemas, announcements, rules
+from ..auth import CurrentActor, get_current_actor, require_admin
 from ..database import get_db
 from ..providers.storage import get_storage_provider, sanitize_segment
 from ..excel_parsing import parse_long_lead_workbook
@@ -44,13 +45,14 @@ def _sibling_submission(db: Session, sub: "models.DeliverableSubmission", item_n
 
 
 @router.get("")
-def list_all_deliverables(status: str | None = None, actor_email: str | None = None,
-                           actor_role: str | None = None, db: Session = Depends(get_db)):
+def list_all_deliverables(status: str | None = None, db: Session = Depends(get_db),
+                           current: CurrentActor = Depends(get_current_actor)):
     """Cross-project queue for the Assigned Deliverables page. Item 166: a
     non-admin only sees their own assigned deliverables (owner or SME on
     that item) -- previously actor_email was accepted but only used for the
     "following" flag, so every role saw the entire cross-project list.
     """
+    actor_email, actor_role = current.email, current.role
     active_projects = db.query(models.Project).filter(
         models.Project.status == models.ProjectStatus.IN_PROGRESS, models.Project.archived.is_not(True),
     ).all()
@@ -230,13 +232,12 @@ def list_all_deliverables(status: str | None = None, actor_email: str | None = N
 
 
 @router.post("/{submission_id}/follow")
-def toggle_follow(submission_id: int, payload: schemas.FollowRequest, db: Session = Depends(get_db)):
+def toggle_follow(submission_id: int, db: Session = Depends(get_db),
+                   current: CurrentActor = Depends(get_current_actor)):
     sub = db.get(models.DeliverableSubmission, submission_id)
     if not sub:
         raise HTTPException(404, "Deliverable not found")
-    email = payload.email.strip().lower()
-    if not email:
-        raise HTTPException(400, "Email is required to follow a deliverable")
+    email = current.email
     existing = db.query(models.Follower).filter_by(submission_id=submission_id, email=email).first()
     if existing:
         db.delete(existing)
@@ -248,9 +249,9 @@ def toggle_follow(submission_id: int, payload: schemas.FollowRequest, db: Sessio
 
 
 @router.post("/{submission_id}/upload")
-async def upload_deliverable(submission_id: int, file: UploadFile = File(...),
-                              actor_name: str = Form("Owner"), actor_role: str = Form("Owner"),
-                              actor_email: str = Form(""), db: Session = Depends(get_db)):
+async def upload_deliverable(submission_id: int, file: UploadFile = File(...), db: Session = Depends(get_db),
+                              current: CurrentActor = Depends(get_current_actor)):
+    actor_name, actor_role, actor_email = current.name, current.role, current.email
     sub = db.get(models.DeliverableSubmission, submission_id)
     if not sub:
         raise HTTPException(404, "Deliverable not found")
@@ -333,7 +334,8 @@ async def upload_deliverable(submission_id: int, file: UploadFile = File(...),
 
 
 @router.patch("/{submission_id}/po-selection")
-def update_po_selection(submission_id: int, payload: schemas.PoSelectionUpdate, db: Session = Depends(get_db)):
+def update_po_selection(submission_id: int, payload: schemas.PoSelectionUpdate, db: Session = Depends(get_db),
+                         current: CurrentActor = Depends(get_current_actor)):
     """[PO Lifecycle]: the owner's pre-approval scratch pad for 1.2/4.1/
     2.11/2.17 -- ticking a checklist box, editing a long-lead row, adding an
     S/C name. Nothing downstream (no PoLineItem, no fan-out) happens here;
@@ -353,7 +355,7 @@ def update_po_selection(submission_id: int, payload: schemas.PoSelectionUpdate, 
         raise HTTPException(400, "This deliverable is already completed or awaiting review — reopen it to change the selection")
 
     assigned_owners = rules.resolve_owners(sub)
-    if not rules.can_act(payload.actor_role, payload.actor_email, assigned_owners):
+    if not rules.can_act(current.role, current.email, assigned_owners):
         raise HTTPException(403, f"Only {', '.join(assigned_owners) or 'the assigned owner'} or an Admin can edit this")
 
     selection = dict(sub.po_selection or {})
@@ -379,7 +381,7 @@ def update_po_selection(submission_id: int, payload: schemas.PoSelectionUpdate, 
         sub.status = models.SubmissionStatus.IN_PROGRESS
     if changed_notes:
         db.add(models.WorkflowHistory(submission_id=sub.id, action="po_selection_updated",
-                                       actor_name=payload.actor_name, note="; ".join(changed_notes)))
+                                       actor_name=current.name, note="; ".join(changed_notes)))
     db.commit()
     # [Request 15]: exception to the general PO Lifecycle rule above (fan-
     # out normally waits for the declaring item's own approval) -- for
@@ -395,7 +397,8 @@ def update_po_selection(submission_id: int, payload: schemas.PoSelectionUpdate, 
 
 
 @router.patch("/{submission_id}/po-number")
-def update_po_number(submission_id: int, payload: schemas.PoNumberUpdate, db: Session = Depends(get_db)):
+def update_po_number(submission_id: int, payload: schemas.PoNumberUpdate, db: Session = Depends(get_db),
+                      current: CurrentActor = Depends(get_current_actor)):
     """[PO number]: Owner-entered on 3.2 (Allowable time for negotiating
     commercial and technical terms) once terms are settled and a real PO
     number is known. Writes to the submission's own PoLineItem, not the
@@ -414,7 +417,7 @@ def update_po_number(submission_id: int, payload: schemas.PoNumberUpdate, db: Se
         raise HTTPException(400, "This project is closed — deliverables are read-only")
 
     assigned_owners = rules.resolve_owners(sub)
-    if not rules.can_act(payload.actor_role, payload.actor_email, assigned_owners):
+    if not rules.can_act(current.role, current.email, assigned_owners):
         raise HTTPException(403, f"Only {', '.join(assigned_owners) or 'the assigned owner'} or an Admin can edit this")
 
     po_number = payload.po_number.strip()
@@ -424,7 +427,7 @@ def update_po_number(submission_id: int, payload: schemas.PoNumberUpdate, db: Se
     old = line_item.po_number
     line_item.po_number = po_number
     db.add(models.WorkflowHistory(
-        submission_id=sub.id, action="po_number_set", actor_name=payload.actor_name,
+        submission_id=sub.id, action="po_number_set", actor_name=current.name,
         note=(f"PO number changed from {old} to {po_number}" if old else f"PO number set to {po_number}"),
     ))
     db.commit()
@@ -442,7 +445,8 @@ def _document_out(d: "models.Document") -> dict:
 
 
 @router.get("/{submission_id}/documents")
-def list_documents(submission_id: int, db: Session = Depends(get_db)):
+def list_documents(submission_id: int, db: Session = Depends(get_db),
+                    current: CurrentActor = Depends(get_current_actor)):
     sub = db.get(models.DeliverableSubmission, submission_id)
     if not sub:
         raise HTTPException(404, "Deliverable not found")
@@ -573,7 +577,8 @@ def _finalize_rejection(db: Session, sub: "models.DeliverableSubmission", commen
 
 
 @router.post("/{submission_id}/mark-complete")
-def mark_complete(submission_id: int, payload: schemas.MarkCompleteRequest, db: Session = Depends(get_db)):
+def mark_complete(submission_id: int, payload: schemas.MarkCompleteRequest, db: Session = Depends(get_db),
+                   current: CurrentActor = Depends(get_current_actor)):
     """Item 143 (2nd revision): the ONLY trigger for SME review — comment-
     only or with any number of documents already uploaded, it makes no
     difference, since there's no more per-document gate to clear first.
@@ -591,8 +596,8 @@ def mark_complete(submission_id: int, payload: schemas.MarkCompleteRequest, db: 
 
     owner_emails = rules.resolve_owners(sub)
     sme_emails = rules.resolve_smes(sub)
-    is_owner = rules.can_act(payload.actor_role, payload.actor_email, owner_emails)
-    is_sme = rules.can_act(payload.actor_role, payload.actor_email, sme_emails)
+    is_owner = rules.can_act(current.role, current.email, owner_emails)
+    is_sme = rules.can_act(current.role, current.email, sme_emails)
     if not (is_owner or is_sme):
         raise HTTPException(403, f"Only {', '.join(owner_emails) or 'the assigned owner'} or {', '.join(sme_emails) or 'the assigned SME'} can complete this deliverable")
 
@@ -611,7 +616,7 @@ def mark_complete(submission_id: int, payload: schemas.MarkCompleteRequest, db: 
     # /review. is_assigned_email (not can_act) deliberately ignores the
     # Admin-role shortcut here: an Admin reviewing someone else's item is
     # not "self"-approving just because the role passes every check.
-    self_approval = is_sme and rules.is_assigned_email(payload.actor_email, owner_emails)
+    self_approval = is_sme and rules.is_assigned_email(current.email, owner_emails)
 
     # SME wins ties (someone assigned as both owner and SME on the same
     # item) — their own Mark Completed is always the stronger, final action.
@@ -622,13 +627,13 @@ def mark_complete(submission_id: int, payload: schemas.MarkCompleteRequest, db: 
     # is always true for Admin regardless of who's actually assigned.
     if is_sme and not self_approval:
         sub.submitted_at = sub.submitted_at or datetime.utcnow()
-        _finalize_approval(db, sub, comment, payload.actor_name, actor_email=payload.actor_email)
+        _finalize_approval(db, sub, comment, current.name, actor_email=current.email)
         return {"status": "ok", "completed": True}
 
     sub.submitted_at = sub.submitted_at or datetime.utcnow()
     sub.status = models.SubmissionStatus.PENDING_REVIEW
     db.add(models.WorkflowHistory(submission_id=sub.id, action="mark_complete_requested",
-                                   actor_name=payload.actor_name, note=comment))
+                                   actor_name=current.name, note=comment))
     db.commit()
 
     if sme_emails:
@@ -645,9 +650,10 @@ def mark_complete(submission_id: int, payload: schemas.MarkCompleteRequest, db: 
 
 @router.post("/{submission_id}/review")
 async def review_deliverable(submission_id: int, approved: bool = Form(...), comment: str = Form(""),
-                              reviewer_name: str = Form("SME"), actor_role: str = Form("Admin"),
-                              actor_email: str = Form(""), file: UploadFile | None = File(None),
-                              db: Session = Depends(get_db)):
+                              file: UploadFile | None = File(None),
+                              db: Session = Depends(get_db),
+                              current: CurrentActor = Depends(get_current_actor)):
+    actor_role, actor_email, reviewer_name = current.role, current.email, current.name
     """Item 143 (2nd revision): the SME's confirm/reject on an Owner's
     completion claim — the only whole-deliverable review action left, since
     per-document review no longer exists. Only reachable from PENDING_REVIEW,
@@ -693,7 +699,8 @@ async def review_deliverable(submission_id: int, approved: bool = Form(...), com
 
 
 @router.post("/{submission_id}/reopen")
-def reopen_deliverable(submission_id: int, actor_role: str = "Viewer", actor_email: str = "", db: Session = Depends(get_db)):
+def reopen_deliverable(submission_id: int, db: Session = Depends(get_db),
+                        current: CurrentActor = Depends(get_current_actor)):
     """Sends an approved or Not-Required deliverable back into the normal
     workflow. Approved: for when something approved turns out to need more
     work — leaves the existing file/documents in place as a record, the
@@ -702,6 +709,7 @@ def reopen_deliverable(submission_id: int, actor_role: str = "Viewer", actor_ema
     makes the item relevant again — admin-only, symmetric with who's
     allowed to mark something Not Required in the first place.
     """
+    actor_role, actor_email = current.role, current.email
     sub = db.get(models.DeliverableSubmission, submission_id)
     if not sub:
         raise HTTPException(404, "Deliverable not found")
@@ -768,14 +776,13 @@ def reopen_deliverable(submission_id: int, actor_role: str = "Viewer", actor_ema
 
 
 @router.post("/{submission_id}/mark-not-required")
-def mark_not_required(submission_id: int, actor_role: str = "Viewer", actor_email: str = "", db: Session = Depends(get_db)):
+def mark_not_required(submission_id: int, db: Session = Depends(get_db),
+                       current: CurrentActor = Depends(require_admin)):
     """Admin override to retire a single deliverable as Not Required at any
     point, not just at the initial BM triage gate (item 86 originally only
     covered that one screen) — e.g. a scope change makes an item moot after
     the tender's already underway.
     """
-    if actor_role != "Admin":
-        raise HTTPException(403, "Only an Admin can mark a deliverable Not Required")
     sub = db.get(models.DeliverableSubmission, submission_id)
     if not sub:
         raise HTTPException(404, "Deliverable not found")
@@ -804,7 +811,8 @@ def mark_not_required(submission_id: int, actor_role: str = "Viewer", actor_emai
 
 
 @router.post("/{submission_id}/completion-date")
-def edit_completion_date(submission_id: int, payload: schemas.EditCompletionDateRequest, db: Session = Depends(get_db)):
+def edit_completion_date(submission_id: int, payload: schemas.EditCompletionDateRequest, db: Session = Depends(get_db),
+                          current: CurrentActor = Depends(require_admin)):
     """Admin-only correction for a submission's recorded completion date
     (reviewed_at) -- e.g. a test/placeholder approval landed on the wrong
     day, or the real sign-off date wasn't what got recorded at the time.
@@ -813,8 +821,6 @@ def edit_completion_date(submission_id: int, payload: schemas.EditCompletionDate
     it here cascades their due dates too, exactly like a genuine early or
     late finish would.
     """
-    if payload.actor_role != "Admin":
-        raise HTTPException(403, "Only an Admin can edit a completion date")
     sub = db.get(models.DeliverableSubmission, submission_id)
     if not sub:
         raise HTTPException(404, "Deliverable not found")
@@ -835,10 +841,14 @@ def edit_completion_date(submission_id: int, payload: schemas.EditCompletionDate
 
 
 @router.post("/{submission_id}/reassign-request")
-def request_reassignment(submission_id: int, payload: schemas.ReassignRequestCreate, db: Session = Depends(get_db)):
+def request_reassignment(submission_id: int, payload: schemas.ReassignRequestCreate, db: Session = Depends(get_db),
+                          current: CurrentActor = Depends(get_current_actor)):
     sub = db.get(models.DeliverableSubmission, submission_id)
     if not sub:
         raise HTTPException(404, "Deliverable not found")
+    owner_emails = rules.resolve_owners(sub)
+    if not rules.can_act(current.role, current.email, owner_emails):
+        raise HTTPException(403, f"Only {', '.join(owner_emails) or 'the assigned owner'} can request this")
     to_email = payload.to_email.strip()
     if not to_email:
         raise HTTPException(400, "The new owner's email is required")
@@ -850,7 +860,11 @@ def request_reassignment(submission_id: int, payload: schemas.ReassignRequestCre
         raise HTTPException(400, f"{to_email} must be a user with Owner permissions in the system roster (Focal Points &#8594; L0-L1 Group)")
     req = models.ReassignmentRequest(
         submission_id=submission_id,
-        from_email=(payload.from_email or ", ".join(rules.resolve_owners(sub)) or "").strip() or None,
+        # Admin filing on someone else's behalf attributes it to every
+        # assigned owner (there can be more than one); a self-filing owner
+        # is always just themselves -- never the client-asserted identity
+        # the old from_email payload field used to allow.
+        from_email=(", ".join(owner_emails) if current.role == "Admin" else current.email) or None,
         to_email=to_email, reason=payload.reason,
     )
     db.add(req)
@@ -864,14 +878,15 @@ def request_reassignment(submission_id: int, payload: schemas.ReassignRequestCre
 
 
 @router.get("/reassignment-requests")
-def list_reassignment_requests(status: str = "pending", requested_by_email: str | None = None, db: Session = Depends(get_db)):
+def list_reassignment_requests(status: str = "pending", db: Session = Depends(get_db),
+                                current: CurrentActor = Depends(get_current_actor)):
     q = db.query(models.ReassignmentRequest)
     if status:
         q = q.filter(models.ReassignmentRequest.status == status)
-    if requested_by_email:
+    if current.role != "Admin":
         # [My Requests]: owner-initiated (see the model's own docstring) --
         # from_email IS the requester, there's no separate tracked field.
-        q = q.filter(models.ReassignmentRequest.from_email.ilike(requested_by_email.strip()))
+        q = q.filter(models.ReassignmentRequest.from_email.ilike(current.email))
     reqs = q.order_by(models.ReassignmentRequest.requested_at.desc()).all()
     return [
         {
@@ -886,14 +901,13 @@ def list_reassignment_requests(status: str = "pending", requested_by_email: str 
 
 
 @router.post("/reassignment-requests/{request_id}/decide")
-def decide_reassignment(request_id: int, decision: schemas.ReassignmentDecision, db: Session = Depends(get_db)):
+def decide_reassignment(request_id: int, decision: schemas.ReassignmentDecision, db: Session = Depends(get_db),
+                         current: CurrentActor = Depends(require_admin)):
     req = db.get(models.ReassignmentRequest, request_id)
     if not req:
         raise HTTPException(404, "Reassignment request not found")
     if req.status != "pending":
         raise HTTPException(400, "This request has already been decided")
-    if decision.actor_role != "Admin":
-        raise HTTPException(403, "Only an Admin can decide a reassignment request")
     req.status = "approved" if decision.approved else "rejected"
     req.decided_at = datetime.utcnow()
     if decision.approved:
@@ -910,14 +924,15 @@ def decide_reassignment(request_id: int, decision: schemas.ReassignmentDecision,
     return {"status": "ok"}
 
 
-def _create_due_date_request(submission_id: int, payload: schemas.DueDateRequestCreate, kind: str, db: Session):
+def _create_due_date_request(submission_id: int, payload: schemas.DueDateRequestCreate, kind: str, db: Session,
+                              current: CurrentActor):
     sub = db.get(models.DeliverableSubmission, submission_id)
     if not sub:
         raise HTTPException(404, "Deliverable not found")
     if sub.status in (models.SubmissionStatus.PENDING_REVIEW, models.SubmissionStatus.APPROVED):
         raise HTTPException(400, "This deliverable is already pending review or completed")
     owner_emails = rules.resolve_owners(sub)
-    if not rules.can_act(payload.actor_role, payload.actor_email, owner_emails):
+    if not rules.can_act(current.role, current.email, owner_emails):
         raise HTTPException(403, f"Only {', '.join(owner_emails) or 'the assigned owner'} can request this")
     # Item [due-date requests]: only one outstanding request (either kind) at
     # a time -- a gap the reassignment-request flow this is modeled on
@@ -937,12 +952,12 @@ def _create_due_date_request(submission_id: int, payload: schemas.DueDateRequest
 
     req = models.DueDateRequest(
         submission_id=submission_id, kind=kind,
-        requested_by_email=(payload.actor_email or ", ".join(owner_emails)).strip(),
+        requested_by_email=current.email,
         reason=reason, requested_due_date=payload.requested_due_date if kind == "extension" else None,
     )
     db.add(req)
     db.add(models.WorkflowHistory(submission_id=sub.id, action=f"{kind}_requested",
-                                   actor_name=payload.actor_name, note=reason))
+                                   actor_name=current.name, note=reason))
     db.commit()
     db.refresh(req)
 
@@ -953,22 +968,30 @@ def _create_due_date_request(submission_id: int, payload: schemas.DueDateRequest
 
 
 @router.post("/{submission_id}/extension-request")
-def request_extension(submission_id: int, payload: schemas.DueDateRequestCreate, db: Session = Depends(get_db)):
+def request_extension(submission_id: int, payload: schemas.DueDateRequestCreate, db: Session = Depends(get_db),
+                       current: CurrentActor = Depends(get_current_actor)):
     """Owner-initiated request to move a deliverable's due date, subject to
     SME/Admin approval via /due-date-requests/{id}/decide."""
-    return _create_due_date_request(submission_id, payload, "extension", db)
+    return _create_due_date_request(submission_id, payload, "extension", db, current)
 
 
 @router.post("/{submission_id}/hold-request")
-def request_hold(submission_id: int, payload: schemas.DueDateRequestCreate, db: Session = Depends(get_db)):
+def request_hold(submission_id: int, payload: schemas.DueDateRequestCreate, db: Session = Depends(get_db),
+                  current: CurrentActor = Depends(get_current_actor)):
     """Owner-initiated request to pause a deliverable (missing data /
     technical issue) so lateness stops accruing, subject to SME/Admin
     approval via /due-date-requests/{id}/decide."""
-    return _create_due_date_request(submission_id, payload, "hold", db)
+    return _create_due_date_request(submission_id, payload, "hold", db, current)
 
 
 @router.get("/due-date-requests")
-def list_due_date_requests(status: str = "pending", requested_by_email: str | None = None, db: Session = Depends(get_db)):
+def list_due_date_requests(status: str = "pending", requested_by_email: str | None = None, db: Session = Depends(get_db),
+                            current: CurrentActor = Depends(get_current_actor)):
+    # Visible to any signed-in user, not scoped to "my own" -- unlike bid-
+    # value/reassignment requests (pure self-service "track my request"
+    # screens), this same listing is also how an SME finds pending requests
+    # on items they need to decide, which isn't "their own" request at all.
+    # The actual decide_due_date_request below is what's permission-gated.
     q = db.query(models.DueDateRequest)
     if status:
         q = q.filter(models.DueDateRequest.status == status)
@@ -990,7 +1013,8 @@ def list_due_date_requests(status: str = "pending", requested_by_email: str | No
 
 
 @router.post("/due-date-requests/{request_id}/decide")
-def decide_due_date_request(request_id: int, decision: schemas.DueDateRequestDecision, db: Session = Depends(get_db)):
+def decide_due_date_request(request_id: int, decision: schemas.DueDateRequestDecision, db: Session = Depends(get_db),
+                             current: CurrentActor = Depends(get_current_actor)):
     """Assigned SME or Admin -- same rules.can_act(..., resolve_smes(sub))
     gate /review already uses, so Admin passes for free and doesn't need a
     separate "or Admin" branch."""
@@ -1000,12 +1024,12 @@ def decide_due_date_request(request_id: int, decision: schemas.DueDateRequestDec
     if req.status != "pending":
         raise HTTPException(400, "This request has already been decided")
     sub = req.submission
-    if not rules.can_act(decision.actor_role, decision.actor_email, rules.resolve_smes(sub)):
+    if not rules.can_act(current.role, current.email, rules.resolve_smes(sub)):
         raise HTTPException(403, "Only the assigned SME or an Admin can decide this request")
 
     req.status = "approved" if decision.approved else "rejected"
     req.decided_at = datetime.utcnow()
-    req.decided_by_email = decision.actor_email
+    req.decided_by_email = current.email
     req.decision_comment = decision.comment
 
     if decision.approved:
@@ -1017,10 +1041,10 @@ def decide_due_date_request(request_id: int, decision: schemas.DueDateRequestDec
             sub.on_hold_since = datetime.utcnow()
             sub.hold_reason = req.reason
         db.add(models.WorkflowHistory(submission_id=sub.id, action=f"{req.kind}_approved",
-                                       actor_name=decision.actor_role, note=decision.comment or None))
+                                       actor_name=current.name, note=decision.comment or None))
     else:
         db.add(models.WorkflowHistory(submission_id=sub.id, action=f"{req.kind}_rejected",
-                                       actor_name=decision.actor_role, note=decision.comment or None))
+                                       actor_name=current.name, note=decision.comment or None))
     db.commit()
 
     if decision.approved:
@@ -1034,7 +1058,8 @@ def decide_due_date_request(request_id: int, decision: schemas.DueDateRequestDec
 
 
 @router.post("/{submission_id}/resume")
-def resume_deliverable(submission_id: int, actor_role: str = "Viewer", actor_email: str = "", db: Session = Depends(get_db)):
+def resume_deliverable(submission_id: int, db: Session = Depends(get_db),
+                        current: CurrentActor = Depends(get_current_actor)):
     """Ends an active hold -- Owner or Admin. Shifts due_date forward by
     exactly the days spent on hold (so pre-existing lateness is preserved,
     not erased or inflated -- see plan notes) and locks it against the next
@@ -1045,7 +1070,7 @@ def resume_deliverable(submission_id: int, actor_role: str = "Viewer", actor_ema
     if not sub.on_hold:
         raise HTTPException(400, "This deliverable is not on hold")
     assigned_owners = rules.resolve_owners(sub)
-    if not rules.can_act(actor_role, actor_email, assigned_owners):
+    if not rules.can_act(current.role, current.email, assigned_owners):
         raise HTTPException(403, f"Only {', '.join(assigned_owners) or 'the assigned owner'} or an Admin can resume this deliverable")
 
     days_on_hold = (datetime.utcnow().date() - sub.on_hold_since.date()).days if sub.on_hold_since else 0
@@ -1054,7 +1079,7 @@ def resume_deliverable(submission_id: int, actor_role: str = "Viewer", actor_ema
     sub.due_date_locked = True
     sub.on_hold = False
     sub.on_hold_since = None
-    db.add(models.WorkflowHistory(submission_id=sub.id, action="resumed", actor_name=actor_role,
+    db.add(models.WorkflowHistory(submission_id=sub.id, action="resumed", actor_name=current.name,
                                    note=f"Resumed after {days_on_hold} day(s) on hold" + (f" -- {sub.hold_reason}" if sub.hold_reason else "")))
     db.commit()
 
@@ -1067,7 +1092,8 @@ def resume_deliverable(submission_id: int, actor_role: str = "Viewer", actor_ema
 
 
 @router.get("/follow-up")
-def get_follow_up(department: str | None = None, project_id: int | None = None, db: Session = Depends(get_db)):
+def get_follow_up(department: str | None = None, project_id: int | None = None, db: Session = Depends(get_db),
+                   current: CurrentActor = Depends(require_admin)):
     """Every currently due/overdue deliverable, for the admin Follow Up page."""
     active_projects = db.query(models.Project).filter(
         models.Project.status == models.ProjectStatus.IN_PROGRESS, models.Project.archived.is_not(True),
@@ -1139,9 +1165,8 @@ def get_follow_up(department: str | None = None, project_id: int | None = None, 
 
 
 @router.post("/bulk-remind")
-def bulk_remind(payload: schemas.BulkRemindRequest, db: Session = Depends(get_db)):
-    if payload.actor_role != "Admin":
-        raise HTTPException(403, "Only an Admin can send reminders")
+def bulk_remind(payload: schemas.BulkRemindRequest, db: Session = Depends(get_db),
+                 current: CurrentActor = Depends(require_admin)):
     subs = db.query(models.DeliverableSubmission).filter(models.DeliverableSubmission.id.in_(payload.submission_ids)).all()
     users_by_email = {u.email.strip().lower(): u for u in db.query(models.User).all()} if payload.cc_manager else {}
     sent = 0
@@ -1167,18 +1192,17 @@ _BULK_REMIND_MAX_ATTACHMENT_BYTES = 10 * 1024 * 1024  # Graph's direct sendMail 
 
 
 @router.post("/bulk-remind-advanced")
-async def bulk_remind_advanced(submission_ids: str = Form(...), actor_role: str = Form(...),
+async def bulk_remind_advanced(submission_ids: str = Form(...),
                                 message: str | None = Form(None), include_owner: bool = Form(True),
                                 include_sme: bool = Form(False), include_manager: bool = Form(False),
                                 additional_emails: str | None = Form(None),
-                                files: list[UploadFile] = File(default=[]), db: Session = Depends(get_db)):
+                                files: list[UploadFile] = File(default=[]), db: Session = Depends(get_db),
+                                current: CurrentActor = Depends(require_admin)):
     """Backs the Follow Up "Send Reminders" modal: unlike bulk_remind() above
     (single owner + optional manager cc, JSON body), the admin here picks an
     arbitrary recipient mix and can attach files -- both need a multipart
     body, so this is a separate endpoint rather than an extended one.
     """
-    if actor_role != "Admin":
-        raise HTTPException(403, "Only an Admin can send reminders")
     try:
         ids = json.loads(submission_ids)
     except ValueError:
@@ -1266,12 +1290,13 @@ def _can_view_comm_offer(db: Session, sub: "models.DeliverableSubmission", actor
 # Starlette matches routes in registration order, same reasoning as
 # projects.py's bid-value-requests routes.
 @router.get("/comm-offer-requests")
-def list_comm_offer_requests(status: str = "pending", requested_by_email: str | None = None, db: Session = Depends(get_db)):
+def list_comm_offer_requests(status: str = "pending", db: Session = Depends(get_db),
+                              current: CurrentActor = Depends(get_current_actor)):
     q = db.query(models.CommOfferAccessRequest)
     if status:
         q = q.filter(models.CommOfferAccessRequest.status == status)
-    if requested_by_email:
-        q = q.filter(models.CommOfferAccessRequest.requested_by_email.ilike(requested_by_email.strip()))
+    if current.role != "Admin":
+        q = q.filter(models.CommOfferAccessRequest.requested_by_email.ilike(current.email))
     reqs = q.order_by(models.CommOfferAccessRequest.requested_at.desc()).all()
     return [
         {
@@ -1285,14 +1310,13 @@ def list_comm_offer_requests(status: str = "pending", requested_by_email: str | 
 
 
 @router.post("/comm-offer-requests/{request_id}/decide")
-def decide_comm_offer_request(request_id: int, decision: schemas.CommOfferAccessDecision, db: Session = Depends(get_db)):
+def decide_comm_offer_request(request_id: int, decision: schemas.CommOfferAccessDecision, db: Session = Depends(get_db),
+                               current: CurrentActor = Depends(require_admin)):
     req = db.get(models.CommOfferAccessRequest, request_id)
     if not req:
         raise HTTPException(404, "Request not found")
     if req.status != "pending":
         raise HTTPException(400, "This request has already been decided")
-    if decision.actor_role != "Admin":
-        raise HTTPException(403, "Only an Admin can decide a Commercial Offers access request")
     req.status = "approved" if decision.approved else "rejected"
     req.decided_at = datetime.utcnow()
     db.commit()
@@ -1301,15 +1325,14 @@ def decide_comm_offer_request(request_id: int, decision: schemas.CommOfferAccess
 
 
 @router.post("/{submission_id}/request-comm-offer-access")
-def request_comm_offer_access(submission_id: int, payload: schemas.CommOfferAccessRequestCreate, db: Session = Depends(get_db)):
+def request_comm_offer_access(submission_id: int, db: Session = Depends(get_db),
+                               current: CurrentActor = Depends(get_current_actor)):
     sub = db.get(models.DeliverableSubmission, submission_id)
     if not sub:
         raise HTTPException(404, "Deliverable not found")
     if not _is_l0_comm_offer(sub):
         raise HTTPException(400, "This deliverable isn't access-restricted")
-    email = payload.actor_email.strip()
-    if not email:
-        raise HTTPException(400, "Your email is required")
+    email = current.email
     if _can_view_comm_offer(db, sub, "Viewer", email):
         raise HTTPException(400, "You already have access")
     existing = (
@@ -1322,16 +1345,17 @@ def request_comm_offer_access(submission_id: int, payload: schemas.CommOfferAcce
     if existing:
         raise HTTPException(400, "A request is already pending")
     req = models.CommOfferAccessRequest(submission_id=submission_id, requested_by_email=email,
-                                         requested_by_name=payload.actor_name.strip() or None)
+                                         requested_by_name=current.name or None)
     db.add(req)
     db.commit()
     db.refresh(req)
-    announcements.comm_offer_access_requested(db, sub.project, rules.admin_emails(db), email, payload.actor_name.strip() or None)
+    announcements.comm_offer_access_requested(db, sub.project, rules.admin_emails(db), email, current.name or None)
     return {"status": "ok", "id": req.id}
 
 
 @router.get("/{submission_id}")
-def get_deliverable_detail(submission_id: int, actor_role: str = "Viewer", actor_email: str | None = None, db: Session = Depends(get_db)):
+def get_deliverable_detail(submission_id: int, db: Session = Depends(get_db),
+                            current: CurrentActor = Depends(get_current_actor)):
     """Full detail for the deliverable popup: the item itself, its workflow
     history, and any supplementary documents on top of the primary file.
 
@@ -1344,6 +1368,7 @@ def get_deliverable_detail(submission_id: int, actor_role: str = "Viewer", actor
     "follow-up" as submission_id, and erroring out before ever reaching the
     real handler).
     """
+    actor_role, actor_email = current.role, current.email
     sub = db.get(models.DeliverableSubmission, submission_id)
     if not sub:
         raise HTTPException(404, "Deliverable not found")
@@ -1485,7 +1510,8 @@ def get_deliverable_detail(submission_id: int, actor_role: str = "Viewer", actor
 
 
 @router.get("/{submission_id}/history")
-def get_history(submission_id: int, db: Session = Depends(get_db)):
+def get_history(submission_id: int, db: Session = Depends(get_db),
+                 current: CurrentActor = Depends(get_current_actor)):
     sub = db.get(models.DeliverableSubmission, submission_id)
     if not sub:
         raise HTTPException(404, "Deliverable not found")

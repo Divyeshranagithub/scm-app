@@ -9,6 +9,7 @@ from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.orm import Session
 
 from .. import models, rules
+from ..auth import CurrentActor, get_current_actor, require_admin
 from ..database import get_db
 
 router = APIRouter(prefix="/api/projects/{project_id}/po-line-items", tags=["po-line-items"])
@@ -158,7 +159,8 @@ def sync_from_submission(db: Session, sub: "models.DeliverableSubmission") -> No
 
 
 @router.get("")
-def list_po_line_items(project_id: int, category: str | None = None, db: Session = Depends(get_db)):
+def list_po_line_items(project_id: int, category: str | None = None, db: Session = Depends(get_db),
+                        current: CurrentActor = Depends(get_current_actor)):
     _get_project(db, project_id)
     q = db.query(models.PoLineItem).filter(models.PoLineItem.project_id == project_id,
                                             models.PoLineItem.status == "active")
@@ -172,7 +174,8 @@ def list_po_line_items(project_id: int, category: str | None = None, db: Session
 
 
 @router.get("/po-cycle-summary")
-def po_cycle_summary(project_id: int, db: Session = Depends(get_db)):
+def po_cycle_summary(project_id: int, db: Session = Depends(get_db),
+                      current: CurrentActor = Depends(get_current_actor)):
     project = _get_project(db, project_id)
     rules.recompute_project_due_dates(db, project)  # cheap, daily-gated read (see rules.py docstring)
     db.commit()
@@ -294,15 +297,14 @@ def po_cycle_summary(project_id: int, db: Session = Depends(get_db)):
 
 
 @router.post("/mark-all-not-required/{item_no}")
-def mark_all_not_required(project_id: int, item_no: str, actor_role: str = "Viewer", db: Session = Depends(get_db)):
+def mark_all_not_required(project_id: int, item_no: str, db: Session = Depends(get_db),
+                           current: CurrentActor = Depends(require_admin)):
     """Bulk version of deliverables.mark_not_required, scoped to one item_no
     across every one of this project's fan-out line items at once -- built
     for 3.12 (prequalification), where most named items on a given project
     often don't need it at all and ticking "Not Required" one by one across
     10+ line items is real, repetitive Admin busywork.
     """
-    if actor_role != "Admin":
-        raise HTTPException(403, "Only an Admin can bulk mark deliverables Not Required")
     project = _get_project(db, project_id)
     subs = (
         db.query(models.DeliverableSubmission)
@@ -318,7 +320,7 @@ def mark_all_not_required(project_id: int, item_no: str, actor_role: str = "View
     )
     for sub in subs:
         sub.applicability = "not_required"
-        db.add(models.WorkflowHistory(submission_id=sub.id, action="not_required", actor_name="Admin",
+        db.add(models.WorkflowHistory(submission_id=sub.id, action="not_required", actor_name=current.name,
                                        note="Marked Not Required (bulk)"))
     if subs:
         db.commit()

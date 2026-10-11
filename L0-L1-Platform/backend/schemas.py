@@ -34,28 +34,14 @@ class ProjectManagerUpdate(BaseModel):
 
 class BidValueUpdate(BaseModel):
     bid_value: float | None = None
-    actor_role: str = "Viewer"
-    actor_email: str = ""
-
-
-class BidValueAccessRequestCreate(BaseModel):
-    actor_name: str = ""
-    actor_email: str
 
 
 class BidValueAccessDecision(BaseModel):
     approved: bool
-    actor_role: str = "Viewer"
-
-
-class CommOfferAccessRequestCreate(BaseModel):
-    actor_name: str = ""
-    actor_email: str
 
 
 class CommOfferAccessDecision(BaseModel):
     approved: bool
-    actor_role: str = "Viewer"
 
 
 class ProjectStatusUpdate(BaseModel):
@@ -64,8 +50,6 @@ class ProjectStatusUpdate(BaseModel):
 
 class ArchiveUpdate(BaseModel):
     archived: bool
-    actor_role: str = "Viewer"
-    actor_email: str = ""
 
 
 class ProjectDetailsUpdate(BaseModel):
@@ -92,7 +76,6 @@ class ProjectDetailsUpdate(BaseModel):
     pre_bid_meeting_date: date | None = None
     pre_bid_deadline: date | None = None
     bsd: date | None = None
-    actor_role: str = "Admin"
 
 
 class ProjectOut(BaseModel):
@@ -142,8 +125,6 @@ class TriageItem(BaseModel):
 
 class TriageRequest(BaseModel):
     items: list[TriageItem]
-    actor_role: str = "Admin"
-    actor_email: str = ""
     # Explicit opt-in (a dedicated button, not a side effect of every
     # confirm) -- a bulk "Mark All Required" shortcut for one tender must
     # never silently overwrite the BM's remembered per-item defaults.
@@ -206,9 +187,6 @@ class SubmissionOut(BaseModel):
 
 class MarkCompleteRequest(BaseModel):
     comment: str
-    actor_name: str = "Owner"
-    actor_role: str = "Owner"
-    actor_email: str = ""
 
 
 class PoSelectionUpdate(BaseModel):
@@ -220,9 +198,6 @@ class PoSelectionUpdate(BaseModel):
     mep_selected: list[str] | None = None  # 1.2
     selected: list[str] | None = None  # 4.1
     items: list[str] | None = None  # 2.11 / 2.17
-    actor_name: str = "Owner"
-    actor_role: str = "Owner"
-    actor_email: str = ""
 
 
 class PoNumberUpdate(BaseModel):
@@ -233,50 +208,33 @@ class PoNumberUpdate(BaseModel):
     line item, with nothing to propagate by hand.
     """
     po_number: str
-    actor_name: str = "Owner"
-    actor_role: str = "Owner"
-    actor_email: str = ""
-
-
-class FollowRequest(BaseModel):
-    email: str
 
 
 class ReassignRequestCreate(BaseModel):
     to_email: str
     reason: str | None = None
-    from_email: str | None = None
 
 
 class ReassignmentDecision(BaseModel):
     approved: bool
-    actor_role: str = "Admin"
 
 
 class DueDateRequestCreate(BaseModel):
     reason: str
     requested_due_date: date | None = None  # extension only
-    actor_name: str = "Owner"
-    actor_role: str = "Owner"
-    actor_email: str = ""
 
 
 class DueDateRequestDecision(BaseModel):
     approved: bool
     comment: str = ""
-    actor_role: str = "Admin"
-    actor_email: str = ""
 
 
 class BulkRemindRequest(BaseModel):
     submission_ids: list[int]
-    actor_role: str = "Admin"
 
 
 class EditCompletionDateRequest(BaseModel):
     completion_date: date
-    actor_role: str = "Admin"
-    actor_email: str = ""
     message: str | None = None  # item 90 — custom reminder text, defaults to the standard one
     cc_manager: bool = False  # item 90 — also CC the owner's manager_email from the user roster
 

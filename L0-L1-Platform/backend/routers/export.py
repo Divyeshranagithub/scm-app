@@ -11,12 +11,14 @@ import io
 import re
 from datetime import datetime
 
-from fastapi import APIRouter
+from fastapi import APIRouter, Depends
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 from openpyxl import Workbook
 from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
 from openpyxl.utils import get_column_letter
+
+from ..auth import CurrentActor, get_current_actor
 
 router = APIRouter(prefix="/api/export", tags=["export"])
 
@@ -47,7 +49,7 @@ def _safe_filename(title: str) -> str:
 
 
 @router.post("/xlsx")
-def export_xlsx(payload: ExportRequest):
+def export_xlsx(payload: ExportRequest, current: CurrentActor = Depends(get_current_actor)):
     wb = Workbook()
     ws = wb.active
     ws.title = re.sub(r"[\[\]:\*\?/\\]", "", payload.sheet_name or "Data")[:31] or "Data"

@@ -5,5 +5,9 @@ data/app.db
 data/local_storage/*
 !data/local_storage/.gitkeep
 .claude/worktrees/
-uvicorn_l0l1.out.log
-uvicorn_l0l1.err.log
+.pytest_cache/
+loadtest/loadtest.db
+loadtest/*.log
+loadtest/results*
+loadtest/profile_test.db
+local-run.log

@@ -8,10 +8,12 @@ items" bug this replaced _my_deliverables_summary to fix). The one genuine
 exception is Bid Value, which stays gated behind the real approval flow
 (projects.py's _can_view_bid_value) -- see get_bid_value below.
 
-Same trust model as every other actor_email/actor_role field in this app:
-self-reported, no real login exists in this pilot (see support.py's own
-docstring) -- read-only access at this ceiling is an acceptable extension
-of what every role can already browse manually.
+Identity comes from the real session (auth.get_current_actor), same as every
+other route -- read-only access at this ceiling is an acceptable extension
+of what every role can already browse manually. The "look someone else up"
+tools (list_my_requests, get_bm_triage_status) deliberately impersonate the
+named person via auth.synthetic_actor rather than being limited to the real
+asker's own role, since that's their whole point (see each tool's docstring).
 
 Stateless on the backend by design: the frontend keeps the conversation
 array and resends it every turn (capped client-side), rather than adding a
@@ -32,6 +34,7 @@ from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
 from .. import models, rules
+from ..auth import CurrentActor, get_current_actor, synthetic_actor
 from ..database import get_db
 from .deliverables_config import _normalized_weight_pct
 from .projects import _can_view_bid_value
@@ -383,16 +386,16 @@ def _tool_list_departments(db: Session) -> str:
     )
 
 
-def _tool_get_bid_value(db: Session, actor_role: str, actor_email: str, est_no: str = "") -> str:
-    # actor_role/actor_email are bound from the real request (payload), NOT
-    # a tool-input argument the model could set -- otherwise a user could
-    # just ask the AI to "check as someone else" and bypass the real gate.
+def _tool_get_bid_value(db: Session, current: CurrentActor, est_no: str = "") -> str:
+    # `current` is bound from the real, verified session (never a tool-input
+    # argument the model could set) -- otherwise a user could just ask the
+    # AI to "check as someone else" and bypass the real gate.
     if not est_no:
         return "est_no is required."
     project = db.query(models.Project).filter(models.Project.est_no.ilike(est_no.strip())).first()
     if not project:
         return "No project found with that Est-No."
-    can_view = rules.can_act(actor_role, actor_email, project.bid_manager) or _can_view_bid_value(db, project, actor_role, actor_email)
+    can_view = rules.can_act(current.role, current.email, project.bid_manager) or _can_view_bid_value(db, project, current)
     if not can_view:
         return (
             f"You don't currently have access to {project.est_no}'s bid value -- it's restricted to the bid "
@@ -403,13 +406,13 @@ def _tool_get_bid_value(db: Session, actor_role: str, actor_email: str, est_no: 
     return f"{project.est_no}'s bid value: {project.bid_value}"
 
 
-def _tool_get_performance_summary(db: Session, department: str = "") -> str:
+def _tool_get_performance_summary(db: Session, current: CurrentActor, department: str = "") -> str:
     # Reuses the real Performance page's own endpoint function directly
     # (not re-derived) -- guarantees this can never drift from what the
     # actual page shows, at the cost of the same per-call weight that page
     # already pays (recomputes due dates for every active project).
     from .dashboard import get_performance
-    data = get_performance(db)
+    data = get_performance(db=db, current=current)
     depts = data["departments"]
     if department:
         dl = department.strip().lower()
@@ -428,11 +431,10 @@ def _tool_get_performance_summary(db: Session, department: str = "") -> str:
     return "\n".join(lines)
 
 
-def _tool_list_announcements(db: Session, actor_role: str, actor_email: str, category: str = "news", stage: str = "") -> str:
+def _tool_list_announcements(db: Session, current: CurrentActor, category: str = "news", stage: str = "") -> str:
     from .announcements_router import list_announcements
     items = list_announcements(
-        limit=30, actor_role=actor_role, actor_email=actor_email,
-        mine=False, stage=stage or None, category=category or "news", db=db,
+        limit=30, mine=False, stage=stage or None, category=category or "news", db=db, current=current,
     )
     if not items:
         return "No matching announcements/reminders found."
@@ -460,6 +462,16 @@ def _tool_list_my_requests(db: Session, email: str) -> str:
     from .departments import list_sme_nominations, list_user_add_requests
     from .projects import list_bid_value_requests
 
+    # This tool looks up a specific NAMED person's requests for the asker --
+    # not the asker's own -- so it needs to bypass each endpoint's normal
+    # "non-admin only sees their own" scoping deliberately, rather than
+    # being limited by whatever role is actually asking. Functions that
+    # still take an explicit requested_by_email filter work with any
+    # synthetic actor; functions that instead auto-scope off current.email
+    # need a non-admin actor impersonating the target email specifically.
+    admin_actor = synthetic_actor("Admin", "ai-support@system", "AI Support")
+    person_actor = synthetic_actor("Viewer", email, "")
+
     sections = []
 
     def add(label: str, rows: list, desc_fn) -> None:
@@ -470,17 +482,17 @@ def _tool_list_my_requests(db: Session, email: str) -> str:
             when = r.get("requested_at")
             sections.append(f"  - {desc_fn(r)} -- status: {r.get('status')}, requested: {when.date().isoformat() if when else 'n/a'}")
 
-    add("Due-Date Requests", list_due_date_requests(status="", requested_by_email=email, db=db),
+    add("Due-Date Requests", list_due_date_requests(status="", requested_by_email=email, db=db, current=admin_actor),
         lambda r: f"{r.get('kind')} on {r.get('item_no')} ({r.get('est_no')})")
-    add("Reassignment Requests", list_reassignment_requests(status="", requested_by_email=email, db=db),
+    add("Reassignment Requests", list_reassignment_requests(status="", db=db, current=person_actor),
         lambda r: f"{r.get('item_no')} on {r.get('est_no')} -> {r.get('to_email')}")
-    add("SME Nominations", list_sme_nominations(status=None, requested_by_email=email, db=db),
+    add("SME Nominations", list_sme_nominations(status=None, requested_by_email=email, db=db, current=admin_actor),
         lambda r: f"{r.get('item_no')} \"{r.get('item_name')}\" ({r.get('department')})")
-    add("Bid Value Access Requests", list_bid_value_requests(status="", requested_by_email=email, db=db),
+    add("Bid Value Access Requests", list_bid_value_requests(status="", db=db, current=person_actor),
         lambda r: f"{r.get('est_no')} \"{r.get('name')}\"")
-    add("Group Add Requests", list_user_add_requests(status="", requested_by_email=email, db=db),
+    add("Group Add Requests", list_user_add_requests(status="", requested_by_email=email, db=db, current=admin_actor),
         lambda r: f"{r.get('email')} ({r.get('role')})")
-    add("Formula Change Requests", list_formula_change_requests(status="", requested_by_email=email, db=db),
+    add("Formula Change Requests", list_formula_change_requests(status="", db=db, current=person_actor),
         lambda r: f"{r.get('item_no')} \"{r.get('item_name')}\"")
 
     if not sections:
@@ -491,10 +503,9 @@ def _tool_list_my_requests(db: Session, email: str) -> str:
 def _tool_get_bm_triage_status(db: Session, bid_manager_email: str = "") -> str:
     from .projects import get_bm_triage_status
     # Always call as Admin (sees every tender) and narrow here instead of
-    # using the endpoint's own non-Admin scoping -- that path 403s on a
-    # blank email, and this tool's whole point is looking things up for
-    # ANYONE, not just whoever's asking.
-    rows = get_bm_triage_status(actor_role="Admin", actor_email="", db=db)
+    # using the endpoint's own non-Admin scoping -- this tool's whole point
+    # is looking things up for ANYONE, not just whoever's asking.
+    rows = get_bm_triage_status(db=db, current=synthetic_actor("Admin", "ai-support@system", "AI Support"))
     if bid_manager_email:
         rows = [r for r in rows if (r.get("bid_manager") or "").strip().lower() == bid_manager_email.strip().lower()]
     if not rows:
@@ -509,7 +520,7 @@ def _tool_get_bm_triage_status(db: Session, bid_manager_email: str = "") -> str:
     return "\n".join(lines)
 
 
-def _tool_get_dashboard_summary(db: Session) -> str:
+def _tool_get_dashboard_summary(db: Session, current: CurrentActor) -> str:
     """The exact numbers the Dashboard page itself shows -- overdue/pending/
     active/closed counts. Added because the model was previously trying to
     answer "how many X" questions (e.g. "how many due deliverables") by
@@ -521,7 +532,7 @@ def _tool_get_dashboard_summary(db: Session) -> str:
     count here) guarantees this can never drift from what the page shows.
     """
     from .dashboard import get_dashboard
-    d = get_dashboard(focus_email=None, db=db)
+    d = get_dashboard(focus_email=None, db=db, current=current)
 
     projects = db.query(models.Project).filter(models.Project.archived.is_not(True)).all()
     closed_l0 = sum(1 for p in projects if p.stage == models.Stage.L0 and rules.is_project_terminal(p))
@@ -542,7 +553,7 @@ def _tool_get_dashboard_summary(db: Session) -> str:
     )
 
 
-def _run_tool(db: Session, name: str, tool_input: dict, actor_role: str, actor_email: str) -> str:
+def _run_tool(db: Session, name: str, tool_input: dict, current: CurrentActor) -> str:
     if name == "lookup_deliverables":
         return _tool_lookup_deliverables(db, **{k: tool_input.get(k, "") for k in ("stage", "item_no", "query", "department")})
     if name == "search_projects":
@@ -552,17 +563,17 @@ def _run_tool(db: Session, name: str, tool_input: dict, actor_role: str, actor_e
     if name == "list_departments":
         return _tool_list_departments(db)
     if name == "get_bid_value":
-        return _tool_get_bid_value(db, actor_role, actor_email, tool_input.get("est_no", ""))
+        return _tool_get_bid_value(db, current, tool_input.get("est_no", ""))
     if name == "get_performance_summary":
-        return _tool_get_performance_summary(db, tool_input.get("department", ""))
+        return _tool_get_performance_summary(db, current, tool_input.get("department", ""))
     if name == "list_announcements":
-        return _tool_list_announcements(db, actor_role, actor_email, tool_input.get("category", "news"), tool_input.get("stage", ""))
+        return _tool_list_announcements(db, current, tool_input.get("category", "news"), tool_input.get("stage", ""))
     if name == "list_my_requests":
         return _tool_list_my_requests(db, tool_input.get("email", ""))
     if name == "get_bm_triage_status":
         return _tool_get_bm_triage_status(db, tool_input.get("bid_manager_email", ""))
     if name == "get_dashboard_summary":
-        return _tool_get_dashboard_summary(db)
+        return _tool_get_dashboard_summary(db, current)
     return f"Unknown tool: {name}"
 
 
@@ -591,19 +602,17 @@ class ChatMessage(BaseModel):
 class ChatRequest(BaseModel):
     message: str
     history: list[ChatMessage] = []
-    actor_email: str = ""
-    actor_role: str = "Viewer"
 
 
 @router.get("/usage")
-def get_usage(actor_email: str = "", db: Session = Depends(get_db)):
-    row = _get_usage_row(db, actor_email, date.today(), create=False)
+def get_usage(db: Session = Depends(get_db), current: CurrentActor = Depends(get_current_actor)):
+    row = _get_usage_row(db, current.email, date.today(), create=False)
     used = row.count if row else 0
     return {"used": used, "limit": _DAILY_LIMIT, "remaining": max(0, _DAILY_LIMIT - used)}
 
 
 @router.post("/chat")
-def chat(payload: ChatRequest, db: Session = Depends(get_db)):
+def chat(payload: ChatRequest, db: Session = Depends(get_db), current: CurrentActor = Depends(get_current_actor)):
     api_key = os.environ.get("ANTHROPIC_API_KEY")
     if not api_key:
         raise HTTPException(503, "AI Support isn't configured yet -- ask an Admin to set ANTHROPIC_API_KEY.")
@@ -615,11 +624,11 @@ def chat(payload: ChatRequest, db: Session = Depends(get_db)):
     # down) before spending anything on the Anthropic call itself -- the
     # whole point is capping API cost, so an already-exhausted user should
     # never trigger a real request.
-    usage = _get_usage_row(db, payload.actor_email, date.today(), create=True)
+    usage = _get_usage_row(db, current.email, date.today(), create=True)
     if usage.count >= _DAILY_LIMIT:
         raise HTTPException(429, f"You've used all {_DAILY_LIMIT} AI Support messages for today -- try again tomorrow, or use Ask the Team.")
 
-    who = f"role: {payload.actor_role or 'Viewer'}" + (f", email: {payload.actor_email}" if payload.actor_email else " (no email given -- ask them to set an acting email first for anything personal)")
+    who = f"role: {current.role}, email: {current.email}"
     system = _SYSTEM_PROMPT + f"\n\n---\n\nThe person you're talking to is acting as {who}."
 
     # Lazy import, same convention as httpx in providers/mail.py and
@@ -643,7 +652,7 @@ def chat(payload: ChatRequest, db: Session = Depends(get_db)):
             history.append({"role": "assistant", "content": resp.content})
             tool_results = [
                 {"type": "tool_result", "tool_use_id": block.id,
-                 "content": _run_tool(db, block.name, block.input, payload.actor_role, payload.actor_email)}
+                 "content": _run_tool(db, block.name, block.input, current)}
                 for block in resp.content if block.type == "tool_use"
             ]
             history.append({"role": "user", "content": tool_results})

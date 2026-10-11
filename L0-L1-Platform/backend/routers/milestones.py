@@ -7,13 +7,15 @@ from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.orm import Session
 
 from .. import models
+from ..auth import CurrentActor, get_current_actor
 from ..database import get_db
 
 router = APIRouter(prefix="/api/projects", tags=["milestones"])
 
 
 @router.get("/{project_id}/milestones")
-def get_milestones(project_id: int, db: Session = Depends(get_db)):
+def get_milestones(project_id: int, db: Session = Depends(get_db),
+                    current: CurrentActor = Depends(get_current_actor)):
     project = db.get(models.Project, project_id)
     if not project:
         raise HTTPException(404, "Project not found")

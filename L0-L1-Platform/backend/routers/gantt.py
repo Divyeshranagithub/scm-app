@@ -7,6 +7,7 @@ from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.orm import Session, joinedload
 
 from .. import models, rules
+from ..auth import CurrentActor, get_current_actor
 from ..database import get_db
 
 router = APIRouter(prefix="/api/gantt", tags=["gantt"])
@@ -182,7 +183,8 @@ def _category_sort_index(category: str | None) -> int:
 
 
 @router.get("/projects/{project_id}")
-def get_project_gantt(project_id: int, db: Session = Depends(get_db)):
+def get_project_gantt(project_id: int, db: Session = Depends(get_db),
+                       current: CurrentActor = Depends(get_current_actor)):
     project = db.get(models.Project, project_id)
     if not project:
         raise HTTPException(404, "Project not found")
@@ -235,7 +237,8 @@ def get_project_gantt(project_id: int, db: Session = Depends(get_db)):
 
 
 @router.get("/timeline")
-def get_stage_timeline(stage: str, db: Session = Depends(get_db)):
+def get_stage_timeline(stage: str, db: Session = Depends(get_db),
+                        current: CurrentActor = Depends(get_current_actor)):
     """Every active project's deliverable-level bars for one stage, pooled
     together (not grouped by project) and sorted by start date — e.g. item
     3.3 from one project can sit right next to item 2.1 from another,

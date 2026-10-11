@@ -4,6 +4,7 @@ from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
 from .. import models
+from ..auth import CurrentActor, get_current_actor, require_admin
 from ..database import get_db
 
 router = APIRouter(prefix="/api/support", tags=["support"])
@@ -34,25 +35,16 @@ def _serialize(r: models.SupportRequest, include_messages: bool = True) -> dict:
 
 
 @router.get("")
-def list_support_requests(actor_role: str = "Viewer", db: Session = Depends(get_db)):
-    if actor_role != "Admin":
-        raise HTTPException(403, "Only an Admin can view support requests")
+def list_support_requests(db: Session = Depends(get_db), current: CurrentActor = Depends(require_admin)):
     rows = db.query(models.SupportRequest).order_by(models.SupportRequest.created_at.desc()).all()
     return [_serialize(r) for r in rows]
 
 
 @router.get("/mine")
-def list_my_support_requests(email: str, db: Session = Depends(get_db)):
-    """No real login exists in this pilot, so "mine" is just a match on the
-    email the asker themselves typed in — same trust level as the rest of
-    the app's client-reported actor_email/actor_role.
-    """
-    email = email.strip()
-    if not email:
-        raise HTTPException(400, "Email is required")
+def list_my_support_requests(db: Session = Depends(get_db), current: CurrentActor = Depends(get_current_actor)):
     rows = (
         db.query(models.SupportRequest)
-        .filter(models.SupportRequest.email.ilike(email))
+        .filter(models.SupportRequest.email.ilike(current.email))
         .order_by(models.SupportRequest.created_at.desc())
         .all()
     )
@@ -60,7 +52,7 @@ def list_my_support_requests(email: str, db: Session = Depends(get_db)):
 
 
 @router.get("/kb")
-def list_kb_entries(db: Session = Depends(get_db)):
+def list_kb_entries(db: Session = Depends(get_db), current: CurrentActor = Depends(get_current_actor)):
     """Item 150/172.1: the knowledge base, unfiltered beyond one rule --
     every entry must trace back to a closed topic. Entries are now only
     created when a ticket resolves, so this mainly guards against stale
@@ -87,13 +79,12 @@ def list_kb_entries(db: Session = Depends(get_db)):
 
 
 @router.post("")
-def create_support_request(payload: SupportRequestCreate, db: Session = Depends(get_db)):
-    if not payload.email.strip():
-        raise HTTPException(400, "Email is required")
+def create_support_request(payload: SupportRequestCreate, db: Session = Depends(get_db),
+                            current: CurrentActor = Depends(get_current_actor)):
     if not payload.message.strip():
         raise HTTPException(400, "Message is required")
     req = models.SupportRequest(
-        name=(payload.name or "").strip() or None, email=payload.email.strip(),
+        name=current.name, email=current.email,
         stage=payload.stage or None, est_no=(payload.est_no or "").strip() or None,
         deliverable=(payload.deliverable or "").strip() or None,
         target_email=(payload.target_email or "").strip() or None, message=payload.message.strip(),
@@ -106,15 +97,12 @@ def create_support_request(payload: SupportRequestCreate, db: Session = Depends(
 
 class SupportReplyCreate(BaseModel):
     body: str
-    actor_role: str = "Viewer"
-    actor_email: str | None = None
     kb_reference_id: int | None = None  # item 150: admin reused an existing KB answer
 
 
 @router.post("/{request_id}/reply")
-def admin_reply(request_id: int, payload: SupportReplyCreate, db: Session = Depends(get_db)):
-    if payload.actor_role != "Admin":
-        raise HTTPException(403, "Only an Admin can reply from the inbox")
+def admin_reply(request_id: int, payload: SupportReplyCreate, db: Session = Depends(get_db),
+                 current: CurrentActor = Depends(require_admin)):
     req = db.get(models.SupportRequest, request_id)
     if not req:
         raise HTTPException(404, "Request not found")
@@ -137,14 +125,15 @@ def admin_reply(request_id: int, payload: SupportReplyCreate, db: Session = Depe
 
 
 @router.post("/{request_id}/respond")
-def asker_respond(request_id: int, payload: SupportReplyCreate, db: Session = Depends(get_db)):
+def asker_respond(request_id: int, payload: SupportReplyCreate, db: Session = Depends(get_db),
+                   current: CurrentActor = Depends(get_current_actor)):
     """The original asker's own reply — allowed until an admin marks the
     request resolved, matching item 77's "respond back until marked resolved".
     """
     req = db.get(models.SupportRequest, request_id)
     if not req:
         raise HTTPException(404, "Request not found")
-    if (payload.actor_email or "").strip().lower() != req.email.strip().lower():
+    if current.email.strip().lower() != req.email.strip().lower():
         raise HTTPException(403, "Only the original asker can reply here")
     if req.status == "resolved":
         raise HTTPException(400, "This request is already resolved")
@@ -157,9 +146,8 @@ def asker_respond(request_id: int, payload: SupportReplyCreate, db: Session = De
 
 
 @router.patch("/{request_id}/resolve")
-def resolve_support_request(request_id: int, actor_role: str = "Viewer", db: Session = Depends(get_db)):
-    if actor_role != "Admin":
-        raise HTTPException(403, "Only an Admin can resolve support requests")
+def resolve_support_request(request_id: int, db: Session = Depends(get_db),
+                             current: CurrentActor = Depends(require_admin)):
     req = db.get(models.SupportRequest, request_id)
     if not req:
         raise HTTPException(404, "Request not found")
