@@ -8,27 +8,27 @@
 <link rel="preconnect" href="https://fonts.googleapis.com" />
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
 <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet" />
-<link rel="stylesheet" href="/static/styles.css" />
+<link rel="stylesheet" href="static/styles.css" />
 <!-- HV Transformer Landing + Sign-In -- ported from
      design_handoff_hv_transformer_signin/. three.js vendored locally
      (see plan snug-moseying-lemon.md) rather than hitting unpkg.com; the
      bare "three" specifier stays in the import map even though it's
      local, since OrbitControls.js itself imports from 'three'. -->
-<link rel="stylesheet" href="/static/css/landing.css" />
-<link rel="preload" as="image" href="/static/img/landing/desert-bg.png" />
+<link rel="stylesheet" href="static/css/landing.css" />
+<link rel="preload" as="image" href="static/img/landing/desert-bg.png" />
 <!-- landing.js's <script type="module"> sits at the end of <body>, and its
      `import ... from './three.core.js'` inside three.module.js is only
      discoverable once the browser has already fetched+parsed that file --
      without these hints the three fetches happen as a sequential 3-deep
      waterfall (landing.js -> three.module.js -> three.core.js) instead of
      starting together, adding real delay before the scene can build. -->
-<link rel="modulepreload" href="/static/js/vendor/three.module.js" />
-<link rel="modulepreload" href="/static/js/vendor/three.core.js" />
-<link rel="modulepreload" href="/static/js/vendor/OrbitControls.js" />
+<link rel="modulepreload" href="static/js/vendor/three.module.js" />
+<link rel="modulepreload" href="static/js/vendor/three.core.js" />
+<link rel="modulepreload" href="static/js/vendor/OrbitControls.js" />
 <script type="importmap">
 { "imports": {
-    "three": "/static/js/vendor/three.module.js",
-    "three/addons/controls/OrbitControls.js": "/static/js/vendor/OrbitControls.js"
+    "three": "./static/js/vendor/three.module.js",
+    "three/addons/controls/OrbitControls.js": "./static/js/vendor/OrbitControls.js"
 } }
 </script>
 </head>
@@ -49,7 +49,7 @@
 <div id="hvLanding">
   <div style="position:absolute;top:0;left:0;width:100%;height:100dvh;z-index:0;overflow:hidden;">
     <div id="hvSceneWrap" style="position:absolute;inset:0;overflow:hidden;pointer-events:none;will-change:transform;">
-      <div style="position:absolute;inset:-7%;background-image:url('/static/img/landing/desert-bg.png');background-size:cover;background-position:center 58%;filter:blur(18px) saturate(0.45) brightness(0.34);"></div>
+      <div style="position:absolute;inset:-7%;background-image:url('static/img/landing/desert-bg.png');background-size:cover;background-position:center 58%;filter:blur(18px) saturate(0.45) brightness(0.34);"></div>
       <div style="position:absolute;inset:0;background:radial-gradient(115% 78% at 52% 74%, rgba(74,64,53,0.5) 0%, rgba(26,24,22,0.9) 58%, rgba(15,14,13,1) 100%);"></div>
       <div style="position:absolute;left:50%;top:58%;width:76%;height:38%;transform:translateX(-50%);background:radial-gradient(ellipse at center, rgba(140,120,94,0.2) 0%, rgba(140,120,94,0) 68%);"></div>
       <div style="position:absolute;inset:0;box-shadow:inset 0 0 220px 90px rgba(10,9,8,0.85);"></div>
@@ -61,7 +61,7 @@
   <div style="position:fixed;top:0;left:0;right:0;height:calc(var(--edge) + var(--logo-h) + 34px);z-index:5;pointer-events:none;background:linear-gradient(180deg,#121110 0%,rgba(18,17,16,0.94) 62%,rgba(18,17,16,0) 100%);"></div>
 
   <div style="position:fixed;top:var(--edge);left:var(--edge);z-index:6;display:flex;align-items:center;gap:18px;pointer-events:none;">
-    <img src="/static/img/landing/algihaz-logo-dark.png" alt="ALGIHAZ CONTRACTING" style="height:var(--logo-h);width:auto;display:block;" />
+    <img src="static/img/landing/algihaz-logo-dark.png" alt="ALGIHAZ CONTRACTING" style="height:var(--logo-h);width:auto;display:block;" />
     <div style="width:2px;height:52px;background:var(--rule);"></div>
     <div>
       <div style="font-family:var(--font-heading);font-weight:700;font-size:14px;letter-spacing:0.16em;color:var(--ink);">ALGIHAZ CONTRACTING</div>
@@ -147,7 +147,7 @@
   <div id="hvSignin" hidden style="position:fixed;inset:0;z-index:12;background:rgba(12,11,10,0.5);align-items:center;justify-content:center;padding:var(--edge);box-sizing:border-box;animation:hvFadeIn 0.9s ease both;">
     <div id="hvSigninPanel" style="width:100%;max-width:390px;background:rgba(22,21,20,0.97);border-top:2px solid #ec3013;padding:32px 30px 36px;box-sizing:border-box;animation:hvBurstIn 1.05s cubic-bezier(0.22,1,0.28,1) both;">
       <div style="display:flex;align-items:flex-start;justify-content:space-between;gap:16px;">
-        <img src="/static/img/landing/algihaz-logo-dark.png" alt="ALGIHAZ CONTRACTING" style="height:40px;width:auto;display:block;" />
+        <img src="static/img/landing/algihaz-logo-dark.png" alt="ALGIHAZ CONTRACTING" style="height:40px;width:auto;display:block;" />
         <button type="button" id="hvSigninClose" class="hv-close-btn" aria-label="Close sign in" style="background:none;border:0;color:var(--ink-faint);font-size:17px;line-height:1;cursor:pointer;padding:0;min-width:44px;min-height:44px;margin:-10px -12px -10px 0;display:flex;align-items:center;justify-content:flex-end;">✕</button>
       </div>
       <div style="font-family:var(--font-heading);font-weight:700;font-size:20px;color:var(--ink);margin-top:26px;">Welcome</div>
@@ -190,7 +190,7 @@
     <div class="brand">
       <!-- [Red Dark Design] white-text variant for the navy sidebar --
            original logo.png (dark text) is untouched, this is additive. -->
-      <div class="brand-badge"><img src="/static/img/logo-white.png" alt="Algihaz Contracting" /></div>
+      <div class="brand-badge"><img src="static/img/logo-white.png" alt="Algihaz Contracting" /></div>
     </div>
 
     <div class="nav-group-label">Workspace</div>
@@ -1916,7 +1916,7 @@
 <div class="global-loading-overlay" id="globalLoadingOverlay" hidden>
   <div class="global-loading-box">
     <div class="global-loading-mascot">
-      <img src="/static/img/gahiz-badge.png" alt="GAHIZ" />
+      <img src="static/img/gahiz-badge.png" alt="GAHIZ" />
       <div class="global-loading-ring"></div>
     </div>
     <span>Loading&#8230;</span>
@@ -2261,7 +2261,7 @@
          card (not a descendant), so the card's own overflow:hidden (for
          its rounded corners) never clips him. Shown only on his own step,
          toggled in renderTourStep(). -->
-    <img id="tourGahizFloat" class="tour-gahiz-float" src="/static/img/gahiz-float.png" alt="GAHIZ" hidden>
+    <img id="tourGahizFloat" class="tour-gahiz-float" src="static/img/gahiz-float.png" alt="GAHIZ" hidden>
     <div class="modal-card tour-card">
       <div class="modal-head">
         <div>
@@ -2475,11 +2475,11 @@
 <!-- Item 33: GAHIZ, Al Gihaz's AI Agent, replaces the generic robot emoji. -->
 <button id="aiChatBubble" class="ai-chat-bubble" aria-label="GAHIZ &#8211; AI Support" title="GAHIZ &#8211; AI Support">
   <span class="ai-chat-bubble-tip">Click for Support</span>
-  <img src="/static/img/gahiz-bubble.png" alt="GAHIZ" />
+  <img src="static/img/gahiz-bubble.png" alt="GAHIZ" />
 </button>
 <div id="aiChatPanel" class="ai-chat-panel" hidden>
   <div class="ai-chat-panel-head">
-    <span><span class="ai-chat-panel-ic"><img src="/static/img/gahiz-icon.png" alt="GAHIZ" /></span> GAHIZ</span>
+    <span><span class="ai-chat-panel-ic"><img src="static/img/gahiz-icon.png" alt="GAHIZ" /></span> GAHIZ</span>
     <span style="display:flex;align-items:center;gap:8px;">
       <span id="aiChatUsage" class="ai-chat-usage" title="Messages left today"></span>
       <button class="modal-close" id="aiChatPanelClose">&#10005;</button>
@@ -2496,9 +2496,9 @@
 </div>
 
 <!-- DronaHQ Native Container SDK -- must load before dronahq-sso.js -->
-<script src="/static/js/dronahq.js"></script>
-<script src="/static/js/dronahq-sso.js"></script>
-<script src="/static/app.js"></script>
-<script type="module" src="/static/js/landing.js"></script>
+<script src="static/js/dronahq.js"></script>
+<script src="static/js/dronahq-sso.js"></script>
+<script src="static/app.js"></script>
+<script type="module" src="static/js/landing.js"></script>
 </body>
 </html>

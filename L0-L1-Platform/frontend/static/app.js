@@ -12,6 +12,18 @@
   var CURRENT_EMAIL = null;
   var CURRENT_NAME = null;
   var AUTH_TOKEN = null;
+  // This file is deployed two different ways: served directly by the
+  // backend itself (local dev, or a non-split deploy) at the domain root,
+  // where a plain "/api/..." call is already correct -- or uploaded as a
+  // static S3/CloudFront bundle under a versioned folder
+  // (.../l0-l1-platform/<version>/index.html), where the actual backend
+  // instead sits behind its own fixed nginx prefix (ROOT_PATH, see
+  // docs/RUNBOOK.md -- ".../l0l1/api/...", NOT the frontend's own version
+  // folder, which has no backend behind it at all). Detected from the
+  // page's own path rather than hardcoded, so this file doesn't need a
+  // per-deploy edit just to point at the right backend.
+  var API_BASE = location.pathname.indexOf("/l0-l1-platform/") === 0 ? "/l0l1" : "";
+  function apiUrl(path) { return API_BASE + path; }
   function actingEmail() { return CURRENT_EMAIL || ""; }
   function can(action) {
     if (CURRENT_ROLE === "Admin") return true;
@@ -546,7 +558,7 @@
     opts.headers = Object.assign({}, opts.headers, AUTH_TOKEN ? { Authorization: "Bearer " + AUTH_TOKEN } : {});
     _loadingStart();
     try {
-      var r = await fetch(path, opts);
+      var r = await fetch(apiUrl(path), opts);
       if (r.status === 401) {
         // The session token expired, or an Admin took this person off the
         // roster mid-session -- there's nothing a retry can fix client-side,
@@ -607,7 +619,7 @@
       rows: exportRows,
     };
     try {
-      var resp = await fetch("/api/export/xlsx", {
+      var resp = await fetch(apiUrl("/api/export/xlsx"), {
         method: "POST",
         headers: Object.assign({ "Content-Type": "application/json" }, AUTH_TOKEN ? { Authorization: "Bearer " + AUTH_TOKEN } : {}),
         body: JSON.stringify(payload),
@@ -3022,7 +3034,7 @@
         '<span style="position:absolute;right:64px;bottom:44px;background:var(--surface);color:var(--ink-900);' +
         'font-size:11.5px;font-weight:700;padding:6px 11px;border-radius:10px;white-space:nowrap;box-shadow:var(--shadow-2);' +
         'border:1px solid var(--line);">Click for Support</span>' +
-        '<img src="/static/img/gahiz-bubble.png" alt="GAHIZ" style="position:absolute;right:14px;bottom:0;width:54px;height:82px;' +
+        '<img src="static/img/gahiz-bubble.png" alt="GAHIZ" style="position:absolute;right:14px;bottom:0;width:54px;height:82px;' +
         'object-fit:contain;object-position:bottom;filter:drop-shadow(0 8px 12px rgba(0,0,0,.3));" />' +
         "</div>" +
         '<div class="tour-callout" style="margin:10px 0;">&#128071; That\'s GAHIZ himself, standing bottom-right on ' +
@@ -3113,7 +3125,7 @@
         featureRowMock(NAV_ICONS.masterpo, "accent", "Master POs List", "Every L1 project's PO status at a glance, read-only &#8212; the same data as the Admin Master PO Report, open to everyone here.") +
         featureRowMock(NAV_ICONS.myrequests, "accent", "My Requests", "Every request you've sent to an Admin &#8212; due-dates, reassignments, SME nominations, and more &#8212; and where each stands.") +
         featureRowMock(NAV_ICONS.support, "accent", "Q/A &#8211; Ask the Team", "Raise a question, track your own requests.") +
-        featureRowMock('<img src="/static/img/gahiz-icon.png" alt="GAHIZ" style="width:100%;height:100%;object-fit:cover;border-radius:50%;" />', "accent", "GAHIZ", "Ask how something in the platform works, or about your own assigned work &#8212; falls back to Ask the Team for anything it can't answer.") +
+        featureRowMock('<img src="static/img/gahiz-icon.png" alt="GAHIZ" style="width:100%;height:100%;object-fit:cover;border-radius:50%;" />', "accent", "GAHIZ", "Ask how something in the platform works, or about your own assigned work &#8212; falls back to Ask the Team for anything it can't answer.") +
         featureRowMock("&#128736;", "crit", "Admin Only", "Reports (4 filterable/printable report types), Top Achievers, Focal Points, Deliverables Configuration, Requests, Follow Up, Open Questions, Archived Projects.") +
         "</div>" +
         '<div class="tour-callout">&#127881; That\'s the full picture &#8212; close this and start ' +
@@ -3308,7 +3320,7 @@
       // resolving against the card's own edge exactly like it does live,
       // instead of the full page width.
       html += '<div class="tour-print-page' + (last ? "" : " tour-print-pagebreak") + '"><div class="tour-stage">' +
-        (s.gahiz ? '<img class="tour-gahiz-float" src="/static/img/gahiz-float.png" alt="GAHIZ">' : "") +
+        (s.gahiz ? '<img class="tour-gahiz-float" src="static/img/gahiz-float.png" alt="GAHIZ">' : "") +
         '<div class="modal-card tour-card">' +
         '<div class="modal-head"><div><div class="eyebrow">' + s.eyebrow + "</div><h2>" + s.title + "</h2></div></div>" +
         '<div class="modal-body tour-body">' + s.body + "</div>" +
@@ -11693,7 +11705,7 @@
   // and {status:"ok", token, role, email, name}. Never guesses or remembers
   // a role client-side between calls; every call re-asks the server.
   async function establishSession(email, name) {
-    var res = await fetch("/api/auth/session", {
+    var res = await fetch(apiUrl("/api/auth/session"), {
       method: "POST", headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ email: email, name: name || null }),
     });
