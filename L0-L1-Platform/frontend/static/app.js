@@ -16,13 +16,15 @@
   // backend itself (local dev, or a non-split deploy) at the domain root,
   // where a plain "/api/..." call is already correct -- or uploaded as a
   // static S3/CloudFront bundle under a versioned folder
-  // (.../l0-l1-platform/<version>/index.html), where the actual backend
-  // instead sits behind its own fixed nginx prefix (ROOT_PATH, see
-  // docs/RUNBOOK.md -- ".../l0l1/api/...", NOT the frontend's own version
-  // folder, which has no backend behind it at all). Detected from the
-  // page's own path rather than hardcoded, so this file doesn't need a
+  // (.../l0-l1-platform/<version>/index.html). dsgvjfnd2ao8v.cloudfront.net
+  // is a CloudFront->S3 distribution ONLY (no path routing to the backend
+  // at all -- it 403s outright on anything but a cacheable GET/HEAD), so
+  // the split deploy needs the backend's own real origin here, not a path
+  // on the frontend's own domain -- same cross-origin split scm-ssot/
+  // QMS360 already use (see backend/main.py's CORS_ORIGINS). Detected from
+  // the page's own path rather than hardcoded, so this file doesn't need a
   // per-deploy edit just to point at the right backend.
-  var API_BASE = location.pathname.indexOf("/l0-l1-platform/") === 0 ? "/l0l1" : "";
+  var API_BASE = location.pathname.indexOf("/l0-l1-platform/") === 0 ? "https://orion.algihaz.com/l0l1" : "";
   function apiUrl(path) { return API_BASE + path; }
   function actingEmail() { return CURRENT_EMAIL || ""; }
   function can(action) {
