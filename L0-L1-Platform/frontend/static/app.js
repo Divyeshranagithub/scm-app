@@ -15,16 +15,26 @@
   // This file is deployed two different ways: served directly by the
   // backend itself (local dev, or a non-split deploy) at the domain root,
   // where a plain "/api/..." call is already correct -- or uploaded as a
-  // static S3/CloudFront bundle under a versioned folder
-  // (.../l0-l1-platform/<version>/index.html). dsgvjfnd2ao8v.cloudfront.net
-  // is a CloudFront->S3 distribution ONLY (no path routing to the backend
-  // at all -- it 403s outright on anything but a cacheable GET/HEAD), so
-  // the split deploy needs the backend's own real origin here, not a path
-  // on the frontend's own domain -- same cross-origin split scm-ssot/
-  // QMS360 already use (see backend/main.py's CORS_ORIGINS). Detected from
-  // the page's own path rather than hardcoded, so this file doesn't need a
-  // per-deploy edit just to point at the right backend.
-  var API_BASE = location.pathname.indexOf("/l0-l1-platform/") === 0 ? "https://orion.algihaz.com/l0l1" : "";
+  // static bundle (S3/CloudFront on desktop web; DronaHQ's own mobile
+  // container, whose actual hosting origin isn't documented/guaranteed to
+  // be the same CloudFront domain desktop uses) under a versioned folder.
+  // A static host is a distribution ONLY (no path routing to the backend
+  // at all -- CloudFront 403s outright on anything but a cacheable
+  // GET/HEAD), so the split deploy needs the backend's own real origin
+  // here, not a path on the frontend's own domain -- same cross-origin
+  // split scm-ssot/QMS360 already use (see backend/main.py's
+  // CORS_ORIGINS).
+  // Inverted on purpose: default to the real backend UNLESS we're
+  // actually being served from the backend's own domain (production
+  // same-origin) or local dev. An allowlist of known frontend hostnames
+  // (e.g. just the desktop CloudFront domain) silently breaks the moment
+  // a DIFFERENT static host serves the bundle -- confirmed to happen:
+  // desktop web (CloudFront) worked after that version, DronaHQ's mobile
+  // container still didn't, pointing at exactly this gap. This flips the
+  // default so any hosting origin that isn't the backend itself resolves
+  // to the real API, with no new allowlist entry needed per static host.
+  var SAME_ORIGIN_HOSTS = ["orion.algihaz.com", "127.0.0.1", "localhost"];
+  var API_BASE = SAME_ORIGIN_HOSTS.indexOf(location.hostname) !== -1 ? "" : "https://orion.algihaz.com/l0l1";
   function apiUrl(path) { return API_BASE + path; }
   function actingEmail() { return CURRENT_EMAIL || ""; }
   function can(action) {

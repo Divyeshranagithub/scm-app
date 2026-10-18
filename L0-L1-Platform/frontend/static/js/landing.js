@@ -836,7 +836,7 @@ async function doBuildScene() {
   const hvBox = box(0.95, 1.05, 0.55, matBody);
   hvBox.position.set(-2.05, 1.9, 1.75);
   reg(hvBox, [-0.3, 0.1, 1], 1.0, 'hvCableBox', 'HV CABLE BOX');
-  const logoTex = new THREE.TextureLoader().load('/static/img/landing/algihaz-logo-alpha.png');
+  const logoTex = new THREE.TextureLoader().load('static/img/landing/algihaz-logo-alpha.png');
   logoTex.colorSpace = THREE.SRGBColorSpace;
   logoTex.anisotropy = 4;
   const logoPlate = new THREE.Mesh(new THREE.PlaneGeometry(0.74, 0.368), new THREE.MeshStandardMaterial({
@@ -1540,7 +1540,7 @@ function initAudio() {
   audio = { ctx, master, bedGain, buzzGain, bp, spaceGain, on: true };
   window.__hvAudio = audio;
   (window.__hvAudioAll = window.__hvAudioAll || []).push(ctx);
-  fetch('/static/audio/electric-shock.mp3')
+  fetch('static/audio/electric-shock.mp3')
     .then((r) => r.arrayBuffer())
     .then((b) => ctx.decodeAudioData(b))
     .then((buf) => { if (audio) audio.zapBuf = buf; })
@@ -1557,7 +1557,7 @@ function initAudio() {
   // sits under the transformer's own interactive sounds, not over them --
   // lowered from an initial 0.06 once the longer replacement track read
   // louder than the original short one at the same gain value.
-  fetch('/static/audio/space-ambience.mp3')
+  fetch('static/audio/space-ambience.mp3')
     .then((r) => r.arrayBuffer())
     .then((b) => ctx.decodeAudioData(b))
     .then((buf) => {
